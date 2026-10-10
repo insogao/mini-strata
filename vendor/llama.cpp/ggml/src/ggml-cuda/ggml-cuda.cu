@@ -4311,6 +4311,10 @@ static int ggml_cuda_try_fuse(ggml_backend_cuda_context * cuda_ctx, ggml_cgraph 
 
 static void ggml_cuda_graph_evaluate_and_capture(ggml_backend_cuda_context * cuda_ctx, ggml_cgraph * cgraph, const bool use_cuda_graph, const bool cuda_graph_update_required, const void * graph_key) {
     bool graph_evaluated_or_captured = false;
+    if (getenv("GGML_STRATA_TRACE")) {
+        GGML_LOG_ERROR("strata trace: cuda graph compute n_nodes %d use_graph %d update %d\n", cgraph->n_nodes,
+                       use_cuda_graph ? 1 : 0, cuda_graph_update_required ? 1 : 0);
+    }
 
     // flag used to determine whether it is an integrated_gpu
     const bool integrated            = ggml_cuda_info().devices[cuda_ctx->device].integrated;
@@ -4409,6 +4413,9 @@ static void ggml_cuda_graph_evaluate_and_capture(ggml_backend_cuda_context * cud
 
             for (int i = 0; i < cgraph->n_nodes; i++) {
                 ggml_tensor * node = cgraph->nodes[i];
+                if (getenv("GGML_STRATA_TRACE")) {
+                    GGML_LOG_ERROR("strata trace: cuda node %d %s op %s\n", i, node->name, ggml_op_name(node->op));
+                }
                 if (is_concurrent_event_active) {
                     GGML_ASSERT(concurrent_event);
 

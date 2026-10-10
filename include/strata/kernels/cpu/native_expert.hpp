@@ -49,4 +49,12 @@ void native_gu_rows(const NativeFmt& f, const uint8_t* blob, const void* const* 
 void native_down_rows(const NativeFmt& f, const uint8_t* blob, const void* const* hq, int nt, float* const* out,
                       int r0, int r1);
 
+/// GGUF stores the three expert matrices in separate tensors. These entry points avoid a second host copy.
+void native_gu_dot_rows_slices(const NativeFmt& f, const uint8_t* gate, const uint8_t* up,
+    const void* const* act, int nt, float* const* gates, float* const* ups, int r0, int r1);
+void native_gu_rows_slices(const NativeFmt& f, const uint8_t* gate, const uint8_t* up,
+    const void* const* act, int nt, float* const* ff, int r0, int r1);
+void native_down_rows_slice(const NativeFmt& f, const uint8_t* down,
+    const void* const* hq, int nt, float* const* out, int r0, int r1);
+
 }  // namespace strata::kernels::cpu

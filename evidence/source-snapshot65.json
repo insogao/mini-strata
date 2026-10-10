@@ -1,0 +1,161 @@
+{
+  "snapshot": "65; frozen before task68",
+  "reference_exe_sha256": "4dcfc1773411d33bdd446241218c725d37499dc3cc2cc6393eb4b78e9b622587",
+  "files": [
+    {
+      "path": "CMakeLists.txt",
+      "sha256_raw_snapshot": "d70d05b3f707d5fed2dc1bf1e90d3d84624831e3bed305ea62d0e68e6962d3e3",
+      "sha256_repository_blob": "c92a91736762a31f6ec7c605392d00b9d41e6c96d2cec7137a5e24d4eb2794d4"
+    },
+    {
+      "path": "include/strata/core/expert_cache.hpp",
+      "sha256_raw_snapshot": "b13c25229798d855119295a02baeb145f41dea5acf1e189352f12ac0099b3103",
+      "sha256_repository_blob": "d2d032c517ea06ae9392d269782801aadf191f1621752925417563f056013bf4"
+    },
+    {
+      "path": "include/strata/core/expert_source.hpp",
+      "sha256_raw_snapshot": "e31275485a7a76f8051d618248f91a628cb41794d7584e6f7d6b51ea77c51f5e",
+      "sha256_repository_blob": "810204c84b913d04631cb7d25a805d135291452b7bb68650d27e93af40ab3546"
+    },
+    {
+      "path": "include/strata/core/qwen35_bridge.hpp",
+      "sha256_raw_snapshot": "005beb0f3b5cb6c8a7944bc8d77eaa4831e1fc2ce79eb46d6ff565231b1cb574",
+      "sha256_repository_blob": "6fac673bf3bec46a344ca71f9b0eb38cd8434746945ee288e75cfcf750c64634"
+    },
+    {
+      "path": "include/strata/core/qwen35_prefill.hpp",
+      "sha256_raw_snapshot": "277e8376f19649cd05741eff1e1b3851a76d000fc7e09097e64dd6170363a75a",
+      "sha256_repository_blob": "277e8376f19649cd05741eff1e1b3851a76d000fc7e09097e64dd6170363a75a"
+    },
+    {
+      "path": "include/strata/kernels/cpu/expert_layout.hpp",
+      "sha256_raw_snapshot": "f40537829c42187623ceb3a5c2108370f4512378cc75d93099eca35670feb0f4",
+      "sha256_repository_blob": "d9e7f8c12e526306a81452a26c75962490e7d5fc67c09d6176c1789e311e9140"
+    },
+    {
+      "path": "include/strata/kernels/cpu/native_expert.hpp",
+      "sha256_raw_snapshot": "681e09285c086d3dd3609182b0531adf8fc2909f5b09d16390ac7bbe9dd92758",
+      "sha256_repository_blob": "4f3814c3349cb902a493c9c88ccf9ba0ae2a51e46642dfd548d687116b000269"
+    },
+    {
+      "path": "include/strata/kernels/cpu/pool.hpp",
+      "sha256_raw_snapshot": "b24e41e8545066ffe80500c9a452ef35b873e954fdad06bae71a22ddf7ce43fc",
+      "sha256_repository_blob": "c10a12d4f8ca5a4fe696a607eba3530222d693c61e0b5f8ccd738794299c4898"
+    },
+    {
+      "path": "include/strata/prefill/cold_stager.hpp",
+      "sha256_raw_snapshot": "3d0fc5f769e2ae038aa14741e7639f92cec86020b0a74369cd0c08e6efad6e6f",
+      "sha256_repository_blob": "3d0fc5f769e2ae038aa14741e7639f92cec86020b0a74369cd0c08e6efad6e6f"
+    },
+    {
+      "path": "include/strata/program/qwen35_model.hpp",
+      "sha256_raw_snapshot": "11020331ebc9831c3e1a1127d53d4dd22b4983c827c6afbd9f664ed8aca8d879",
+      "sha256_repository_blob": "11020331ebc9831c3e1a1127d53d4dd22b4983c827c6afbd9f664ed8aca8d879"
+    },
+    {
+      "path": "src/core/expert_cache.cpp",
+      "sha256_raw_snapshot": "29722d638cc6ff068df6f0051453ff38257a0882e53360f3b0a423eacfabe5b4",
+      "sha256_repository_blob": "45a599e3d235aa2a0a5ac44222633bbeee8ea56cf54c012294f3f14d258c6065"
+    },
+    {
+      "path": "src/core/expert_source.cpp",
+      "sha256_raw_snapshot": "f658a8f9578afef3ac2de08c1c4afb89fad819d5115792b92823f2609528f01f",
+      "sha256_repository_blob": "f658a8f9578afef3ac2de08c1c4afb89fad819d5115792b92823f2609528f01f"
+    },
+    {
+      "path": "src/core/qwen35_bridge.cpp",
+      "sha256_raw_snapshot": "187a74034f0605ab9324d3998cf7f57f6da802f21986aa37ffb646dd40aedfdb",
+      "sha256_repository_blob": "922d77416f2c830664d708b33d338f82e013131be189da4b0ac694343f238fd4"
+    },
+    {
+      "path": "src/core/qwen35_prefill.cu",
+      "sha256_raw_snapshot": "7f7848bd40f077ab795d924c32b6d6ba29e8f6c7f3e10888b154dbcc07a49cec",
+      "sha256_repository_blob": "7f7848bd40f077ab795d924c32b6d6ba29e8f6c7f3e10888b154dbcc07a49cec"
+    },
+    {
+      "path": "src/kernels/cpu/expert_layout.cpp",
+      "sha256_raw_snapshot": "e95eeee63d9a1eefc4f17f2c92e5a8eb02e4f5a10a2d51ca04b06ba3f376203a",
+      "sha256_repository_blob": "6ae542e852cffe75daef6b72a71ba781b75a5419aee214caad6f2bea4413f4d1"
+    },
+    {
+      "path": "src/kernels/cpu/native_expert.cpp",
+      "sha256_raw_snapshot": "741c5da462554cd2da9abaf5a5d24c0b15c6814b4eb14443c0c9cfcbf249dee0",
+      "sha256_repository_blob": "07a86ac735ef55c0562767296fd2afb9e0c88139fbef3d486305adbe59205e36"
+    },
+    {
+      "path": "src/kernels/cpu/pool.cpp",
+      "sha256_raw_snapshot": "f5337b5123bfdebe4d770c82c1cbc86be8e8f1ae9bf5a4214f14b3695508d16d",
+      "sha256_repository_blob": "45cc01f659f12e027763b4feea2d21a1e3084fe6f261d5bea411eb60c8620244"
+    },
+    {
+      "path": "src/kernels/cuda/iq_kernels.cu",
+      "sha256_raw_snapshot": "f97fc5b4ae1ff8a5a6248d2ea38c10d0979fae489ef4ed37c5f9d632d8bcf0cc",
+      "sha256_repository_blob": "8cfea7b08d7eaa617bc676a626d4d6f255c5e85a91c4718aa5c2ed1bb9efaafa"
+    },
+    {
+      "path": "src/prefill/cold_stager.cpp",
+      "sha256_raw_snapshot": "5bc329a953a058eae23973f63896142902a0c16aec181be2d33c1014c97dcf9c",
+      "sha256_repository_blob": "5bc329a953a058eae23973f63896142902a0c16aec181be2d33c1014c97dcf9c"
+    },
+    {
+      "path": "src/prefill/prefill.cpp",
+      "sha256_raw_snapshot": "244b351cec53a88f7c6ef9fa36163aac88605958320736b987e552fd543670ec",
+      "sha256_repository_blob": "8b76a6fd5f45be560c37241ac1e79cdeb5642fd02840e60aeaa9d2832a6d88da"
+    },
+    {
+      "path": "src/program/generate.cpp",
+      "sha256_raw_snapshot": "c2c27b4003c2c87f1b0f15d3df35de0dd02bccd5c426e31ee5d4d44e4db79499",
+      "sha256_repository_blob": "328119ec1b8a7731c14d1bf6f7b04cd6e26b3d55451cb6b05d514b734fd84b52"
+    },
+    {
+      "path": "src/program/qwen35_expert_check.cpp",
+      "sha256_raw_snapshot": "50e4c51d3d8a004079edc147179e3cc142eb2243ee6e4afb50468df91cbdb997",
+      "sha256_repository_blob": "50e4c51d3d8a004079edc147179e3cc142eb2243ee6e4afb50468df91cbdb997"
+    },
+    {
+      "path": "src/program/qwen35_model.cpp",
+      "sha256_raw_snapshot": "92aedc12b8d23ae80cbd2423a74779aaa82a0785604ff4ceaaf26bf21a72c1a4",
+      "sha256_repository_blob": "dc664d2c5f911c925e883600e9bd69dbae5c21397301a20048210187fbe28aa0"
+    },
+    {
+      "path": "vendor/llama.cpp/ggml/include/ggml-backend.h",
+      "sha256_raw_snapshot": "26b36a8e6c1590bd312b9455321cda6351f2fdce6c4743d2db3249b423b0913c",
+      "sha256_repository_blob": "26b36a8e6c1590bd312b9455321cda6351f2fdce6c4743d2db3249b423b0913c"
+    },
+    {
+      "path": "vendor/llama.cpp/ggml/src/ggml-backend.cpp",
+      "sha256_raw_snapshot": "9182108b43799f042b45d27766b729cca9bfe61b0b48cb875ac1b20a20c83bec",
+      "sha256_repository_blob": "9182108b43799f042b45d27766b729cca9bfe61b0b48cb875ac1b20a20c83bec"
+    },
+    {
+      "path": "vendor/llama.cpp/ggml/src/ggml-cuda/ggml-cuda.cu",
+      "sha256_raw_snapshot": "08edad52193f85cd711877a2fa2f1ce9c3980e19c7cb5a18d073a2ff63261c10",
+      "sha256_repository_blob": "08edad52193f85cd711877a2fa2f1ce9c3980e19c7cb5a18d073a2ff63261c10"
+    },
+    {
+      "path": "vendor/llama.cpp/src/llama-context.cpp",
+      "sha256_raw_snapshot": "63e2b08b6330be5f65241c7b6a8ad4869d2911e13b885bf0b22fef2c78867810",
+      "sha256_repository_blob": "63e2b08b6330be5f65241c7b6a8ad4869d2911e13b885bf0b22fef2c78867810"
+    },
+    {
+      "path": "vendor/llama.cpp/src/llama-graph.cpp",
+      "sha256_raw_snapshot": "e506e07b544b30a41e61235f1d52d16e63eb49fe7d1dd546358c2c1dc27b40c3",
+      "sha256_repository_blob": "e506e07b544b30a41e61235f1d52d16e63eb49fe7d1dd546358c2c1dc27b40c3"
+    },
+    {
+      "path": "vendor/llama.cpp/src/models/qwen35moe.cpp",
+      "sha256_raw_snapshot": "f617c8b012be90b7a3d3e9adb3131308e9f58ea5e57f3853631b1d5620e9d3b1",
+      "sha256_repository_blob": "f617c8b012be90b7a3d3e9adb3131308e9f58ea5e57f3853631b1d5620e9d3b1"
+    },
+    {
+      "path": "vendor/llama.cpp/ggml/src/ggml-cuda/gated_delta_net.cu",
+      "sha256_raw_snapshot": "6c95caa9dff67279b23b39058a74ddb4ab6d634f651716f82482e06e53f027d8",
+      "sha256_repository_blob": "6c95caa9dff67279b23b39058a74ddb4ab6d634f651716f82482e06e53f027d8"
+    },
+    {
+      "path": "vendor/llama.cpp/ggml/src/ggml-cuda/gated_delta_net.cuh",
+      "sha256_raw_snapshot": "390bce5216e6f9f30ca24b58c16cf52380724286686d57c7ad64954a5740541d",
+      "sha256_repository_blob": "390bce5216e6f9f30ca24b58c16cf52380724286686d57c7ad64954a5740541d"
+    }
+  ]
+}

@@ -179,7 +179,10 @@ __device__ __forceinline__ float vec_dot_iq2_s_q8_1(const void* __restrict__ vbq
             sumi1 = ggml_cuda_dp4a(grid_h, u1, sumi1);
         }
     }
-    const int sumi = (sumi0 * ls0 + sumi1 * ls1 + (sumi0 + sumi1) / 2) / 4;
+    // The reference (ggml-cpu quants.c, ggml_vec_dot_iq2_s_q8_K_generic) uses the scale 1 + 2*ls and one 0.125
+    // factor at the end.  The upstream CUDA form `(sumi0*ls0 + sumi1*ls1 + (sumi0+sumi1)/2)/4` truncates that
+    // identity through two integer divisions; keep the exact value instead (two fp32 multiplies here).
+    const float sumi = float(sumi0 * (2 * ls0 + 1) + sumi1 * (2 * ls1 + 1)) * 0.125f;
     const float d = __half2float(bq2->d) * __low2float(bq8_1[iqs / 2].ds);
     return d * sumi;
 }
@@ -612,7 +615,7 @@ template<> struct Fmt<8> { static constexpr int qk = 32, ipb = QI8_0 / VDR_Q8_0,
 #else
 #define STRATA_GU_FMTS(X) X(16) X(17) X(18) X(21) X(22) X(23) X(29) X(42) X(12) X(13) X(6) X(2) X(3) X(8)
 #endif
-#define STRATA_D_FMTS(X) X(20) X(23) X(42) X(7) X(6) X(2) X(3) X(8)
+#define STRATA_D_FMTS(X) X(20) X(21) X(23) X(42) X(7) X(6) X(2) X(3) X(8)
 #define STRATA_MMVQ_FMTS(X) X(16) X(17) X(18) X(20) X(21) X(22) X(23) X(29) X(42) X(12) X(13) X(7) X(6) X(2) X(3) X(8)
 
 __device__ __forceinline__ float warp_sum(float v) {
@@ -740,6 +743,18 @@ template<> struct Split<17> : SplitLs2 {   // IQ2_XS
 };
 template<> inline constexpr bool kSplit<22> = true;
 template<> struct Split<22> : SplitLs2 {   // IQ2_S
+    // The exact scale identity 1 + 2*ls and one 0.125 (see vec_dot_iq2_s_q8_1 above): the inherited form's two
+    // integer divisions truncate.  Same dp4a grouping, only the final combination differs.
+    __device__ static float apply(const W& r, const block_q8_1* __restrict__ bq8_1, int iqs) {
+        int sumi0 = 0, sumi1 = 0;
+#pragma unroll
+        for (int j = 0; j < 4; ++j) sumi0 = ggml_cuda_dp4a(r.g[j], get_int_b4(bq8_1[iqs / 2].qs, j), sumi0);
+#pragma unroll
+        for (int j = 4; j < 8; ++j) sumi1 = ggml_cuda_dp4a(r.g[j], get_int_b4(bq8_1[iqs / 2].qs, j), sumi1);
+        const float sumi = float(sumi0 * (2 * r.ls0 + 1) + sumi1 * (2 * r.ls1 + 1)) * 0.125f;
+        const float d = r.dw * __low2float(bq8_1[iqs / 2].ds);
+        return d * sumi;
+    }
     template<bool STAGE_GRID = false>
     __device__ static W load(const void* __restrict__ vbq, int kbx, int iqs, const uint32_t* __restrict__ s_grid = nullptr) {
         const block_iq2_s* bq2 = (const block_iq2_s*) vbq + kbx;

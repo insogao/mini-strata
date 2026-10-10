@@ -61,3 +61,16 @@ build-vision-cuda12.bat
 
 /.ccache/
 /.rocm-win/
+
+# mini-strata local Qwen experiment artifacts
+/build/
+/models/
+/fixtures/
+/results/
+/runtime/
+.env
+.env.*
+*.exe
+*.dll
+*.pdb
+*.gguf

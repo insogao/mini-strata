@@ -16,6 +16,7 @@
 
 #include "strata/platform/memory.hpp"
 #include "strata/core/arch_defaults.hpp"
+#include "strata/program/qwen35_model.hpp"
 #include "strata/core/dma_batch.hpp"
 #include "strata/core/device.hpp"
 #include "strata/core/remote_expert_opt.hpp"
@@ -368,6 +369,23 @@ struct Options {
     /// combination recorded in bench/results/2026-09-23-attention-ple plus the native indexer, and never the
     /// <=256-token attention adapter. It becomes the default once P0 shows it is not slower.
     std::string native_preset;
+    /// Qwen35 text POC (build with -DSTRATA_QWEN35=ON): `--qwen35-model <gguf>` routes this invocation to the
+    /// internal Qwen35 module (the pinned llama.cpp graph for attention/GDN/shared expert, the shared Strata
+    /// expert service for the routed experts).  The Flash-Next path and every other option are untouched.
+    std::string qwen35_model;
+    std::string qwen35_pack;             ///< native_experts.txt directory; default: the model's directory
+    std::string qwen35_prompt;           ///< alternative prompt TEXT (tokenized with the model vocab; calibration)
+    std::string qwen35_teacher;          ///< fixed teacher prefix (token file) for perf attribution
+    std::string qwen35_cuda_backend;     ///< ggml-cuda dynamic backend (e.g. runtime/b11476/ggml-cuda.dll)
+    std::string qwen35_profile;          ///< optional expert profile for the GPU cache fill
+    std::string qwen35_routing_log;      ///< optional diagnostic routing log
+    int64_t qwen35_topk = 0;             ///< dump top-N logits per sampled position (diagnostic)
+    std::string qwen35_topk_file;        ///< top-k dump destination (JSONL)
+    int64_t qwen35_cache_slots = 0;      ///< GPU expert cache slots (0 = cache off)
+    int64_t qwen35_ngl = 99;             ///< dense layers offloaded to the GPU
+    int64_t qwen35_threads = 8;          ///< llama CPU threads; the expert pool's total compute lanes (workers + host) follow it
+    int64_t qwen35_pool_workers = 0;     ///< advanced override: the pool's WORKER count as given (the host still drains)
+    uint32_t qwen35_ubatch = 128;        ///< Qwen35 POC: prompt micro-batch (llama n_ubatch); strictly validated CLI
     /// The token embedding from this GGUF instead of --native's (tools/embd_bf16_pack.py: BF16 as shipped)
     std::string embd_gguf;
     /// Plan v0.3 P2: how the n-gram table is read. Direct (default) = unbuffered SSD reads, table never in RAM.
@@ -705,6 +723,9 @@ void usage() {
                  "  --expert-cache-cpu-order  experimental GPU expert reduction matching CPU order\n"
                  "  --max-new N          tokens to generate (default 16)\n"
                  "  --max-context N      KV/state capacity (default 4096)\n"
+                 "  --qwen35-ubatch N    Qwen35 POC (with --qwen35-model): llama prompt micro-batch n_ubatch\n"
+                 "                       (default 128; positive decimal integer up to 4294967295; larger values\n"
+                 "                       mean fewer, longer prompt batches)\n"
                  "  --rope-scaling T     extend the context past the trained one: none, linear\n"
                  "                       (position interpolation) or yarn - llama.cpp's types and names.\n"
                  "                       Default: the model file's rope keys, else none. Fixed at startup:\n"
@@ -1743,6 +1764,33 @@ int main(int argc, char** argv) {
             }
         }
         else if (a == "--no-host-worker") o.no_host_worker = true;
+        else if (a == "--qwen35-model") o.qwen35_model = next("--qwen35-model");
+        else if (a == "--qwen35-pack") o.qwen35_pack = next("--qwen35-pack");
+        else if (a == "--qwen35-prompt") o.qwen35_prompt = next("--qwen35-prompt");
+        else if (a == "--qwen35-teacher-file") o.qwen35_teacher = next("--qwen35-teacher-file");
+        else if (a == "--qwen35-cuda-backend") o.qwen35_cuda_backend = next("--qwen35-cuda-backend");
+        else if (a == "--qwen35-profile") o.qwen35_profile = next("--qwen35-profile");
+        else if (a == "--qwen35-routing-log") o.qwen35_routing_log = next("--qwen35-routing-log");
+        else if (a == "--qwen35-topk") o.qwen35_topk = std::atoll(next("--qwen35-topk"));
+        else if (a == "--qwen35-topk-file") o.qwen35_topk_file = next("--qwen35-topk-file");
+        else if (a == "--qwen35-cache-slots") o.qwen35_cache_slots = std::atoll(next("--qwen35-cache-slots"));
+        else if (a == "--qwen35-ngl") o.qwen35_ngl = std::atoll(next("--qwen35-ngl"));
+        else if (a == "--qwen35-threads") o.qwen35_threads = std::atoll(next("--qwen35-threads"));
+        else if (a == "--qwen35-pool-workers") o.qwen35_pool_workers = std::atoll(next("--qwen35-pool-workers"));
+        else if (a == "--qwen35-ubatch") {
+            // Qwen35 POC only (--qwen35-model routes here): strictly a positive decimal integer in the
+            // uint32 range, so a negative or overflowing value can never silently wrap through a cast.
+            const char* v = next("--qwen35-ubatch");
+            char* end = nullptr;
+            const long long ubatch_value = std::strtoll(v, &end, 10);
+            if (v[0] < '0' || v[0] > '9' || end == v || *end != '\0' || ubatch_value <= 0 ||
+                ubatch_value > 4294967295LL) {
+                std::fprintf(stderr, "strata generate: --qwen35-ubatch expects a positive decimal integer "
+                                     "in 1..4294967295\n");
+                return 2;
+            }
+            o.qwen35_ubatch = (uint32_t) ubatch_value;
+        }
         else if (a == "--no-ple-prefetch") o.no_ple_prefetch = true;
         else if (a == "--coupled-draft") o.coupled_draft = true;
         else if (a == "--no-coupled-draft") o.coupled_draft = false;
@@ -1948,6 +1996,44 @@ int main(int argc, char** argv) {
             return 2;
         }
         }
+    }
+    // The Qwen35 POC route: the same entry point, the internal Qwen module.  It runs before every native-engine
+    // check below, so nothing about the Flash-Next path changes.
+    if (!o.qwen35_model.empty()) {
+#if defined(STRATA_QWEN35)
+        strata::program::Qwen35RunOptions q;
+        q.model = o.qwen35_model;
+        q.pack_dir = o.qwen35_pack;
+        if (q.pack_dir.empty()) {
+            const size_t slash = o.qwen35_model.find_last_of("/\\");
+            q.pack_dir = slash == std::string::npos ? std::string(".") : o.qwen35_model.substr(0, slash);
+        }
+        q.tokens = o.tokens;
+        q.prompt_text = o.qwen35_prompt;
+        q.teacher_file = o.qwen35_teacher;
+        q.max_new = o.max_new;
+        q.max_context = o.max_context;
+        q.ngl = o.qwen35_ngl;
+        q.threads = o.qwen35_threads;
+        q.ubatch = o.qwen35_ubatch;
+        q.cache_slots = o.qwen35_cache_slots;
+        q.profile = o.qwen35_profile;
+        q.routing_log = o.qwen35_routing_log;
+        q.topk = o.qwen35_topk;
+        q.topk_file = o.qwen35_topk_file;
+        q.cuda_backend = o.qwen35_cuda_backend;
+        // Total CPU compute concurrency follows --qwen35-threads the way the pool's own protocol counts it:
+        // WORKERS + the host thread that drains too.  So the default is threads-1 workers, and the whole
+        // path runs t8 threads total (previously threads workers + host overshot the ask by one lane).
+        // --qwen35-pool-workers is the advanced override and keeps its literal worker-count meaning, exactly
+        // as the Flash-Next engine's --pool-workers does.
+        q.pool_workers = (int) (o.qwen35_pool_workers > 0 ? o.qwen35_pool_workers
+                                                          : (o.qwen35_threads > 1 ? o.qwen35_threads - 1 : 1));
+        return strata::program::qwen35_run(q);
+#else
+        std::fprintf(stderr, "strata generate: --qwen35-model needs a build configured with -DSTRATA_QWEN35=ON\n");
+        return 2;
+#endif
     }
 #if defined(STRATA_USE_HIP)
     {   // gfx1151 (Strix Halo): the switches that are exact there are on by default (strata/core/arch_defaults.hpp); before

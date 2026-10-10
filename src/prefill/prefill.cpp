@@ -33,6 +33,7 @@
 #include "strata/prefill/moe_mmq.hpp"
 #include "strata/core/peer_experts.hpp"
 #include "strata/prefill/kernels.hpp"
+#include "strata/prefill/cold_stager.hpp"
 
 #include <cuda_runtime.h>
 
@@ -90,6 +91,11 @@ void experts_native(const Batch&, const NativeGeom&, int, int64_t, const void*, 
 #endif
 
 namespace strata::prefill {
+
+// The unpinned experts' host copies (step 4 of the prompt-speed plan): a shared component now, its former
+// file-local name kept for this file's call sites (include/strata/prefill/cold_stager.hpp).
+using Stager = ColdStager;
+
 namespace {
 
 using Clock = std::chrono::steady_clock;
@@ -392,165 +398,8 @@ struct Alloc {
 
 }  // namespace
 
-// Step 4 of the prompt-speed plan: the experts the arena could not pin (a third of the streamed ones on IQ3_S) are
-// copied into pinned buffers by these threads, ahead of the launches.  Copied in line by the launching thread they
-// left the GPU without queued work while each ~2 MB memcpy ran (~15 s of a 32K prompt on IQ3_S).  Job j - a layer's
-// j-th unpinned expert, in launch order - lands in host buffer j % kRing, which is free again once the DMA of job
-// j - kRing (recorded by the launching thread, `issued`) is done.
-struct Stager {
-    // D-5: the pinned ring's depth (STRATA_STAGER_RING, default 16) - how far the host copies can run ahead of the
-    // DMAs of the unpinned experts' blobs
-    int kRing = 16;
-    // pp-opt: the jobs a thread claims at once (STRATA_STAGER_BATCH; set by init's caller, at most kMaxBatch and kRing)
-    static constexpr int kMaxBatch = 32;
-    int batch = 1;
-    // `from` set: the blob is copied by the source itself (CS-T: a GGUF read in place assembles it from its three
-    // role slices; a pointer to it would not live as long as the queue)
-    struct Job { const uint8_t* src; size_t bytes; core::ExpertSource* from = nullptr; int32_t l = 0, e = 0; };
-    std::vector<uint8_t*> buf;
-    std::vector<char> pinned;
-    std::vector<std::vector<uint8_t>> pageable;   // the fallback when no more RAM can be pinned
-    std::vector<cudaEvent_t> dma_done;
-    std::vector<Job> jobs;
-    std::unique_ptr<std::atomic<int>[]> ready;
-    size_t ready_cap = 0;
-    // gen << 32 | n << 16 | next index: a claim is a CAS on the generation it woke for (a thread late from the
-    // previous layer can never take a job of this one - the expert pool's issue #29 lesson)
-    std::atomic<uint64_t> head{0};
-    std::atomic<int> issued{0}, active{0};
-    uint32_t gen = 0;
-    bool quit = false;
-    std::mutex mu;
-    std::condition_variable cv;
-    std::vector<std::thread> threads;
-    int device = 0;
-
-    bool init(size_t blob_bytes, int nthreads) {
-        if (const char* v = std::getenv("STRATA_STAGER_RING")) kRing = std::clamp(std::atoi(v), 2, 256);
-        buf.assign((size_t) kRing, nullptr);
-        pinned.assign((size_t) kRing, 0);
-        dma_done.assign((size_t) kRing, nullptr);
-        pageable.resize(kRing);
-        for (int i = 0; i < kRing; ++i) {
-            pinned[i] = !force_pageable() && cudaHostAlloc((void**) &buf[i], blob_bytes, cudaHostAllocDefault) == cudaSuccess;
-            if (!pinned[i]) {
-                cudaGetLastError();
-                pageable[(size_t) i].resize(blob_bytes);
-                buf[i] = pageable[(size_t) i].data();
-            }
-            if (cudaEventCreateWithFlags(&dma_done[i], stager_sleep() ? (cudaEventDisableTiming | cudaEventBlockingSync)
-                                                                      : cudaEventDisableTiming) != cudaSuccess) return false;
-        }
-        cudaGetDevice(&device);
-        for (int t = 0; t < nthreads; ++t) threads.emplace_back([this] { work(); });
-        return true;
-    }
-    ~Stager() {
-        finish();
-        { std::lock_guard<std::mutex> lk(mu); quit = true; }
-        cv.notify_all();
-        for (auto& t : threads) t.join();
-        for (int i = 0; i < kRing; ++i) {
-            if (dma_done[i]) cudaEventDestroy(dma_done[i]);
-            if (buf[i] && pinned[i]) cudaFreeHost(buf[i]);
-        }
-    }
-    void work() {
-        cudaSetDevice(device);
-        uint32_t seen = 0;
-        for (;;) {
-            {
-                std::unique_lock<std::mutex> lk(mu);
-                cv.wait(lk, [&] { return quit || gen != seen; });
-                if (quit) return;
-                seen = gen;
-            }
-            for (;;) {
-                active.fetch_add(1, std::memory_order_acq_rel);
-                // pp-opt: a run of up to `batch` consecutive jobs (batch <= kRing, so the earliest unfinished run
-                // never waits for a buffer of its own)
-                int k = 1;
-                const int j = claim(seen, batch, k);
-                if (j < 0) { active.fetch_sub(1, std::memory_order_acq_rel); break; }
-                for (int i = j; i < j + k; ++i) {
-                    // The copies run ahead of the DMAs, so most of these threads spend most of a prompt waiting here: sleep
-                    // (atomic wait, and a blocking-sync event below), not a yield spin - 32 spinners took every core
-                    // (Linux; see stager_sleep for Windows).
-                    if (i >= kRing) {   // job i - kRing's DMA from this buffer is queued
-                        if (stager_sleep())
-                            for (int x; (x = issued.load(std::memory_order_acquire)) <= i - kRing;) issued.wait(x);
-                        else
-                            while (issued.load(std::memory_order_acquire) <= i - kRing) std::this_thread::yield();
-                    }
-                    // and done - for a generation's first kRing jobs that is the previous generation's last DMA from
-                    // the buffer, which nothing else waits for when a chunk ends without a sync (no MTP) or the DMA
-                    // was a ring entry the routing skipped (an event never recorded returns at once)
-                    cudaEventSynchronize(dma_done[i % kRing]);
-                }
-                int32_t rl[kMaxBatch], re[kMaxBatch];
-                uint8_t* rd[kMaxBatch];
-                size_t nr = 0;
-                core::ExpertSource* from = nullptr;
-                for (int i = j; i < j + k; ++i) {
-                    const Job& jb = jobs[(size_t) i];
-                    if (jb.from == nullptr) { std::memcpy(buf[i % kRing], jb.src, jb.bytes); continue; }
-                    from = jb.from;
-                    rl[nr] = jb.l; re[nr] = jb.e; rd[nr] = buf[i % kRing]; ++nr;
-                }
-                if (nr > 0 && !from->copy_blobs(rl, re, rd, nr)) {
-                    std::fprintf(stderr, "prefill: the expert source could not copy experts %d.. of layer %d\n", re[0], rl[0]);
-                    std::abort();
-                }
-                for (int i = j; i < j + k; ++i) ready[(size_t) i].store(1, std::memory_order_release);
-                active.fetch_sub(1, std::memory_order_acq_rel);
-            }
-        }
-    }
-    int claim(uint32_t g, int want, int& k) {
-        uint64_t cur = head.load(std::memory_order_acquire);
-        for (;;) {
-            if ((uint32_t) (cur >> 32) != g) return -1;
-            const int n = (int) ((cur >> 16) & 0xffff), j = (int) (cur & 0xffff);
-            if (j >= n) return -1;
-            k = std::min(want, n - j);
-            if (head.compare_exchange_weak(cur, cur + (uint64_t) k, std::memory_order_acq_rel, std::memory_order_acquire))
-                return j;
-        }
-    }
-    /// A layer's jobs; the previous layer's are finished (finish()).
-    void start(std::vector<Job>&& js) {
-        if (js.empty()) return;
-        std::lock_guard<std::mutex> lk(mu);
-        jobs = std::move(js);
-        if (ready_cap < jobs.size()) {
-            ready_cap = jobs.size() * 2;
-            ready.reset(new std::atomic<int>[ready_cap]);
-        }
-        for (size_t i = 0; i < jobs.size(); ++i) ready[i].store(0, std::memory_order_relaxed);
-        issued.store(0);
-        ++gen;
-        head.store((uint64_t) gen << 32 | (uint64_t) jobs.size() << 16, std::memory_order_release);
-        cv.notify_all();
-    }
-    /// Job j's bytes, in a pinned buffer (waits for the copy).
-    const uint8_t* wait(int j) {
-        while (!ready[(size_t) j].load(std::memory_order_acquire)) std::this_thread::yield();
-        return buf[j % kRing];
-    }
-    /// The launching thread queued job j's DMA on `copy`: its buffer is free once that is done.
-    void issued_one(int j, cudaStream_t copy) {
-        cudaEventRecord(dma_done[j % kRing], copy);
-        issued.store(j + 1, std::memory_order_release);
-        issued.notify_all();
-    }
-    /// No job is running after this (the end of a layer, or an early return in the middle of one).
-    void finish() {
-        head.store((uint64_t) gen << 32, std::memory_order_release);   // n = 0: nothing more to claim
-        issued.store(1 << 30, std::memory_order_release);
-        issued.notify_all();
-        while (active.load(std::memory_order_acquire) != 0) std::this_thread::yield();
-    }
-};
+// The former file-local Stager (step 4 of the prompt-speed plan): include/strata/prefill/cold_stager.hpp,
+// methods in src/prefill/cold_stager.cpp; the alias at the top of this namespace keeps the call sites.
 
 // multi-GPU: the peer GPU's share of a prompt chunk's experts.  Per MoE layer the primary copies its normed
 // activations over P2P, the peer quantizes the rows routed to the experts it holds, runs the same MMQ products the

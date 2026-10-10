@@ -63,6 +63,23 @@ struct ExpertJobMulti {
     const void* nact[MAXT] = {};
 };
 
+/// The Qwen35 graph path (native pack read in place): one expert's three GGUF role slices against up to MAXT
+/// quantized activations (all tokens of a prefill tile routed to it), the whole expert in one worker task -
+/// gate/up rows, SwiGLU, hidden quantization, down rows.  The row-major loops read each weight row once for
+/// every activation (the slices avoid the staging copy `native_gu_rows` would otherwise read); a packed `blob`
+/// (an experts.bin pack) is the fallback.  `ff` and `hq` are the job's own scratch, one per activation.
+struct NativeSliceJob {
+    const uint8_t* gate = nullptr;
+    const uint8_t* up = nullptr;
+    const uint8_t* down = nullptr;
+    const uint8_t* blob = nullptr;   ///< packed fallback when the source has no role slices
+    int nt = 0;
+    const void* act[MAXT] = {};      ///< this job's quantized activations (the layer's gu_act)
+    float* ff[MAXT] = {};            ///< n_ff floats each
+    void* hq[MAXT] = {};             ///< the layer's d_act over n_ff
+    float* out[MAXT] = {};           ///< n_embd floats each
+};
+
 /// How worker threads are allocated across physical/logical CPU cores (#272).  `All` is the layout the pool has
 /// always used and the default; the hybrid-aware ones are opt-in (--pool-affinity auto|p-cores).
 enum class PoolAffinity {
@@ -183,6 +200,11 @@ public:
     void run_split_multi(ExpertJobMulti* jobs, int n);
     /// Plan v0.3 P6: the same for a native pack's layer (ggml-cpu arithmetic, `nact` activations).
     void run_split_multi_native(const NativeFmt& f, ExpertJobMulti* jobs, int n);
+    /// The Qwen35 path: the layer's three GGUF role slices (or a packed blob fallback), ROW-SPLIT across all
+    /// threads exactly like `run_split_multi_native`'s phases: gate/up rows, the host's intermediate
+    /// quantization, down rows.  Each row still runs the whole-expert task's per-row kernel, so the output is
+    /// bitwise the same; with only a few missed experts a whole-expert task would leave most cores idle.
+    void run_native_slice_jobs(const NativeFmt& f, NativeSliceJob* jobs, int n);
     static constexpr int kMaxSplitMulti = 96;
     /// run_split_multi's phases, accumulated ms: gate/up rows, the intermediate quantization, down rows.
     double ms_multi_gu = 0, ms_multi_q = 0, ms_multi_down = 0;
@@ -295,6 +317,7 @@ private:
         alignas(64) uint8_t hq[MAXT][kNativeHBytes];   // plan v0.3 P6: native down activations
     };
     const NativeFmt* nfmt_ = nullptr;
+    NativeSliceJob* sjobs_ = nullptr;   ///< mode 7: one whole-expert task per index
     std::vector<SplitBufMulti> split_multi_;
     PoolAffinity affinity_ = PoolAffinity::All;
     CpuTopology topo_;

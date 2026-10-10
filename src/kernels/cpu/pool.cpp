@@ -624,9 +624,35 @@ void ExpertPool::drain(int id, ExpertScratch& scratch, uint32_t epoch) {
             const int e = (int) i / parts_b_, part = (int) i % parts_b_;
             const int r0 = H * part / parts_b_, r1 = H * (part + 1) / parts_b_;
             s2_expert_down_rows(jobs_[e].blob, split_[(size_t) e].a2, jobs_[e].out, r0, r1);
+        } else if (mode_ == 8) {
+            // The Qwen35 path, ROW-SPLIT: this task owns an equal range of the phase's gate/up rows across
+            // all its experts (the range may span two).  Same per-row kernels the whole-expert task ran, so
+            // every row's bits are unchanged; the caller quantizes the intermediates between the phases.
+            const int per = (int) nfmt_->n_ff;
+            const int64_t g0 = mrows_ * (int64_t) i / mtasks_, g1 = mrows_ * (int64_t) (i + 1) / mtasks_;
+            for (int64_t r = g0; r < g1;) {
+                const int e = (int) (r / per), r0 = (int) (r % per);
+                const int r1 = (int) std::min<int64_t>(per, r0 + (g1 - r));
+                const NativeSliceJob& sj = sjobs_[(size_t) e];
+                if (sj.gate != nullptr) native_gu_rows_slices(*nfmt_, sj.gate, sj.up, sj.act, sj.nt, sj.ff, r0, r1);
+                else native_gu_rows(*nfmt_, sj.blob, sj.act, sj.nt, sj.ff, r0, r1);
+                r += r1 - r0;
+            }
+        } else if (mode_ == 9) {
+            // ... and the down rows the same way (from the intermediates the caller quantized between phases).
+            const int per = (int) nfmt_->n_embd;
+            const int64_t g0 = mrows_ * (int64_t) i / mtasks_, g1 = mrows_ * (int64_t) (i + 1) / mtasks_;
+            for (int64_t r = g0; r < g1;) {
+                const int e = (int) (r / per), r0 = (int) (r % per);
+                const int r1 = (int) std::min<int64_t>(per, r0 + (g1 - r));
+                const NativeSliceJob& sj = sjobs_[(size_t) e];
+                if (sj.gate != nullptr) native_down_rows_slice(*nfmt_, sj.down, sj.hq, sj.nt, sj.out, r0, r1);
+                else native_down_rows(*nfmt_, sj.blob, sj.hq, sj.nt, sj.out, r0, r1);
+                r += r1 - r0;
+            }
         } else if (mode_ >= 5) {
             // plan v0.3 P6: native layers, 5 = gate/up rows, 6 = down rows
-            const int per = mode_ == 5 ? FF : H;
+            const int per = mode_ == 5 ? (int) nfmt_->n_ff : (int) nfmt_->n_embd;
             const int64_t g0 = mrows_ * (int64_t) i / mtasks_, g1 = mrows_ * (int64_t) (i + 1) / mtasks_;
             for (int64_t r = g0; r < g1;) {
                 const int e = (int) (r / per), r0 = (int) (r % per);
@@ -764,17 +790,17 @@ void ExpertPool::run_split_multi_native(const NativeFmt& f, ExpertJobMulti* jobs
         const int nb = (std::min)(kMaxSplitMulti, n - b0);
         mjobs_ = jobs + b0;
         nfmt_ = &f;
-        mrows_ = (int64_t) nb * FF;
+        mrows_ = (int64_t) nb * f.n_ff;
         mtasks_ = phase_tasks(mrows_);
         const auto a = std::chrono::steady_clock::now();
         run_phase(5, mtasks_);
         const auto b = std::chrono::steady_clock::now();
         for (int e = 0; e < nb; ++e)
             for (int t = 0; t < mjobs_[e].nt; ++t)
-                if (q2_native_kernels(f.d_type)) act_quant_any(split_multi_[(size_t) e].ff[t], FF, split_multi_[(size_t) e].a2[t]);
+                if (q2_native_kernels(f.d_type)) act_quant_any(split_multi_[(size_t) e].ff[t], (int) f.n_ff, split_multi_[(size_t) e].a2[t]);
                 else native_quant_h(f, split_multi_[(size_t) e].ff[t], split_multi_[(size_t) e].hq[t]);
         const auto c = std::chrono::steady_clock::now();
-        mrows_ = (int64_t) nb * H;
+        mrows_ = (int64_t) nb * f.n_embd;
         mtasks_ = phase_tasks(mrows_);
         run_phase(6, mtasks_);
         const auto d = std::chrono::steady_clock::now();
@@ -783,6 +809,52 @@ void ExpertPool::run_split_multi_native(const NativeFmt& f, ExpertJobMulti* jobs
         ms_multi_down += std::chrono::duration<double, std::milli>(d - c).count();
     }
     multi_bytes += (int64_t) n * (int64_t) f.bytes;
+    mode_ = 0;
+    ms_drain_ += std::chrono::duration<double, std::milli>(std::chrono::steady_clock::now() - t0).count();
+}
+
+void ExpertPool::run_native_slice_jobs(const NativeFmt& f, NativeSliceJob* jobs, int n) {
+    if (n <= 0) return;
+    if (n_ == 1) {   // no workers: run inline, so a single-core machine still produces a token
+        for (int i = 0; i < n; ++i) {
+            const NativeSliceJob& sj = jobs[i];
+            const int nt = sj.nt;
+            if (sj.gate != nullptr) {
+                native_gu_rows_slices(f, sj.gate, sj.up, sj.act, nt, sj.ff, 0, (int) f.n_ff);
+                for (int t = 0; t < nt; ++t) native_quant_h(f, sj.ff[t], sj.hq[t]);
+                native_down_rows_slice(f, sj.down, sj.hq, nt, sj.out, 0, (int) f.n_embd);
+            } else {
+                native_gu_rows(f, sj.blob, sj.act, nt, sj.ff, 0, (int) f.n_ff);
+                for (int t = 0; t < nt; ++t) native_quant_h(f, sj.ff[t], sj.hq[t]);
+                native_down_rows(f, sj.blob, sj.hq, nt, sj.out, 0, (int) f.n_embd);
+            }
+        }
+        return;
+    }
+    // ROW-SPLIT (the multi-token phases' protocol, run_split_multi_native's shape): phase 8 streams the
+    // gate/up rows across ALL threads - with only a few missed experts a whole-expert task would leave every
+    // other core idle - the host quantizes each expert's intermediates, phase 9 does the down rows.  Each
+    // row runs the same per-row kernel as the whole-expert task, so the output is bitwise unchanged; the
+    // slice jobs carry their own ff/hq scratch, so no extra per-expert buffers are needed.
+    const auto t0 = std::chrono::steady_clock::now();
+    nfmt_ = &f;
+    sjobs_ = jobs;
+    mrows_ = (int64_t) n * f.n_ff;
+    mtasks_ = phase_tasks(mrows_);
+    const auto a = std::chrono::steady_clock::now();
+    run_phase(8, mtasks_);
+    const auto b = std::chrono::steady_clock::now();
+    for (int e = 0; e < n; ++e)
+        for (int t = 0; t < jobs[e].nt; ++t)
+            native_quant_h(f, jobs[e].ff[t], jobs[e].hq[t]);
+    const auto c = std::chrono::steady_clock::now();
+    mrows_ = (int64_t) n * f.n_embd;
+    mtasks_ = phase_tasks(mrows_);
+    run_phase(9, mtasks_);
+    const auto d = std::chrono::steady_clock::now();
+    ms_multi_gu += std::chrono::duration<double, std::milli>(b - a).count();
+    ms_multi_q += std::chrono::duration<double, std::milli>(c - b).count();
+    ms_multi_down += std::chrono::duration<double, std::milli>(d - c).count();
     mode_ = 0;
     ms_drain_ += std::chrono::duration<double, std::milli>(std::chrono::steady_clock::now() - t0).count();
 }

@@ -172,9 +172,27 @@ public:
     /// The slot range layer `l` may admit into under per-layer admission.  Exposed so a test can check it.
     void layer_slot_range(int64_t layer, int64_t& lo, int64_t& hi) const;
 
+    /// **AN ADMISSION CEILING FOR THE PROMPT PATH'S LOAN.**  `admit` hands out no slot at or past `limit`
+    /// (the loan's first slot) while the prompt holds the tail; -1 (the default) means the whole arena.  The
+    /// counter only moves forward, so clearing the limit never re-hands a slot that was already admitted.
+    void set_admit_limit(int64_t limit) {
+        admit_limit_ = limit < 0 ? -1 : (limit > slots_ ? slots_ : limit);
+    }
+    int64_t admit_limit() const { return admit_limit_ < 0 ? slots_ : admit_limit_; }
+
     /// The device address of one slot.
     uint8_t* device_slot(int32_t slot);
     const uint8_t* device_slot(int32_t slot) const;
+
+    /// **THE PROMPT PATH'S LOAN (the Qwen35 prompt, same contract as generate.cpp's `lent`/`host_res`).**
+    /// Marks every resident whose slot >= `first` as `kNotResident` and returns its `(residency index, slot)`
+    /// pairs, so those tail slots can serve as the prompt's workspace/ring.  A lent expert is streamed during
+    /// the prompt and copied back by `restore_lent` after it, when the decode tier must see it again.  Slots
+    /// past `next_free_` (never admitted) stay empty: they are workspace only and are not restored.
+    int64_t lend_from(int64_t first, std::vector<std::pair<int64_t, int64_t>>& lent);
+    /// Puts the pairs back after their blobs were copied into the slots again.  An entry a later admission
+    /// claimed meanwhile is left alone (never two owners for one slot).
+    void restore_lent(const std::vector<std::pair<int64_t, int64_t>>& lent);
 
     /// Copies `(layer, expert)`'s blob from `host_blob` into `slot` on `stream`.  Asynchronous: the caller
     /// orders it.  Returns false if the indices are out of range rather than reading past the arena.
@@ -240,6 +258,8 @@ private:
     std::vector<int32_t> layer_next_;   ///< [n_layers] -> that layer's next free slot
     std::vector<uint64_t> off_;         ///< plan v0.3 P6: slot offsets (slots + 1 entries) when sized
     int64_t admitted_ = 0;
+    /// The prompt loan's admission ceiling (see set_admit_limit); -1: the whole arena.
+    int64_t admit_limit_ = -1;
 };
 
 }  // namespace strata::core

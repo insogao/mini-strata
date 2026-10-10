@@ -967,6 +967,8 @@ struct ggml_backend_sched {
     void * callback_eval_user_data;
 
     ggml_backend_sched_copy_callback callback_copy;
+    ggml_backend_sched_external_callback callback_external;
+    void * callback_external_user_data;
     void * callback_copy_user_data;
 
     char * context_buffer;
@@ -1061,7 +1063,20 @@ static char causes[GGML_DEFAULT_GRAPH_SIZE*16 + GGML_SCHED_MAX_SPLITS_DEBUG*GGML
 #endif
 
 // returns the backend that should be used for the node based on the current locations
+static bool ggml_backend_sched_is_external(ggml_backend_sched_t sched, ggml_tensor * node) {
+    return sched->callback_external && sched->callback_external(NULL, node, true, sched->callback_external_user_data);
+}
+
 static int ggml_backend_sched_backend_id_from_cur(ggml_backend_sched_t sched, struct ggml_tensor * tensor) {
+    if (ggml_backend_sched_is_external(sched, tensor)) {
+        // Application executes this producer, not the ordinary CUDA op dispatcher.
+        for (int b = 0; b < sched->n_backends; ++b) {
+            if (ggml_backend_dev_type(ggml_backend_get_device(sched->backends[b])) == GGML_BACKEND_DEVICE_TYPE_GPU) {
+                return b;
+            }
+        }
+        GGML_ABORT("external device producer requires a GPU backend");
+    }
     // assign pre-allocated nodes to their backend
     int cur_backend_id = ggml_backend_sched_backend_from_buffer(sched, tensor, tensor);
     if (cur_backend_id != -1) {
@@ -1207,6 +1222,7 @@ static void ggml_backend_sched_set_if_supported(ggml_backend_sched_t sched, stru
 
 // assigns backends to ops and splits the graph into subgraphs that can be computed on the same backend
 void ggml_backend_sched_split_graph(ggml_backend_sched_t sched, struct ggml_cgraph * graph) {
+    if (getenv("GGML_STRATA_TRACE")) GGML_LOG_ERROR("strata trace: split_graph begin n_nodes %d\n", graph->n_nodes);
     // reset splits
     sched->n_splits = 0;
     sched->n_graph_inputs = 0;
@@ -1354,6 +1370,9 @@ void ggml_backend_sched_split_graph(ggml_backend_sched_t sched, struct ggml_cgra
     // only nodes that could not be assigned during expansion due to the backend not supporting the op should be unassigned at this point
     for (int i = 0; i < graph->n_nodes; i++) {
         struct ggml_tensor * node = graph->nodes[i];
+        if (ggml_backend_sched_is_external(sched, node)) {
+            continue;
+        }
         if (ggml_is_view_op(node->op)) {
             continue;
         }
@@ -1439,6 +1458,7 @@ void ggml_backend_sched_split_graph(ggml_backend_sched_t sched, struct ggml_cgra
 
     // pass 5: split graph, find tensors that need to be copied
     {
+        if (getenv("GGML_STRATA_TRACE")) GGML_LOG_ERROR("strata trace: split_graph pass5 begin\n");
         int i_split = 0;
         struct ggml_backend_sched_split * split = &sched->splits[0];
         // find the backend of the first split, skipping view ops
@@ -1455,17 +1475,20 @@ void ggml_backend_sched_split_graph(ggml_backend_sched_t sched, struct ggml_cgra
         int cur_backend_id = split->backend_id;
         for (; i < graph->n_nodes; i++) {
             struct ggml_tensor * node = graph->nodes[i];
-
-            if (ggml_is_view_op(node->op)) {
+            if (ggml_is_view_op(node->op) && !ggml_backend_sched_is_external(sched,node) && !ggml_backend_sched_is_external(sched, graph->nodes[split->i_start])) {
                 continue;
             }
-
             const int node_backend_id = tensor_backend_id(node);
 
             GGML_ASSERT(node_backend_id != -1); // all nodes should be assigned by now, this can happen if there is no CPU fallback
 
             // check if we should start a new split based on the sources of the current node
-            bool need_new_split = false;
+            // External producer has its own pre/post seam even when all three
+            // segments share one CUDA backend. Do not send CUSTOM to CUDA.
+            const bool external = ggml_backend_sched_is_external(sched, node);
+            if (getenv("GGML_STRATA_TRACE") && external) GGML_LOG_ERROR("strata trace: split_graph pass5 external node %d %s split %d start %d\n", i, node->name, i_split, split->i_start);
+            bool need_new_split = i > split->i_start &&
+                (external || ggml_backend_sched_is_external(sched, graph->nodes[split->i_start]));
             if (node_backend_id == cur_backend_id && split->n_inputs > 0) {
                 for (int j = 0; j < GGML_MAX_SRC; j++) {
                     struct ggml_tensor * src = node->src[j];
@@ -1502,6 +1525,12 @@ void ggml_backend_sched_split_graph(ggml_backend_sched_t sched, struct ggml_cgra
                 split->i_start = i;
                 split->n_inputs = 0;
                 cur_backend_id = node_backend_id;
+            }
+
+            if (external || ggml_is_view_op(node->op)) {
+                // Original device inputs are real allocation dependencies. The
+                // callback validates residency, and handles selective CPU misses.
+                continue;
             }
 
             // find inputs that are not on the same backend
@@ -1618,14 +1647,29 @@ void ggml_backend_sched_split_graph(ggml_backend_sched_t sched, struct ggml_cgra
         struct ggml_backend_sched_split * split = &sched->splits[i];
         split->graph = ggml_graph_view(graph, split->i_start, split->i_end);
 
-        ggml_backend_graph_optimize(sched->backends[split->backend_id], &split->graph, &opt_params);
+        // A split that carries an external producer, or a view of one, is not this backend's arithmetic: the
+        // external callback wrote the base tensor, and the vendor optimizer must not be run over the seam
+        // (a CUDA split of views of an external node crashed the graph optimizer at reservation).
+        bool touches_external = false;
+        for (int j = 0; j < split->graph.n_nodes && !touches_external; ++j) {
+            struct ggml_tensor * n = split->graph.nodes[j];
+            if (ggml_backend_sched_is_external(sched, n)) { touches_external = true; break; }
+            for (struct ggml_tensor * v = n; v != nullptr && !touches_external; v = v->view_src)
+                if (ggml_backend_sched_is_external(sched, v)) touches_external = true;
+        }
+        if (!touches_external) {
+            if (getenv("GGML_STRATA_TRACE")) GGML_LOG_ERROR("strata trace: optimize split %d backend %s nodes %d\n", i, ggml_backend_name(sched->backends[split->backend_id]), split->graph.n_nodes);
+            ggml_backend_graph_optimize(sched->backends[split->backend_id], &split->graph, &opt_params);
+        }
     }
+    if (getenv("GGML_STRATA_TRACE")) GGML_LOG_ERROR("strata trace: optimize loop done\n");
 
     // each dep is added to graph_copy as a GGML_OP_NONE node with the kept tensors as srcs
     int n_dep_nodes = 0;
     for (const auto & it : alloc_deps) {
         n_dep_nodes += (it.second.size() + GGML_MAX_SRC - 1) / GGML_MAX_SRC;
     }
+    if (getenv("GGML_STRATA_TRACE")) GGML_LOG_ERROR("strata trace: deps %zu -> dep nodes %d\n", alloc_deps.size(), n_dep_nodes);
 
     int total_inputs = sched->n_graph_inputs;
     for (int i = 0; i < sched->n_splits; i++) {
@@ -1702,6 +1746,7 @@ void ggml_backend_sched_split_graph(ggml_backend_sched_t sched, struct ggml_cgra
 
     // a mismatch means a backend added a dep with an `until` tensor that is not a node of the optimized graph
     GGML_ASSERT(n_dep_nodes_added == n_dep_nodes);
+    if (getenv("GGML_STRATA_TRACE")) GGML_LOG_ERROR("strata trace: graph_copy nodes %d leafs %d\n", graph_copy->n_nodes, graph_copy->n_leafs);
 
     if (sched->n_copies > 1) {
         // add input copies as leafs so that they are allocated first
@@ -1745,6 +1790,7 @@ void ggml_backend_sched_split_graph(ggml_backend_sched_t sched, struct ggml_cgra
     for (int i = 0; i < sched->n_splits; ++i) {
         sched->splits[i].graph.uid = ggml_graph_next_uid();
     }
+    if (getenv("GGML_STRATA_TRACE")) GGML_LOG_ERROR("strata trace: split_graph end\n");
 }
 
 static bool ggml_backend_sched_alloc_splits(ggml_backend_sched_t sched) {
@@ -1860,6 +1906,23 @@ static enum ggml_status ggml_backend_sched_compute_splits(ggml_backend_sched_t s
         struct ggml_backend_sched_split * split = &splits[split_id];
         int split_backend_id = split->backend_id;
         ggml_backend_t split_backend = sched->backends[split_backend_id];
+        if (getenv("GGML_STRATA_TRACE")) GGML_LOG_ERROR("strata trace: compute split %d backend %s nodes %d inputs %d ext %d\n",
+            split_id, ggml_backend_name(split_backend), split->graph.n_nodes, split->n_inputs,
+            ggml_backend_sched_is_external(sched, split->graph.nodes[0]) ? 1 : 0);
+
+        if (ggml_backend_sched_is_external(sched, split->graph.nodes[0])) {
+            GGML_ASSERT(split->graph.n_nodes == 1 && split->n_inputs == 0);
+            if (!sched->callback_external(split_backend, split->graph.nodes[0], false, sched->callback_external_user_data)) {
+                return GGML_STATUS_FAILED;
+            }
+            // Callback orders pre -> private expert stream -> post via events.
+            // Keep this before generic cross-backend host synchronization/copy.
+            if (sched->events[split_backend_id][sched->cur_copy]) {
+                ggml_backend_event_record(sched->events[split_backend_id][sched->cur_copy], split_backend);
+            }
+            prev_backend_id = split_backend_id;
+            continue;
+        }
 
         // ensure the previous split's async work has completed before we start
         // this split, the allocator may have reused buffer regions across splits
@@ -2087,10 +2150,12 @@ bool ggml_backend_sched_alloc_graph(ggml_backend_sched_t sched, struct ggml_cgra
     sched->next_copy = (sched->next_copy + 1) % sched->n_copies;
 
     ggml_backend_sched_split_graph(sched, graph);
+    if (getenv("GGML_STRATA_TRACE")) GGML_LOG_ERROR("strata trace: alloc_graph split_graph done n_splits %d\n", sched->n_splits);
 
     if (!ggml_backend_sched_alloc_splits(sched)) {
         return false;
     }
+    if (getenv("GGML_STRATA_TRACE")) GGML_LOG_ERROR("strata trace: alloc_graph alloc_splits done\n");
 
     sched->is_alloc = true;
 
@@ -2141,6 +2206,12 @@ void ggml_backend_sched_set_copy_callback(ggml_backend_sched_t sched, ggml_backe
     GGML_ASSERT(sched);
     sched->callback_copy = callback;
     sched->callback_copy_user_data = user_data;
+}
+
+void ggml_backend_sched_set_external_callback(ggml_backend_sched_t sched, ggml_backend_sched_external_callback callback, void * user_data) {
+    GGML_ASSERT(sched);
+    sched->callback_external = callback;
+    sched->callback_external_user_data = user_data;
 }
 
 int ggml_backend_sched_get_n_splits(ggml_backend_sched_t sched) {

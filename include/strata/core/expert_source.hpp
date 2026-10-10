@@ -146,6 +146,11 @@ public:
     /// A blob pointer that stays valid (not recycled) for as long as the source is open: for a copy that runs
     /// asynchronously long after the call (the adaptive tier's swap-ins).  Defaults to `blob`.
     virtual const uint8_t* blob_stable(int64_t layer, int64_t expert) { return blob(layer, expert); }
+    /// The three GGUF role slices of `(layer, expert)` read in place (gate / up / down), when this source has
+    /// them; false otherwise.  A consumer that gets them computes the expert without staging a blob.
+    virtual bool slices(int64_t layer, int64_t expert, const uint8_t* out[3]) {
+        (void) layer; (void) expert; (void) out; return false;
+    }
 
     /// Blobs touched, for the driver to report.  A source that does not count returns 0.
     virtual int64_t reads() const { return 0; }
@@ -186,7 +191,11 @@ public:
     /// The blob's bytes into `dst` (blob_bytes(layer) of them).  Safe from several threads for a source whose
     /// `transient` can be true.
     virtual bool copy_blob(int64_t layer, int64_t expert, uint8_t* dst);
-    /// Asks the OS for these pairs' bytes ahead of the `blob` calls that read them.  False (nothing asked) by default.
+    /// Asks the OS for these pairs' bytes ahead of the `blob` calls that read them.  False (nothing asked) by
+    /// default.  On Windows the platform read-ahead helper is a no-op, so FileExpertSource offers the same
+    /// PrefetchVirtualMemory hint under the exact-value opt-in STRATA_QWEN35_COLD_HINT="1" (bounded pairs,
+    /// three role slices, no stage pool/locks/threads); unset keeps the original behaviour and the return
+    /// reports only that the hint call itself was made successfully - it does not prove the pages are resident.
     virtual bool advise_pairs(const std::pair<int32_t, int32_t>* pairs, int64_t n) const {
         (void) pairs; (void) n; return false;
     }
@@ -296,6 +305,10 @@ struct ExpertDispatch {
     RemoteExperts* remote[3] = {}; ///< optional CUDA1..3 tiers for otherwise CPU-served rows
     int remote_count = 0;
     int64_t n_expert = strata::kernels::cpu::NE;
+    /// The model's own expert geometry (the Flash-Next constants when nobody sets them).  The Qwen35 graph path
+    /// passes 2048/512 here; nothing else about the adapter changes.
+    int64_t n_embd = strata::kernels::cpu::H;
+    int64_t n_ff = strata::kernels::cpu::FF;
 
     /// Counters, for the driver to report rather than for control flow.
     int64_t layers = 0;
@@ -397,6 +410,84 @@ struct ExpertDispatch {
 
     std::vector<strata::kernels::cpu::ExpertJob> jobs;
     strata::kernels::cpu::ActQ act;
+    /// The Qwen35 graph path (expert_native_qwen_dispatch): one quantized activation per routed entry, the
+    /// whole-expert slice jobs and their scratch, reused every layer so the token path allocates nothing.
+    std::vector<uint8_t> qwen_acts;
+    std::vector<strata::kernels::cpu::NativeSliceJob> qwen_jobs;
+    std::vector<float> qwen_ff;
+    std::vector<uint8_t> qwen_hq;
+    std::vector<int32_t> qwen_local_ids;   ///< the decode layer's miss ids, contiguous
+
+    // ============ THE QWEN35 NATIVE TIER, INSIDE THE SHARED SERVICE ============
+    //
+    // The graph boundary (qwen35_bridge.cpp) transfers the router ids and the activation image; the tier here
+    // owns everything else the Qwen decode needs: which experts the cache holds and their device addresses,
+    // the Launch (GPU hits) -> CPU misses -> Combine order, and the compulsory admission that fills the tier.
+    /// One resident slot's device address; index = ExpertCache slot.
+    std::vector<unsigned long long> native_slot_ptr;
+    /// The tier's own cache (the shared service owns the lifecycle; `cache` aliases it for the base fields).
+    std::unique_ptr<ExpertCache> native_cache;
+    /// Device buffers the native GPU-hit launch owns, sized for `native_k` entries at the layer's geometry.
+    int64_t native_k = 0, native_embd = 0, native_ff = 0;
+    /// THE HIT LAUNCH'S METADATA, ONE BOUNDED PERSISTENT BLOCK PER SIDE: `ptr[k]` (u64) | `start[k+1]` |
+    /// `dst[k]` | `tok[k]` | `groups` (i32), the u64 pointer section 8-byte aligned and the int32 sections
+    /// 4-byte (their natural) aligned, so ONE H2D publishes the whole plan and the same mature grouped kernel
+    /// reads each field at its offset.  Host side: `native_meta_h` (the single staged image); device side:
+    /// `native_meta_dev`.  Both are sized in `native_buffers` for `k` and reused every layer.  Rewrite
+    /// safety: the host block is refilled inside the launch, which runs after the layer's router-id event
+    /// wait; that event is ordered (graph pre -> copy) after the backend stream's wait on the previous
+    /// layer's post, so the previous layer's H2D has completed.  The device block's H2D is enqueued on the
+    /// layer's work stream after its `pre` wait, so the previous layer's grouped kernel - ordered to end
+    /// before that `pre` via its post wait - can no longer read it.
+    void* native_meta_dev = nullptr;
+    std::vector<uint8_t> native_meta_h;
+    void* native_d_act = nullptr;
+    void* native_x_q8_1 = nullptr;
+    void* native_scratch = nullptr;
+    size_t native_scratch_bytes = 0;
+    /// The layer's (k, n_embd) expert-result staging on the device: GPU hits write it, CPU misses are copied
+    /// into it, Combine reads it.
+    float* native_parts_dev = nullptr;
+    /// Counters: GPU hits and CPU entries this tier dispatched.
+    int64_t native_hits = 0, native_misses = 0;
+    /// The Qwen35 native tier's phase timers (ms, accumulated) and overlap counters, for the report.
+    struct NativeTierStats {
+        double ms_ids = 0, ms_launch = 0, ms_misses = 0, ms_combine = 0, ms_queue = 0;
+        int64_t hit_overlap = 0;   ///< layers where the GPU hit work was DONE when the CPU misses ended
+        int64_t hit_late = 0;      ///< layers where it was still running
+        int64_t hit_inflight = 0;  ///< layers where the hit kernel was still running right after its launch
+        int64_t all_hit = 0;       ///< layers with no CPU miss at all
+        // The prompt path (qwen35_prefill.cu): real expert-pipeline counters, not estimates.
+        int64_t prefill_layers_gpu = 0;    ///< prompt layers run on the GPU through the MMQ pipeline
+        int64_t prefill_resident = 0;      ///< experts read from their VRAM cache slots
+        int64_t prefill_streamed = 0;      ///< cold experts DMA'd through the bounded pinned ring
+        int64_t prefill_product_calls = 0; ///< MMQ product launches (gu + down)
+        uint64_t prefill_stream_bytes = 0; ///< bytes the ring copied host -> device
+        uint64_t prefill_workspace_bytes = 0;  ///< the prompt workspace (allocated once, bounded)
+        uint64_t prefill_ring_bytes = 0;       ///< the pinned ring (host + device halves)
+        // The prompt path's loan (expert_native_loan_plan): the cache slots/bytes behind its workspace.
+        int64_t prefill_loan_slots = 0;        ///< cache slots borrowed (0: owned buffers)
+        uint64_t prefill_loan_bytes = 0;       ///< the borrowed region's real bytes (variable-slot aware)
+        uint64_t prefill_owned_bytes = 0;      ///< device bytes the prompt path allocated itself (fallback)
+        int64_t prefill_loan_restored = 0;     ///< lent experts copied back before the decode tier ran
+        double prefill_loan_refill_ms = 0;
+        std::string prefill_loan_why;          ///< why the fallback/owned buffers were used (empty: borrowed)
+        double prefill_ms = 0;             ///< wall time in the GPU prompt expert path
+    };
+    NativeTierStats native_stats;
+    /// The prompt path's loan state: the borrowed tail slots (see expert_native_loan_plan / _return).
+    bool native_loan_active = false;
+    int64_t native_loan_first = 0, native_loan_slots = 0;
+    uint64_t native_loan_bytes = 0;
+    int64_t native_loan_restored = 0;
+    double native_loan_refill_ms = 0;
+    std::vector<std::pair<int64_t, int64_t>> native_loan_lent;
+    void* prefill_state = nullptr;       ///< the Qwen prompt path's workspace (qwen35_prefill.cu)
+    void* native_ev_ids = nullptr;      ///< cudaEvent_t, the tier's own (lazy)
+    void* native_ev_act = nullptr;
+    void* native_ev_miss = nullptr;
+    void* native_ev_hit_done = nullptr;
+
     /// Plan v0.3 P6 verify window: one quantized activation per token, the multi-token jobs, and the expert ->
     /// job map (reset after every layer).
     std::vector<strata::kernels::cpu::ActQ> act_multi;
@@ -431,6 +522,10 @@ struct ExpertDispatch {
     /// whole mechanism exists to prevent.  `failed` is what the short-circuit reads.
     bool failed = false;
     const char* fail = nullptr;
+    /// Owned storage for `fail`: a message built from a local string or an exception (`e.what()`) dies before
+    /// the caller reads `fail`, so paths that cannot use a literal set it through `set_fail`.
+    std::string fail_store;
+    void set_fail(std::string text) { fail_store = std::move(text); fail = fail_store.c_str(); }
     int64_t fail_layer = -1;
     int64_t fail_expert = -1;
 };
@@ -444,6 +539,79 @@ void expert_pool_dispatch(void* user, const float* x_f, const int32_t* ids, cons
 /// resident experts' rows are zeroed (the GPU adds them).  Requires `host_res` (the token-graph residency).
 void expert_pool_dispatch_multi(ExpertDispatch& d, const float* x_f, const int32_t* ids, int64_t n_tok, int64_t k,
                                 float* out);
+
+/// **THE QWEN35 GRAPH'S CPU SIDE.**  A native (GGUF-in-place) pack, any n_tok, k experts per token: every entry
+/// whose `hit_rows[i]` is zero (or `hit_rows == nullptr`) is computed here from the source's three role slices
+/// (or its packed blob), into `out[i * n_embd]`.  Hit rows are left untouched - the caller's GPU path owns them,
+/// and the caller counts them.  `x_f` is (n_tok, n_embd) host floats, `ids` (n_tok, k) host int32.
+/// Lives here, not in the graph bridge, because the source, the pool and the counters are this adapter's.
+void expert_native_qwen_dispatch(ExpertDispatch& d, const float* x_f, const int32_t* ids, int64_t n_tok, int64_t k,
+                                 const uint8_t* hit_rows, float* out);
+
+// ================== THE QWEN35 NATIVE TIER (shared-service API for the graph boundary) ==================
+//
+// The graph boundary (qwen35_bridge.cpp) does exactly two things with these: transfer the router ids and the
+// activation image, and call them in the Launch -> CPU misses -> Combine order.  The residency table, the GPU
+// hit dispatch, the CPU miss dispatch, the device combine and the cache budget/admission all live here.
+
+/// Opens the GPU tier with `slots` variable-size slots (largest native blob), fills them from `profile`
+/// (ranked hottest first; empty = leave them for compulsory admission), and verifies one filled slot.
+/// 0 slots = tier off (returns true, nothing opened).
+bool expert_native_cache_open(ExpertDispatch& d, int64_t slots, const std::string& profile, std::string& err);
+/// `(layer, expert) -> slot` from the shared cache, `-1` when not resident.  `-1` for every expert when off.
+int32_t expert_native_slot_of(const ExpertDispatch& d, int64_t layer, int64_t expert);
+
+/// **THE PROMPT PATH'S LOAN** (the Qwen35 prompt, same contract as generate.cpp's `lent`/`host_res`): plans the
+/// tail slots to borrow so the prompt workspace/ring live inside the cache instead of its own cudaMalloc, marks
+/// the borrowed slots' residents `kNotResident` (they become CPU misses until `expert_native_loan_return`), and
+/// prices the region from the cache's REAL slot offsets (variable-size aware).  Returns the borrowed device
+/// base or null with `why` set (no cache / the tail cannot cover `need_bytes`); `got_bytes` then holds the
+/// region's bytes.  The decode tier keeps at least 128 slots below the loan.
+void* expert_native_loan_plan(ExpertDispatch& d, uint64_t need_bytes, uint64_t& got_bytes, std::string& why);
+/// Refills every lent expert from the source and restores its residency, so the next decode query sees it.
+/// All prompt device work must be complete (the caller synchronizes).  On failure the slots stay
+/// `kNotResident` - a fake residency is worse than a slow miss - and `err` says where.
+bool expert_native_loan_return(ExpertDispatch& d, std::string& err);
+/// **LAUNCH**: the resident experts of `layer` among `ids` (host, `k` entries).  Fills `is_hit[i]`, uploads the
+/// activation image `x_dev` and the group indices, and enqueues `native_expert_grouped` into `stream` writing
+/// `d.native_parts_dev` rows (rank-indexed).  Returns the number of hits; false on a device error.
+/// The buffer image (device arrays, quantized activation, parts) is allocated on first use at k x n_embd.
+bool expert_native_launch(ExpertDispatch& d, int64_t layer, void* stream, const float* x_dev,
+                          const int32_t* ids, int64_t k, uint8_t* is_hit);
+/// **CPU MISSES**: wraps `expert_native_qwen_dispatch` for the miss rows of one token; counts them.
+bool expert_native_misses(ExpertDispatch& d, int64_t layer, const float* x_host, const int32_t* miss_ids,
+                          int64_t nm, float* out);
+/// **COMBINE**: the weighted sum of `k` rows of `d.native_parts_dev` with the DEVICE router weights into
+/// `out_dev`, on `stream` (the same stream the hits and the miss uploads were ordered on).
+bool expert_native_combine(ExpertDispatch& d, void* stream, const float* weights_dev, float* out_dev, int64_t k);
+/// The device expert-result staging (the boundary copies CPU misses into it and Combine reads it).
+float* expert_native_parts(ExpertDispatch& d);
+    /// Compulsory admission (the hot-assembly lifecycle): the `n` routed experts of `layer` that are not resident
+    /// take free slots (copied from the source on the legacy stream, blocking) until the tier is full.  No eviction.
+    bool expert_native_admit(ExpertDispatch& d, int64_t layer, const int32_t* ids, int64_t n, std::string& err);
+
+    // ================== THE QWEN35 DECODE LAYER, WHOLE ==================
+    //
+    // The graph boundary owns the device tensors and a bounded pinned staging block; everything else of one
+    // decode layer's routed MoE - the router-id transfer, the residency decision, the GPU hit dispatch, the
+    // CPU miss collection and compute, the result upload, the device combine and the cache admission - is
+    // this call.  The boundary only records the pre event, calls this, and records the post event.
+    /// The caller-owned staging (pinned unless noted): `k` ids, `n_embd` activation floats, `k x n_embd` miss
+    /// rows, `k` hit flags; the two non-blocking streams the boundary ordered on its pre event.
+    struct NativeDecodeStage {
+        void* work_stream = nullptr;
+        void* copy_stream = nullptr;
+        int32_t* host_ids = nullptr;
+        float* host_act = nullptr;
+        float* host_miss = nullptr;
+        uint8_t* is_hit = nullptr;
+    };
+    /// Returns false with `err` on a latched failure (the dispatch's own `fail` is authoritative too).
+    bool expert_native_decode_layer(ExpertDispatch& d, int64_t layer, int64_t k, const void* x_dev,
+                                    const void* ids_dev, const void* weights_dev, void* out_dev,
+                                    const NativeDecodeStage& st, std::string& err);
+    /// Frees the tier's device buffers and closes the cache (process teardown).
+void expert_native_close(ExpertDispatch& d);
 
 /// **THE HITS, LAUNCHED AFTER THE MISSES ARE STAGED AND BEFORE `post[l]`.**  Same shape as `PoolFn` and for the
 /// same reason: `session_loop` owns the ORDER and this owns the work, so the loop needs to know nothing about
@@ -603,7 +771,9 @@ public:
     const uint8_t* blob(int64_t layer, int64_t expert) override;
     /// With io prefetch in the experts.bin tier, the mapping itself (blob() may hand out a recycled staging buffer).
     const uint8_t* blob_stable(int64_t layer, int64_t expert) override;
-    /// Windows, opt-in with STRATA_FILE_RELEASE=1: trim the file mapping's full pages after their expert reaches
+    /// The GGUF-in-place mode's three role slices of `(layer, expert)`, directly out of the mapped files (no
+    /// staging copy): `out[0..2]` = gate / up / down.  False when this source is not reading the GGUF in place.
+    bool slices(int64_t layer, int64_t expert, const uint8_t* out[3]) override;    /// Windows, opt-in with STRATA_FILE_RELEASE=1: trim the file mapping's full pages after their expert reaches
     /// VRAM. Never touches the resident complement or staging buffers. Disabled by default.
     uint64_t release(int64_t layer, int64_t expert) override;
     bool pinned(int64_t layer, int64_t expert) const override;

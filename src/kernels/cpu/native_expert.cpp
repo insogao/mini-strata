@@ -103,6 +103,40 @@ void native_quant_h(const NativeFmt& f, const float* h, void* dst) {
     traits(f.d_act)->from_float(h, dst, f.n_ff);
 }
 
+void native_gu_dot_rows_slices(const NativeFmt& f, const uint8_t* gate, const uint8_t* up,
+    const void* const* act, int nt, float* const* gates, float* const* ups, int r0, int r1) {
+    const ggml_vec_dot_t dot = traits(f.gu_type)->vec_dot;
+    for (int r = r0; r < r1; ++r) {
+        for (int t = 0; t < nt; ++t) {
+            dot((int) f.n_embd, &gates[t][r], 0, gate + (size_t) r * f.gu_row, 0, act[t], 0, 1);
+            dot((int) f.n_embd, &ups[t][r], 0, up + (size_t) r * f.gu_row, 0, act[t], 0, 1);
+        }
+    }
+}
+
+void native_gu_rows_slices(const NativeFmt& f, const uint8_t* gate, const uint8_t* up,
+    const void* const* act, int nt, float* const* ff, int r0, int r1) {
+    const ggml_vec_dot_t dot = traits(f.gu_type)->vec_dot;
+    for (int r = r0; r < r1; ++r) {
+        for (int t = 0; t < nt; ++t) {
+            float g = 0.f, u = 0.f;
+            dot((int) f.n_embd, &g, 0, gate + (size_t) r * f.gu_row, 0, act[t], 0, 1);
+            dot((int) f.n_embd, &u, 0, up + (size_t) r * f.gu_row, 0, act[t], 0, 1);
+            ff[t][r] = (g / (1.f + std::exp(-g))) * u;
+        }
+    }
+}
+
+void native_down_rows_slice(const NativeFmt& f, const uint8_t* down,
+    const void* const* hq, int nt, float* const* out, int r0, int r1) {
+    const ggml_vec_dot_t dot = traits(f.d_type)->vec_dot;
+    for (int r = r0; r < r1; ++r) {
+        for (int t = 0; t < nt; ++t) {
+            dot((int) f.n_ff, &out[t][r], 0, down + (size_t) r * f.d_row, 0, hq[t], 0, 1);
+        }
+    }
+}
+
 int native_gu_mt_min(int gu_type) {
     // #152: from how many tokens the multi-token kernels run (ggml's vec_dot below that).  The default 2 is the
     // measured-fastest rule, but a token's expert rows then round differently alone than in a group, so greedy output

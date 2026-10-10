@@ -650,7 +650,10 @@ int32_t ExpertCache::admit(int64_t layer, int64_t expert) {
         ++admitted_;
         return residency_[at];
     }
-    if (next_free_ >= slots_) return kNotResident;   // full: no eviction, deliberately - see the header
+    // The prompt loan's ceiling (set_admit_limit): no slot at or past the borrowed tail while the prompt
+    // holds it; -1 keeps the whole arena, so every pre-existing caller is unaffected.
+    const int64_t limit = admit_limit_ < 0 ? slots_ : admit_limit_;
+    if (next_free_ >= limit) return kNotResident;   // full (or the loan's ceiling): no eviction, deliberately
     residency_[at] = (int32_t) next_free_;
     return (int32_t) next_free_++;
 }
@@ -659,6 +662,28 @@ uint8_t* ExpertCache::device_slot(int32_t slot) {
     if (slot < 0 || slot >= slots_) return nullptr;
     if (!off_.empty()) return base_ + off_[(size_t) slot];
     return base_ + (size_t) slot * (size_t) blob_;
+}
+
+int64_t ExpertCache::lend_from(int64_t first, std::vector<std::pair<int64_t, int64_t>>& lent) {
+    lent.clear();
+    if (first <= 0 || first > slots_ || residency_.empty()) return 0;
+    for (size_t i = 0; i < residency_.size(); ++i) {
+        const int32_t slot = residency_[i];
+        if (slot >= first && slot != kNotResident) {
+            lent.emplace_back((int64_t) i, (int64_t) slot);
+            residency_[i] = kNotResident;
+        }
+    }
+    return (int64_t) lent.size();
+}
+
+void ExpertCache::restore_lent(const std::vector<std::pair<int64_t, int64_t>>& lent) {
+    for (const auto& p : lent) {
+        if (p.first < 0 || (size_t) p.first >= residency_.size()) continue;
+        if (p.second < 0 || p.second >= slots_) continue;
+        if (residency_[(size_t) p.first] != kNotResident) continue;   // a later claim owns it
+        residency_[(size_t) p.first] = (int32_t) p.second;
+    }
 }
 
 const uint8_t* ExpertCache::device_slot(int32_t slot) const {

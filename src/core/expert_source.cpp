@@ -12,6 +12,8 @@
 #include "strata/kernels/elementwise.hpp"
 #include "strata/kernels/quantize_act.hpp"
 #include "strata/kernels/s2_expert_grouped.hpp"
+#include "strata/kernels/iq_kernels.hpp"
+#include "strata/kernels/native_moe.hpp"
 #include "strata/kernels/cpu/kq_avx1.hpp"
 #include "strata/kernels/cpu/kq_avx2.hpp"
 
@@ -1370,9 +1372,53 @@ void FileExpertSource::prefetch_pairs(const std::pair<int32_t, int32_t>* pairs, 
     fill_many(todo);
 }
 
+// The Qwen prompt path's bounded cold-page hint opt-in (exact "1").  On Windows the platform read-ahead helper
+// is a no-op (strata/platform/memory.cpp), so this offers the same PrefetchVirtualMemory mechanism the
+// fill/warm paths already use - without their staging pool, locks, threads or predictor bookkeeping.  Unset
+// keeps the original Windows behaviour (false, no call).  Linux does not read this.
+bool qwen_cold_hint_enabled() {
+    static const bool on = [] {
+        const char* v = std::getenv("STRATA_QWEN35_COLD_HINT");
+        return v != nullptr && std::strcmp(v, "1") == 0;
+    }();
+    return on;
+}
+
 bool FileExpertSource::advise_pairs(const std::pair<int32_t, int32_t>* pairs, int64_t n) const {
-    if (base_ == nullptr || !direct_.empty() || !strata::platform::read_ahead_enabled()) return false;
-    for (int64_t i = 0; pairs != nullptr && i < n; ++i) {
+    if (base_ == nullptr || !direct_.empty() || pairs == nullptr || n <= 0) return false;
+#if defined(_WIN32)
+    if (!qwen_cold_hint_enabled()) return false;   // default Windows: unchanged (false, no call)
+    using Pvm = BOOL(WINAPI*)(HANDLE, ULONG_PTR, PWIN32_MEMORY_RANGE_ENTRY, ULONG);
+    static const Pvm pvm = (Pvm) (void*) GetProcAddress(GetModuleHandleW(L"kernel32.dll"), "PrefetchVirtualMemory");
+    if (pvm == nullptr) return false;              // API unavailable: the copy path stays as it was
+    std::vector<WIN32_MEMORY_RANGE_ENTRY> ranges;
+    ranges.reserve(3 * 256);                       // bounded: <=256 pairs -> <=768 ranges
+    const int64_t cap = n < 256 ? n : 256;
+    for (int64_t i = 0; i < cap; ++i) {
+        const int64_t l = pairs[i].first, e = pairs[i].second;
+        if (l < 0 || e < 0 || l >= n_layers_ || e >= n_expert_) continue;
+        if (role_ptr_.empty()) {   // experts.bin: the blob is one contiguous range
+            const uint8_t* b = mapped_blob(l, e);
+            if (b != nullptr && layer_blob_bytes_[(size_t) l] > 0)
+                ranges.push_back({(PVOID) b, (SIZE_T) layer_blob_bytes_[(size_t) l]});
+            continue;
+        }
+        for (int r = 0; r < 3; ++r) {
+            const size_t k = (size_t) (3 * l + r);
+            if (k >= role_ptr_.size()) continue;
+            const uint8_t* p = role_ptr_[k];
+            const uint64_t bytes = role_bytes_[k];
+            if (p == nullptr || bytes == 0) continue;
+            const uint64_t off = (uint64_t) e * bytes;
+            if (off / bytes != (uint64_t) e) continue;   // overflow guard
+            ranges.push_back({(PVOID) (p + (size_t) off), (SIZE_T) bytes});
+        }
+    }
+    if (ranges.empty()) return false;              // no valid range: no call, no true
+    return pvm(GetCurrentProcess(), (ULONG_PTR) ranges.size(), ranges.data(), 0) != FALSE;
+#else
+    if (!strata::platform::read_ahead_enabled()) return false;
+    for (int64_t i = 0; i < n; ++i) {
         const int64_t l = pairs[i].first, e = pairs[i].second;
         if (l < 0 || e < 0 || l >= n_layers_ || e >= n_expert_) continue;
         if (role_ptr_.empty()) {   // experts.bin: the blob is one contiguous range
@@ -1385,6 +1431,7 @@ bool FileExpertSource::advise_pairs(const std::pair<int32_t, int32_t>* pairs, in
         }
     }
     return true;
+#endif
 }
 
 void FileExpertSource::fill_many(const std::vector<Fill>& todo) {
@@ -2893,6 +2940,16 @@ const uint8_t* FileExpertSource::resident_blob(int64_t layer, int64_t expert) co
     return resident_blob(index);   // through the rotation's ownership table when STRATA_EXCHANGE_ROTATE is on
 }
 
+bool FileExpertSource::slices(int64_t layer, int64_t expert, const uint8_t* out[3]) {
+    if (role_ptr_.empty() || layer < 0 || expert < 0 || layer >= n_layers_ || expert >= n_expert_) return false;
+    for (int r = 0; r < 3; ++r) {
+        const size_t i = (size_t) (3 * layer + r);
+        if (role_ptr_[i] == nullptr || role_bytes_[i] == 0) return false;
+        out[r] = role_ptr_[i] + (size_t) expert * (size_t) role_bytes_[i];
+    }
+    return true;
+}
+
 const uint8_t* FileExpertSource::blob_stable(int64_t layer, int64_t expert) {
     if (io_pf_ && role_ptr_.empty() && direct_.empty()) {
         if (complement_ready_ && layer >= 0 && expert >= 0 && layer < n_layers_ && expert < n_expert_) {
@@ -2982,9 +3039,9 @@ void expert_pool_dispatch(void* user, const float* x_f, const int32_t* ids, cons
     // Clause 3: the blob's internal offsets are compile-time constants, so a mismatched geometry does not
     // produce a wrong answer - it produces a walk off the end of the blob into the next expert's bytes, which
     // is finite and plausible.  Refuse, name the number, and let the driver report it.
-    if (n_embd != H) {
+    if (n_embd != d.n_embd) {
         d.failed = true;
-        d.fail = "the expert kernel is compiled for a 2560-wide activation";
+        d.fail = "the expert kernel was configured for a different activation width";
         d.fail_layer = d.layers;
         return;
     }
@@ -3001,7 +3058,7 @@ void expert_pool_dispatch(void* user, const float* x_f, const int32_t* ids, cons
 
     // Clause 1: rebuilt from `x_f` on EVERY call.  `x_f` is mapped pinned memory whose address never changes,
     // so anything cached against it would be layer 0's activation reused 48 times.
-    act_quant_q8_1(x_f, H, d.act);
+    act_quant_q8_1(x_f, (int) d.n_embd, d.act);
 
     // ---- R4.2c: THE POOL'S HALF OF THE SPLIT.  **IT DOES NOT DECIDE ANYTHING - `Launch` ALREADY DID.**
     //
@@ -3027,7 +3084,7 @@ void expert_pool_dispatch(void* user, const float* x_f, const int32_t* ids, cons
         static thread_local std::string remote_error;
         for (int r = 0; r < d.remote_count; ++r)
             if (!d.remote[r]->begin(d.layers, x_f, ids, 1, k, kind, d.host_res, remote_error)) {
-                d.failed = true; d.fail = remote_error.c_str(); d.fail_layer = d.layers; return;
+                d.failed = true; d.set_fail(remote_error); d.fail_layer = d.layers; return;
             }
     }
 
@@ -3087,11 +3144,619 @@ void expert_pool_dispatch(void* user, const float* x_f, const int32_t* ids, cons
         static thread_local std::string remote_error;
         for (int r = 0; r < d.remote_count; ++r)
             if (!d.remote[r]->finish(out, remote_error)) {
-                d.failed = true; d.fail = remote_error.c_str(); d.fail_layer = d.layers; return;
+                d.failed = true; d.set_fail(remote_error); d.fail_layer = d.layers; return;
             }
     }
     ++d.layers;
     d.experts += k;
+}
+
+void expert_native_qwen_dispatch(ExpertDispatch& d, const float* x_f, const int32_t* ids, int64_t n_tok, int64_t k,
+                                 const uint8_t* hit_rows, float* out) {
+    using namespace strata::kernels::cpu;
+    if (d.failed) return;
+    if (d.pool == nullptr || d.src == nullptr) {
+        d.failed = true; d.fail = "the Qwen35 expert path has no pool/source"; d.fail_layer = d.layers; return;
+    }
+    const ExpertLayout& lay = expert_layout();
+    if (!lay.native || d.layers < 0 || d.layers >= (int64_t) lay.fmt.size()) {
+        d.failed = true; d.fail = "the Qwen35 expert path needs a native pack"; d.fail_layer = d.layers; return;
+    }
+    if (n_tok < 1 || k < 1) return;
+    const NativeFmt& f = lay.fmt[(size_t) d.layers];
+    if (f.n_embd != d.n_embd || f.n_ff != d.n_ff) {
+        d.failed = true;
+        d.fail = "the Qwen35 expert geometry does not match the loaded pack";
+        d.fail_layer = d.layers;
+        return;
+    }
+    const int64_t n = n_tok * k;
+    d.qwen_acts.resize((size_t) n_tok * kNativeActBytes);
+    d.qwen_jobs.resize((size_t) n);
+    d.qwen_ff.resize((size_t) n * (size_t) f.n_ff);
+    d.qwen_hq.resize((size_t) n * kNativeHBytes);
+    for (int64_t t = 0; t < n_tok; ++t)
+        native_quant_act(f, x_f + (size_t) t * (size_t) d.n_embd, d.qwen_acts.data() + (size_t) t * kNativeActBytes);
+    d.src->begin_layer(d.layers, ids, n);
+    // Group the entries BY EXPERT: a prefill tile routes several tokens to the same expert, and one
+    // whole-expert task with all of them reads each weight row once (the row-major loops in the pool keep the
+    // row in cache across the activations).  At most MAXT activations per task; a single-token decode tile
+    // degenerates to one task per entry, as before.
+    if (d.job_of.size() != (size_t) d.n_expert) d.job_of.assign((size_t) d.n_expert, (int16_t) -1);
+    int64_t njobs = 0;
+    for (int64_t i = 0; i < n; ++i) {
+        const int64_t e = ids[i];
+        if (e < 0 || e >= d.n_expert) {
+            d.failed = true;
+            d.fail = "a routed expert id is out of range";
+            d.fail_layer = d.layers;
+            d.fail_expert = e;
+            return;
+        }
+        if (hit_rows != nullptr && hit_rows[i] != 0) {
+            ++d.cache_hits;
+            continue;
+        }
+        ++d.cache_refused;
+        int16_t& jo = d.job_of[(size_t) e];
+        if (jo < 0 || d.qwen_jobs[(size_t) jo].nt >= MAXT) {
+            NativeSliceJob& j = d.qwen_jobs[(size_t) njobs];
+            j = NativeSliceJob{};
+            const uint8_t* roles[3] = {nullptr, nullptr, nullptr};
+            if (d.src->slices(d.layers, e, roles)) {
+                j.gate = roles[0];
+                j.up = roles[1];
+                j.down = roles[2];
+            } else {
+                const uint8_t* b = d.src->blob(d.layers, e);
+                if (b == nullptr) {
+                    d.failed = true;
+                    d.fail = "the expert source could not produce a blob";
+                    d.fail_layer = d.layers;
+                    d.fail_expert = e;
+                    ++d.missing;
+                    return;
+                }
+                j.blob = b;
+            }
+            jo = (int16_t) njobs;
+            ++njobs;
+        }
+        NativeSliceJob& j = d.qwen_jobs[(size_t) jo];
+        const int t = j.nt++;
+        j.act[t] = d.qwen_acts.data() + (size_t) (i / k) * kNativeActBytes;
+        j.ff[t] = d.qwen_ff.data() + (size_t) i * (size_t) f.n_ff;
+        j.hq[t] = d.qwen_hq.data() + (size_t) i * kNativeHBytes;
+        j.out[t] = out + (size_t) i * (size_t) d.n_embd;
+    }
+    if (njobs > 0) d.pool->run_native_slice_jobs(f, d.qwen_jobs.data(), (int) njobs);
+    for (int64_t i = 0; i < n; ++i)
+        if (ids[i] >= 0 && ids[i] < d.n_expert) d.job_of[(size_t) ids[i]] = (int16_t) -1;
+    d.multi_entries += njobs;
+    ++d.layers;
+    d.experts += n;
+}
+
+// ================== THE QWEN35 NATIVE TIER ==================
+
+namespace {
+double tier_now_ms() {
+    static const auto epoch = std::chrono::steady_clock::now();
+    return std::chrono::duration<double, std::milli>(std::chrono::steady_clock::now() - epoch).count();
+}
+}  // namespace
+
+bool expert_native_cache_open(ExpertDispatch& d, int64_t slots, const std::string& profile, std::string& err) {
+    using namespace strata::kernels::cpu;
+    if (slots <= 0) return true;
+    const ExpertLayout& lay = expert_layout();
+    if (!lay.native || lay.max_blob == 0) {
+        err = "native tier: no native expert layout is loaded";
+        return false;
+    }
+    const int64_t max_blob = (int64_t) lay.max_blob;
+    std::vector<std::pair<int32_t, int32_t>> ranked;
+    if (!profile.empty()) {
+        int64_t file_slots = 0;
+        if (!read_expert_profile(profile, lay.n_layers, lay.n_expert, ranked, file_slots, err)) return false;
+        // The profile is a PRIORITY list, not a capacity limit: the requested slots are honored, the profile
+        // fills the first `ranked.size()` of them and the rest stay empty for the real routing to admit into
+        // (real tensors only - no placeholder fill).
+    }
+    slots = (std::min)(slots, lay.n_layers * lay.n_expert);
+    if (slots <= 0) {
+        err = "native tier: no slots";
+        return false;
+    }
+    if (!d.native_cache) d.native_cache = std::make_unique<ExpertCache>();
+    if (!d.native_cache->open_sized(std::vector<int64_t>((size_t) slots, max_blob), lay.n_layers, lay.n_expert, err)) {
+        d.native_cache.reset();
+        d.cache = nullptr;
+        return false;
+    }
+    d.cache = d.native_cache.get();
+    d.native_slot_ptr.assign((size_t) slots, 0);
+    for (int64_t s = 0; s < slots; ++s)
+        d.native_slot_ptr[(size_t) s] = (unsigned long long) d.native_cache->device_slot((int32_t) s);
+    std::fprintf(stderr, "strata: native expert tier: %lld slots x %lld B = %.2f GiB (%.2f GiB API bytes)\n",
+                 (long long) slots, (long long) max_blob, (double) (slots * max_blob) / 1073741824.0,
+                 (double) d.native_cache->bytes() / 1073741824.0);
+    if (!profile.empty()) {
+        const int64_t want = (std::min)(slots, (int64_t) ranked.size());
+        const auto t0 = std::chrono::steady_clock::now();
+        uint64_t fill_bytes = 0;
+        int64_t filled = 0;
+        for (int64_t i = 0; i < want; ++i) {
+            const int32_t layer = ranked[(size_t) i].first;
+            const int32_t expert = ranked[(size_t) i].second;
+            const int32_t slot = d.native_cache->admit(layer, expert);
+            if (slot < 0) break;
+            const int64_t nb = (int64_t) lay.blob_bytes(layer);
+            const uint8_t* b = d.src != nullptr ? d.src->blob_stable(layer, expert) : nullptr;
+            if (b == nullptr || !d.native_cache->fill_slot_blocking(slot, b, err, nb)) {
+                err = "native tier: the profile fill failed at pair " + std::to_string(i) + ": " + err;
+                return false;
+            }
+            fill_bytes += (uint64_t) nb;
+            ++filled;
+        }
+        if (filled > 0) {
+            const int32_t layer0 = ranked[0].first, expert0 = ranked[0].second;
+            const int32_t slot0 = d.native_cache->slot_of(layer0, expert0);
+            const uint8_t* b0 = d.src != nullptr ? d.src->blob_stable(layer0, expert0) : nullptr;
+            if (slot0 < 0 || b0 == nullptr ||
+                !d.native_cache->verify_slot(slot0, b0, err, (int64_t) lay.blob_bytes(layer0))) {
+                err = "native tier: the profile fill's slot 0 did not verify: " + err;
+                return false;
+            }
+        }
+        const double secs = std::chrono::duration<double>(std::chrono::steady_clock::now() - t0).count();
+        std::fprintf(stderr, "strata: native expert tier: pre-filled %lld of %lld slots from %s in %.1f s "
+                             "(%.0f MB/s); slot 0 verified\n", (long long) filled, (long long) slots,
+                     profile.c_str(), secs, fill_bytes / 1e6 / (secs > 0 ? secs : 1e-9));
+    }
+    return true;
+}
+
+int32_t expert_native_slot_of(const ExpertDispatch& d, int64_t layer, int64_t expert) {
+    if (d.cache == nullptr) return -1;
+    return d.cache->slot_of(layer, expert);
+}
+
+void* expert_native_loan_plan(ExpertDispatch& d, uint64_t need_bytes, uint64_t& got_bytes, std::string& why) {
+    using namespace strata::kernels::cpu;
+    got_bytes = 0;
+    why.clear();
+    if (d.failed) { why = "the native tier already failed"; return nullptr; }
+    if (d.cache == nullptr) { why = "no expert cache (the run is cache-off)"; return nullptr; }
+    if (d.src == nullptr) { why = "no expert source"; return nullptr; }
+    if (d.native_loan_active) { why = "a prompt loan is already active"; return nullptr; }
+    const ExpertLayout& lay = expert_layout();
+    if (!lay.native) { why = "no native pack is loaded"; return nullptr; }
+    const int64_t slots = d.cache->slots();
+    const int64_t keep = 128;   // the decode tier's floor below the loan, as generate.cpp's rule
+    if (slots <= keep) { why = "the cache has no slots below the decode floor to lend"; return nullptr; }
+    int64_t k = 0;
+    uint64_t region = 0;
+    for (int64_t c = 1; c + keep <= slots; ++c) {
+        const int64_t first = slots - c;
+        const uint64_t r = (uint64_t) d.cache->bytes() - (uint64_t) d.cache->slot_offset(first);
+        if (r >= need_bytes) { k = c; region = r; break; }
+    }
+    if (k <= 0) { why = "the cache tail cannot cover the prompt workspace"; return nullptr; }
+    const int64_t first = slots - k;
+    const int64_t lent = d.cache->lend_from(first, d.native_loan_lent);
+    // NO ADMISSION MAY HAND OUT THE BORROWED TAIL while the prompt holds it: the ceiling stops `admit` at
+    // `first`; the ceiling is cleared when the loan returns (the counter only moves forward).
+    d.cache->set_admit_limit(first);
+    d.native_loan_active = true;
+    d.native_loan_first = first;
+    d.native_loan_slots = k;
+    d.native_loan_bytes = region;
+    d.native_stats.prefill_loan_slots = k;
+    d.native_stats.prefill_loan_bytes = region;
+    d.native_stats.prefill_owned_bytes = 0;
+    d.native_stats.prefill_loan_why.clear();
+    got_bytes = region;
+    std::fprintf(stderr, "strata: prompt loan: borrowing the cache's last %lld slots (%.1f MiB, from slot %lld); "
+                         "%lld resident experts stream during the prompt and are refilled after it\n",
+                 (long long) k, (double) region / 1048576.0, (long long) first, (long long) lent);
+    return d.cache->device_slot((int32_t) first);
+}
+
+namespace {
+/// The loan's full byte-audit gate (diagnostic only): the exact value "1" verifies EVERY lent pair against
+/// the source's real pack before any residency is restored.  Unset (or any other value) keeps the path
+/// byte-for-byte as before: one pair verified, the rest trusted by count/lifecycle evidence.
+bool loan_verify_all_requested() {
+    const char* v = std::getenv("STRATA_QWEN35_LOAN_VERIFY");
+    return v != nullptr && std::strcmp(v, "1") == 0;
+}
+}  // namespace
+
+bool expert_native_loan_return(ExpertDispatch& d, std::string& err) {
+    if (!d.native_loan_active) return true;
+    using namespace strata::kernels::cpu;
+    const ExpertLayout& lay = expert_layout();
+    const auto t0 = std::chrono::steady_clock::now();
+    int64_t restored = 0;
+    for (const auto& p : d.native_loan_lent) {
+        const int64_t layer = p.first / lay.n_expert, expert = p.first % lay.n_expert;
+        const int64_t slot = p.second;
+        const uint8_t* b = d.src != nullptr ? d.src->blob_stable(layer, expert) : nullptr;
+        const int64_t nb = (int64_t) lay.blob_bytes(layer);
+        if (b == nullptr || !d.cache->fill_slot_queued((int32_t) slot, b, err, nb)) {
+            err = "the prompt loan's refill failed at slot " + std::to_string(slot) + ": " + err;
+            d.native_loan_active = false;   // the slots stay not-resident: a miss, never a fake hit
+            d.cache->set_admit_limit(-1);   // the workspace is dead; the arena is the cache's again
+            // Copies already queued on the legacy stream must land (or drain) before the cache is ever
+            // closed over them; the failures above are reported, the cleanup here is best-effort.
+            std::string ignored;
+            d.cache->sync_queued(ignored);
+            return false;
+        }
+        ++restored;
+    }
+    if (!d.cache->sync_queued(err)) {
+        d.native_loan_active = false;   // a sticky CUDA error: nothing is restored, so nothing is claimed
+        d.cache->set_admit_limit(-1);
+        return false;
+    }
+    d.cache->set_admit_limit(-1);
+    // THE SLOT MUST HOLD THE EXPERT IT CLAIMS *BEFORE* THE CLAIM EXISTS: verify first, restore residency
+    // only after the read-back matches.  A failed check leaves every lent pair kNotResident (a miss).
+    if (restored > 0) {
+        const auto verify_pair = [&](const std::pair<int64_t, int64_t>& p, std::string& e) -> bool {
+            const int64_t layer = p.first / lay.n_expert, expert = p.first % lay.n_expert;
+            const uint8_t* b = d.src != nullptr ? d.src->blob_stable(layer, expert) : nullptr;
+            return b != nullptr && d.cache->verify_slot((int32_t) p.second, b, e, (int64_t) lay.blob_bytes(layer));
+        };
+        if (loan_verify_all_requested()) {
+            // DIAGNOSTIC (STRATA_QWEN35_LOAN_VERIFY=1): every lent pair byte-compared against the source's
+            // real three-tensor pack, after the queued refill synced and before any residency restore.
+            // Totals and the first failure only - no tensor dump.
+            int64_t checked = 0, mismatched = 0;
+            uint64_t bytes = 0;
+            bool first_reported = false;
+            for (const auto& p : d.native_loan_lent) {
+                std::string e;
+                const int64_t layer = p.first / lay.n_expert;
+                ++checked;
+                bytes += (uint64_t) lay.blob_bytes(layer);
+                if (!verify_pair(p, e)) {
+                    ++mismatched;
+                    if (!first_reported) {
+                        first_reported = true;
+                        std::fprintf(stderr, "strata: prompt loan verify: first mismatch at pair %lld/%lld "
+                                             "(slot %lld, expected %lld bytes): %s\n", (long long) layer,
+                                     (long long) (p.first % lay.n_expert), (long long) p.second,
+                                     (long long) lay.blob_bytes(layer), e.c_str());
+                        err = "the prompt loan's diagnostic audit failed: " + e;
+                    }
+                }
+            }
+            std::fprintf(stderr, "strata: prompt loan verify: checked %lld, mismatched %lld, bytes %llu\n",
+                         (long long) checked, (long long) mismatched, (unsigned long long) bytes);
+            if (mismatched != 0) {
+                d.native_loan_active = false;   // nothing is restored: the pairs stay not-resident (a miss)
+                return false;
+            }
+        } else {
+            const auto& p = d.native_loan_lent.front();
+            std::string e;
+            if (!verify_pair(p, e)) {
+                err = "the prompt loan's refilled slot did not verify: " + e;
+                d.native_loan_active = false;
+                return false;
+            }
+            std::fprintf(stderr, "strata: prompt loan: slot %lld read back byte-equal to its expert before the "
+                                 "residency restore\n", (long long) p.second);
+        }
+    }
+    d.cache->restore_lent(d.native_loan_lent);
+    d.native_loan_active = false;
+    d.native_loan_restored = restored;
+    d.native_loan_refill_ms =
+        std::chrono::duration<double, std::milli>(std::chrono::steady_clock::now() - t0).count();
+    d.native_stats.prefill_loan_restored = restored;
+    d.native_stats.prefill_loan_refill_ms = d.native_loan_refill_ms;
+    std::fprintf(stderr, "strata: prompt loan returned: %lld experts refilled in %.1f ms\n", (long long) restored,
+                 d.native_loan_refill_ms);
+    return true;
+}
+
+namespace {
+/// The hit launch's packed metadata block layout (one host image, one device block, one H2D):
+/// `[ptr: k*u64][start: (k+1)*i32][dst: k*i32][tok: k*i32][groups: i32]`; the pointer section is 8-byte
+/// aligned and the int32 sections 4-byte (their natural) aligned.
+size_t meta_start_off(int64_t k) { return (size_t) (((uint64_t) k * 8 + 7) & ~(uint64_t) 7); }
+size_t meta_dst_off(int64_t k) { return meta_start_off(k) + (size_t) (k + 1) * sizeof(int32_t); }
+size_t meta_tok_off(int64_t k) { return meta_dst_off(k) + (size_t) k * sizeof(int32_t); }
+size_t meta_groups_off(int64_t k) { return meta_tok_off(k) + (size_t) k * sizeof(int32_t); }
+size_t meta_bytes(int64_t k) { return (meta_groups_off(k) + sizeof(int32_t) + 7) & ~(uint64_t) 7; }
+
+/// The tier's device buffers, allocated once and reused (no allocation on the token path).
+bool native_buffers(ExpertDispatch& d, int64_t k, const strata::kernels::cpu::NativeFmt& f, std::string& err) {
+    if (d.native_k >= k && d.native_embd == d.n_embd && d.native_ff == f.n_ff && d.native_parts_dev != nullptr &&
+        d.native_meta_dev != nullptr)
+        return true;
+    auto free_all = [&] {
+        for (void** p : {&d.native_meta_dev, &d.native_d_act, &d.native_x_q8_1, &d.native_scratch}) {
+            if (*p != nullptr) { cudaFree(*p); *p = nullptr; }
+        }
+        if (d.native_parts_dev != nullptr) { cudaFree(d.native_parts_dev); d.native_parts_dev = nullptr; }
+    };
+    free_all();
+    const size_t act = (size_t) d.n_embd * sizeof(float);
+    d.native_scratch_bytes = strata::kernels::native_expert_scratch_bytes(k, f.n_ff);
+    const size_t meta = meta_bytes(k);
+    if (cudaMalloc(&d.native_parts_dev, (size_t) k * act) != cudaSuccess ||
+        cudaMalloc(&d.native_d_act, act) != cudaSuccess ||
+        cudaMalloc(&d.native_x_q8_1, (size_t) (d.n_embd / 32) * 36) != cudaSuccess ||
+        cudaMalloc(&d.native_scratch, d.native_scratch_bytes) != cudaSuccess ||
+        cudaMalloc(&d.native_meta_dev, meta) != cudaSuccess) {
+        free_all();
+        err = "native tier: a device buffer allocation failed";
+        return false;
+    }
+    d.native_meta_h.assign(meta, 0);
+    d.native_k = k;
+    d.native_embd = d.n_embd;
+    d.native_ff = f.n_ff;
+    return true;
+}
+}  // namespace
+
+bool expert_native_launch(ExpertDispatch& d, int64_t layer, void* stream, const float* x_dev, const int32_t* ids,
+                          int64_t k, uint8_t* is_hit) {
+    using namespace strata::kernels::cpu;
+    if (d.failed) return false;
+    const ExpertLayout& lay = expert_layout();
+    if (!lay.native || layer < 0 || layer >= (int64_t) lay.fmt.size()) {
+        d.failed = true; d.fail = "native tier: layer out of range"; d.fail_layer = layer; return false;
+    }
+    const NativeFmt& f = lay.fmt[(size_t) layer];
+    if (f.n_embd != d.n_embd) {
+        d.failed = true; d.fail = "native tier: the activation width does not match the pack"; d.fail_layer = layer;
+        return false;
+    }
+    std::string err;
+    if (!native_buffers(d, k, f, err)) {
+        d.failed = true; d.set_fail(err); d.fail_layer = layer; return false;
+    }
+    const strata::kernels::NativeExpertLayout G =
+        strata::kernels::native_expert_layout(f.gu_type, f.d_type, f.n_embd, f.n_ff);
+    // Fill the ONE packed host image: ptr/start/dst/tok/groups, the same field layout the grouped kernel
+    // already consumes.  The block is only rewritten here, after the router-id event wait above this call,
+    // which the graph's post->pre chain orders after the previous layer's H2D completed (see the header).
+    uint8_t* hm = d.native_meta_h.data();
+    auto* hptr = (unsigned long long*) (hm + 0);
+    auto* hstart = (int32_t*) (hm + meta_start_off(k));
+    auto* hdst = (int32_t*) (hm + meta_dst_off(k));
+    auto* htok = (int32_t*) (hm + meta_tok_off(k));
+    auto* hgroups = (int32_t*) (hm + meta_groups_off(k));
+    int nh = 0;
+    for (int64_t i = 0; i < k; ++i) {
+        const int32_t e = ids[i];
+        const int32_t slot = (e >= 0 && e < d.n_expert && d.cache != nullptr) ? d.cache->slot_of(layer, e) : -1;
+        is_hit[i] = slot >= 0 ? 1 : 0;
+        if (slot < 0) continue;
+        hptr[nh] = d.native_slot_ptr[(size_t) slot];
+        hstart[nh] = (int32_t) nh;
+        hdst[nh] = (int32_t) i;
+        htok[nh] = 0;
+        ++nh;
+    }
+    hstart[nh] = (int32_t) nh;   // start[nh]: the plan's sentinel, exactly as the whole-plan form had it
+    if (nh == 0) return true;   // all-hit impossible here; a caller with no hits should not have called
+    *hgroups = (int32_t) nh;
+    cudaStream_t cs = (cudaStream_t) stream;
+    // ONE submission for the whole plan (the five separate H2Ds are gone), plus the activation image.
+    if (cudaMemcpyAsync(d.native_meta_dev, hm, meta_bytes(k), cudaMemcpyHostToDevice, cs) != cudaSuccess ||
+        cudaMemcpyAsync(d.native_d_act, x_dev, (size_t) d.n_embd * sizeof(float), cudaMemcpyDeviceToDevice,
+                        cs) != cudaSuccess) {
+        d.failed = true; d.fail = "native tier: the hit launch's copies failed"; d.fail_layer = layer; return false;
+    }
+    strata::kernels::quantize_q8_1_rows((const float*) d.native_d_act, 1, d.n_embd, d.native_x_q8_1, stream);
+    try {
+        const uint8_t* dm = (const uint8_t*) d.native_meta_dev;
+        strata::kernels::native_expert_grouped(G, (const unsigned long long*) (dm + 0),
+                                               (const int32_t*) (dm + meta_start_off(k)),
+                                               (const int32_t*) (dm + meta_groups_off(k)),
+                                               (const int32_t*) (dm + meta_dst_off(k)),
+                                               (const int32_t*) (dm + meta_tok_off(k)), k, k,
+                                               d.native_x_q8_1, d.native_scratch, d.native_parts_dev, stream, nh);
+    } catch (const std::exception& e) {
+        d.failed = true; d.set_fail(e.what()); d.fail_layer = layer; return false;
+    }
+    if (cudaGetLastError() != cudaSuccess) {
+        d.failed = true; d.fail = "native tier: the GPU hit kernel failed"; d.fail_layer = layer; return false;
+    }
+    d.native_hits += nh;
+    return true;
+}
+
+bool expert_native_misses(ExpertDispatch& d, int64_t layer, const float* x_host, const int32_t* miss_ids,
+                          int64_t nm, float* out) {
+    if (nm <= 0) return true;
+    d.layers = layer;
+    expert_native_qwen_dispatch(d, x_host, miss_ids, 1, nm, nullptr, out);
+    if (d.failed) return false;
+    d.native_misses += nm;
+    return true;
+}
+
+bool expert_native_combine(ExpertDispatch& d, void* stream, const float* weights_dev, float* out_dev, int64_t k) {
+    if (d.native_parts_dev == nullptr) {
+        d.failed = true; d.fail = "native tier: combine before any launch"; return false;
+    }
+    try {
+        strata::kernels::native_moe_combine_multi(d.native_parts_dev, weights_dev, nullptr, out_dev, d.n_embd, k, 1,
+                                                  stream);
+    } catch (const std::exception& e) {
+        d.failed = true; d.set_fail(e.what()); return false;
+    }
+    if (cudaGetLastError() != cudaSuccess) {
+        d.failed = true; d.fail = "native tier: the device combine failed"; return false;
+    }
+    return true;
+}
+
+float* expert_native_parts(ExpertDispatch& d) { return d.native_parts_dev; }
+
+bool expert_native_admit(ExpertDispatch& d, int64_t layer, const int32_t* ids, int64_t n, std::string& err) {
+    if (d.cache == nullptr || d.src == nullptr) return true;
+    if (d.cache->resident() >= d.cache->slots()) return true;
+    const strata::kernels::cpu::ExpertLayout& lay = strata::kernels::cpu::expert_layout();
+    for (int64_t i = 0; i < n; ++i) {
+        const int32_t e = ids[i];
+        if (e < 0 || e >= d.n_expert || d.cache->slot_of(layer, e) >= 0) continue;
+        const int32_t slot = d.cache->admit(layer, e);
+        if (slot < 0) break;
+        // Protective check (the ceiling in admit enforces it, this proves it every call): a borrowed tail
+        // slot must never become an expert while the prompt loan holds it.
+        if (slot >= d.cache->admit_limit()) {
+            d.failed = true;
+            d.set_fail("native tier: admission crossed the prompt loan's ceiling");
+            d.fail_layer = layer;
+            return false;
+        }
+        const int64_t nb = (int64_t) lay.blob_bytes(layer);
+        const uint8_t* b = d.src->blob(layer, e);
+        if (b == nullptr || !d.cache->fill_slot_blocking(slot, b, err, nb)) {
+            err = "native tier: cache admission failed at layer " + std::to_string(layer) + ": " + err;
+            return false;
+        }
+        d.native_slot_ptr[(size_t) slot] = (unsigned long long) d.cache->device_slot(slot);
+    }
+    return true;
+}
+
+void expert_native_close(ExpertDispatch& d) {
+    for (void** p : {&d.native_meta_dev, &d.native_d_act, &d.native_x_q8_1, &d.native_scratch}) {
+        if (*p != nullptr) { cudaFree(*p); *p = nullptr; }
+    }
+    d.native_meta_h.clear();
+    d.native_meta_h.shrink_to_fit();
+    if (d.native_parts_dev != nullptr) { cudaFree(d.native_parts_dev); d.native_parts_dev = nullptr; }
+    for (void** e : {&d.native_ev_ids, &d.native_ev_act, &d.native_ev_miss, &d.native_ev_hit_done}) {
+        if (*e != nullptr) { cudaEventDestroy((cudaEvent_t) *e); *e = nullptr; }
+    }
+    if (d.native_cache) {
+        d.native_cache->close();
+        d.native_cache.reset();
+    }
+    d.cache = nullptr;
+    d.native_k = 0;
+}
+
+bool expert_native_decode_layer(ExpertDispatch& d, int64_t layer, int64_t k, const void* x_dev,
+                                const void* ids_dev, const void* weights_dev, void* out_dev,
+                                const NativeDecodeStage& st, std::string& err) {
+    const int64_t K = k;
+    if (st.work_stream == nullptr || st.copy_stream == nullptr || st.host_ids == nullptr || st.host_act == nullptr ||
+        st.host_miss == nullptr || st.is_hit == nullptr || x_dev == nullptr || ids_dev == nullptr ||
+        weights_dev == nullptr || out_dev == nullptr) {
+        err = "native tier: the decode boundary is not fully staged";
+        return false;
+    }
+    if (d.native_ev_ids == nullptr) {
+        for (void** e : {&d.native_ev_ids, &d.native_ev_act, &d.native_ev_miss, &d.native_ev_hit_done}) {
+            if (cudaEventCreateWithFlags((cudaEvent_t*) e, cudaEventDisableTiming) != cudaSuccess) {
+                err = "native tier: cannot create the seam events";
+                return false;
+            }
+        }
+    }
+    cudaStream_t work = (cudaStream_t) st.work_stream, copy = (cudaStream_t) st.copy_stream;
+    const double t0 = tier_now_ms();
+    // Router ids (32 B).  With the tier OFF every entry is a miss, so the activation image is needed anyway:
+    // both transfers are enqueued together behind ONE sync (the pre event already ordered the stream).
+    const bool all_miss = d.cache == nullptr;
+    if (cudaMemcpyAsync(st.host_ids, ids_dev, (size_t) K * sizeof(int32_t), cudaMemcpyDeviceToHost, copy) !=
+        cudaSuccess) {
+        err = "native tier: the router-id transfer failed";
+        return false;
+    }
+    if (all_miss &&
+        cudaMemcpyAsync(st.host_act, x_dev, (size_t) d.n_embd * sizeof(float), cudaMemcpyDeviceToHost, copy) !=
+            cudaSuccess) {
+        err = "native tier: the activation transfer failed";
+        return false;
+    }
+    if (cudaEventRecord((cudaEvent_t) d.native_ev_ids, copy) != cudaSuccess ||
+        cudaEventSynchronize((cudaEvent_t) d.native_ev_ids) != cudaSuccess) {
+        err = "native tier: the router-id wait failed";
+        return false;
+    }
+    const double t1 = tier_now_ms();
+    d.native_stats.ms_ids += t1 - t0;
+    // LAUNCH: residency decision + the GPU hits.
+    const int64_t hits_before = d.native_hits;
+    if (!expert_native_launch(d, layer, work, (const float*) x_dev, st.host_ids, K, st.is_hit)) return false;
+    const bool have_hits = d.native_hits > hits_before;
+    if (have_hits && cudaEventRecord((cudaEvent_t) d.native_ev_hit_done, work) != cudaSuccess) return false;
+    if (have_hits) {
+        // GPU hit work is really in flight while the CPU misses below run?  Query right after the launch.
+        const cudaError_t just_launched = cudaEventQuery((cudaEvent_t) d.native_ev_hit_done);
+        if (just_launched == cudaErrorNotReady) ++d.native_stats.hit_inflight;
+        else if (just_launched != cudaSuccess) (void) cudaGetLastError();
+    }
+    const double t2 = tier_now_ms();
+    d.native_stats.ms_launch += t2 - t1;
+    // CPU MISSES.
+    int miss_rank[16];
+    int nm = 0;
+    for (int64_t i = 0; i < K; ++i)
+        if (st.is_hit[i] == 0 && nm < 16) miss_rank[nm++] = (int) i;
+    if (nm == 0) {
+        ++d.native_stats.all_hit;
+    } else {
+        if (!all_miss) {
+            if (cudaMemcpyAsync(st.host_act, x_dev, (size_t) d.n_embd * sizeof(float), cudaMemcpyDeviceToHost,
+                                copy) != cudaSuccess) {
+                err = "native tier: the activation transfer failed";
+                return false;
+            }
+            if (cudaEventRecord((cudaEvent_t) d.native_ev_act, copy) != cudaSuccess ||
+                cudaEventSynchronize((cudaEvent_t) d.native_ev_act) != cudaSuccess) {
+                err = "native tier: the activation wait failed";
+                return false;
+            }
+        }
+        d.qwen_local_ids.resize((size_t) nm);
+        for (int i = 0; i < nm; ++i) d.qwen_local_ids[(size_t) i] = st.host_ids[miss_rank[i]];
+        if (!expert_native_misses(d, layer, st.host_act, d.qwen_local_ids.data(), nm, st.host_miss)) return false;
+        float* parts = expert_native_parts(d);
+        for (int i = 0; i < nm; ++i)
+            if (cudaMemcpyAsync(parts + (size_t) miss_rank[i] * d.n_embd, st.host_miss + (size_t) i * d.n_embd,
+                                (size_t) d.n_embd * sizeof(float), cudaMemcpyHostToDevice, copy) != cudaSuccess) {
+                err = "native tier: a miss-row upload failed";
+                return false;
+            }
+        if (cudaEventRecord((cudaEvent_t) d.native_ev_miss, copy) != cudaSuccess ||
+            cudaStreamWaitEvent(work, (cudaEvent_t) d.native_ev_miss, 0) != cudaSuccess) {
+            err = "native tier: the miss-upload ordering failed";
+            return false;
+        }
+        // Real overlap evidence: the CPU work just ended; SUCCESS here means the GPU hits finished during it.
+        if (have_hits) {
+            const cudaError_t ready = cudaEventQuery((cudaEvent_t) d.native_ev_hit_done);
+            if (ready == cudaSuccess) ++d.native_stats.hit_overlap;
+            else if (ready == cudaErrorNotReady) ++d.native_stats.hit_late;
+            else (void) cudaGetLastError();
+        }
+    }
+    const double t3 = tier_now_ms();
+    d.native_stats.ms_misses += t3 - t2;
+    // COMBINE: the shared parts with the DEVICE router weights into the graph's output.
+    if (!expert_native_combine(d, work, (const float*) weights_dev, (float*) out_dev, K)) return false;
+    const double t4 = tier_now_ms();
+    d.native_stats.ms_combine += t4 - t3;
+    // The tier's lifecycle: admit what it can hold (no eviction).
+    if (!expert_native_admit(d, layer, st.host_ids, K, err)) return false;
+    d.native_stats.ms_queue += tier_now_ms() - t4;
+    return true;
 }
 
 namespace {
@@ -3259,7 +3924,7 @@ void expert_pool_dispatch_multi(ExpertDispatch& d, const float* x_f, const int32
         static thread_local std::string remote_error;
         for (int r = 0; r < d.remote_count; ++r) {
             if (!d.remote[r]->begin(d.layers, x_f, ids, n_tok, k, kind, d.host_res, remote_error)) {
-                d.failed = true; d.fail = remote_error.c_str(); d.fail_layer = d.layers; return;
+                d.failed = true; d.set_fail(remote_error); d.fail_layer = d.layers; return;
             }
             for (int64_t i = 0; i < n; ++i) if (d.remote[r]->owns(i)) kind[i] = 2;
         }
@@ -3279,11 +3944,11 @@ void expert_pool_dispatch_multi(ExpertDispatch& d, const float* x_f, const int32
         for (int64_t t = 0; t < n_tok; ++t) {
             if (ep && std::all_of(kind + t * k, kind + (t + 1) * k, [](int32_t v) { return v >= 0; })) continue;
             if (native && strata::kernels::cpu::q2_native_kernels(lay.fmt[(size_t) d.layers].gu_type))   // a native Q2_0 pack: the Q2_0 kernels' activations
-                act_quant_any(x_f + (size_t) t * H, H, d.act_multi[(size_t) t]);
+                act_quant_any(x_f + (size_t) t * d.n_embd, (int) d.n_embd, d.act_multi[(size_t) t]);
             else if (native)
-                native_quant_act(lay.fmt[(size_t) d.layers], x_f + (size_t) t * H, d.nact_multi.data() + (size_t) t * kNativeActBytes);
+                native_quant_act(lay.fmt[(size_t) d.layers], x_f + (size_t) t * d.n_embd, d.nact_multi.data() + (size_t) t * kNativeActBytes);
             else
-                act_quant_q8_1(x_f + (size_t) t * H, H, d.act_multi[(size_t) t]);
+                act_quant_q8_1(x_f + (size_t) t * d.n_embd, (int) d.n_embd, d.act_multi[(size_t) t]);
         }
     }
     const auto c2 = std::chrono::steady_clock::now();
@@ -3301,7 +3966,7 @@ void expert_pool_dispatch_multi(ExpertDispatch& d, const float* x_f, const int32
         for (int64_t j = 0; j < k; ++j) {
             const int64_t i = t * k + j;
             const int64_t e = ids[i];
-            float* row = out + (size_t) i * H;
+            float* row = out + (size_t) i * d.n_embd;
             if (e < 0 || e >= d.n_expert) {
                 d.failed = true;
                 d.fail = "a routed expert id is out of range";
@@ -3317,7 +3982,7 @@ void expert_pool_dispatch_multi(ExpertDispatch& d, const float* x_f, const int32
                 // dec_batch: copy_rows_from_mapped_kernel already zeroes kind 0/1 rows on the GPU
                 if (!((kind[i] == 2 && d.peer != nullptr && d.peer->launched_direct()) ||
                       (gpu_zeroes_hits && (kind[i] == 0 || kind[i] == 1))))
-                    std::memset(row, 0, (size_t) H * sizeof(float));
+                    std::memset(row, 0, (size_t) d.n_embd * sizeof(float));
                 continue;
             }
             ++d.cache_refused;
@@ -3354,7 +4019,7 @@ void expert_pool_dispatch_multi(ExpertDispatch& d, const float* x_f, const int32
         static thread_local std::string remote_error;
         for (int r = 0; r < d.remote_count; ++r)
             if (!d.remote[r]->finish(out, remote_error)) {
-                d.failed = true; d.fail = remote_error.c_str(); d.fail_layer = d.layers; return;
+                d.failed = true; d.set_fail(remote_error); d.fail_layer = d.layers; return;
             }
     }
     if (d.peer != nullptr) {                 // multi-GPU: the second GPU's rows, into the same mapped rows

@@ -1,5 +1,9 @@
 #include "llama-context.h"
 
+#ifdef LLAMA_STRATA_QWEN35
+#include "strata/core/qwen35_bridge.hpp"
+#endif
+
 #include "ggml.h"
 #include "llama-arch.h"
 #include "llama-graph.h"
@@ -642,6 +646,9 @@ void llama_context::sched_reserve() {
 
     sched.reset(ggml_backend_sched_new(backend_ptrs.data(), backend_buft.data(), backend_ptrs.size(), max_nodes, cparams.pipeline_parallel, cparams.op_offload));
     ggml_backend_sched_set_copy_callback(sched.get(), sched_copy_experts, this);
+#ifdef LLAMA_STRATA_QWEN35
+    strata::core::qwen35_install_decode_seam(sched.get());
+#endif
 
     llama_memory_context_ptr mctx;
     if (memory) {
@@ -682,6 +689,9 @@ void llama_context::sched_reserve() {
                 cparams.pipeline_parallel = false;
                 sched.reset(ggml_backend_sched_new(backend_ptrs.data(), backend_buft.data(), backend_ptrs.size(), max_nodes, false, cparams.op_offload));
                 ggml_backend_sched_set_copy_callback(sched.get(), sched_copy_experts, this);
+#ifdef LLAMA_STRATA_QWEN35
+                strata::core::qwen35_install_decode_seam(sched.get());
+#endif
                 gf = graph_reserve(n_tokens, n_seqs, n_outputs_pp, mctx.get());
             }
             if (!gf) {

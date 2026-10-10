@@ -1,0 +1,95 @@
+{
+  "hardware": "RTX4060 Laptop 8GiB",
+  "warmup_runs": 0,
+  "load_seconds": null,
+  "full_prefill_excludes_load": true,
+  "context": 4096,
+  "threads": 8,
+  "max_new": 1,
+  "physical_microbatch": 2048,
+  "cache_slots": 3700,
+  "producer_threads": 2,
+  "write_combined": false,
+  "fixture_tokens": {
+    "risk": 3869,
+    "normal": 3863
+  },
+  "samples_are_complete_conversation_composites": true,
+  "single_trials_only": true,
+  "median_confirmation": false,
+  "exe_sha256": "4dcfc1773411d33bdd446241218c725d37499dc3cc2cc6393eb4b78e9b622587",
+  "results": [
+    {
+      "case": "A67-control-risk",
+      "exit_code": 0,
+      "timed_out": false,
+      "validation_problems": [],
+      "answer_text": "3",
+      "summary": {
+        "prefill_seconds": 5.2815754,
+        "ttft_seconds": 5.283412,
+        "prefill_tokens_per_s": 732.547,
+        "prefill_gpu_layers": 78,
+        "prefill_entries": 1207128,
+        "cache_payload_mib": 3976.8,
+        "prefill_loan_slots": 262,
+        "prefill_loan_restored": 262,
+        "peak_device_vram_mib": 7920.7,
+        "decode_evaluations": 0
+      }
+    },
+    {
+      "case": "C67-sort-risk",
+      "exit_code": 0,
+      "timed_out": false,
+      "validation_problems": [],
+      "answer_text": "3",
+      "summary": {
+        "prefill_seconds": 4.0531744,
+        "ttft_seconds": 4.0551644,
+        "prefill_tokens_per_s": 954.56,
+        "prefill_gpu_layers": 78,
+        "prefill_entries": 1207128,
+        "cache_payload_mib": 3976.8,
+        "prefill_loan_slots": 262,
+        "prefill_loan_restored": 262,
+        "peak_device_vram_mib": 7920.7,
+        "decode_evaluations": 0
+      }
+    },
+    {
+      "case": "D67-sort-normal",
+      "exit_code": 0,
+      "timed_out": false,
+      "validation_problems": [],
+      "answer_text": "0",
+      "summary": {
+        "prefill_seconds": 4.2395845,
+        "ttft_seconds": 4.2412114,
+        "prefill_tokens_per_s": 911.174,
+        "prefill_gpu_layers": 78,
+        "prefill_entries": 1205256,
+        "cache_payload_mib": 3976.8,
+        "prefill_loan_slots": 262,
+        "prefill_loan_restored": 262,
+        "peak_device_vram_mib": 7920.7,
+        "decode_evaluations": 0
+      }
+    }
+  ],
+  "raw_log_sha256": [
+    {
+      "A67-control-risk.stdout.log": "8f1b3ad57f5e3fecf81f1503418efcbd3a4530df80ace557be7edb92f9c1f160",
+      "A67-control-risk.stderr.log": "f97fab62b85ca9ceeaba93c02547d61f2738566b478ff924e382c94b798311f2"
+    },
+    {
+      "C67-sort-risk.stdout.log": "ba1246d489db6836d1b3a04a18f2d79b64cc026956aa0522c19bc3a086e71ce7",
+      "C67-sort-risk.stderr.log": "b835eaae0a0c9bc3232034facdd1a2ff47a22223f3a84bee7c39dc720c17551f"
+    },
+    {
+      "D67-sort-normal.stdout.log": "dae3c2c0219a9ec4eae9856334cf6bc4ac678c20b79883f4db87fdee271eb063",
+      "D67-sort-normal.stderr.log": "ac3310759a697d3596a6ee8c7598329bb36e52e22ea5e122e9fd08d6f8f3c1f7"
+    }
+  ],
+  "raw_logs_and_fixture_contents_kept_local": true
+}

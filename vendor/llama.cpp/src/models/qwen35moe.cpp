@@ -1,6 +1,10 @@
 #include "models.h"
 #include "llama-memory-recurrent.h"
 
+#ifdef LLAMA_STRATA_QWEN35
+#include "strata/core/qwen35_bridge.hpp"
+#endif
+
 void llama_model_qwen35moe::load_arch_hparams(llama_model_loader & ml) {
     ml.get_key_or_arr(LLM_KV_EXPERT_FEED_FORWARD_LENGTH, hparams.n_ff_exp_arr, hparams.n_layer_all, false);
     ml.get_key(LLM_KV_EXPERT_SHARED_FEED_FORWARD_LENGTH, hparams.n_ff_shexp, false);
@@ -537,6 +541,17 @@ ggml_tensor * llama_model_qwen35moe::graph::build_layer_ffn(ggml_tensor * cur, c
         // Apply the gate to the shared expert output
         ffn_shexp = ggml_mul(ctx0, ffn_shexp, shared_gate);
         cb(ffn_shexp, "ffn_shexp_gated", il);
+
+#ifdef LLAMA_STRATA_QWEN35
+        if (strata::core::qwen35_shared_overlap_tensor(cur)) {
+            // Anchor the shared-expert nodes right after the routed-MoE hook.  When the hook left its external
+            // CUSTOM node unexpanded (the STRATA_QWEN35_SHARED_OVERLAP decode pre marker), this places the
+            // shared expert between the marker and the routed node.  When the hook expanded that node early
+            // (prefill, native decode without the prototype), the later DFS would add the same nodes in the
+            // same order, so this expand is order-neutral there.
+            ggml_build_forward_expand(gf, ffn_shexp);
+        }
+#endif
 
         cur = ggml_add(ctx0, moe_out, ffn_shexp);
         cb(cur, "ffn_out", il);

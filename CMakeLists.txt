@@ -531,7 +531,7 @@ if(STRATA_ENABLE_CUDA OR STRATA_ENABLE_HIP)
   # what composes them into a token.  No tokenizer - the prompt arrives as ids - because Gate C1 compares logits
   # against llama.cpp on the SAME ids and a tokenizer on one side of that comparison is a second variable.
   # plan v0.3 P5: batched prompt processing (tensor-core GEMMs through cuBLAS).
-  add_library(strata_prefill STATIC src/prefill/gemm.cu src/prefill/kernels.cu src/prefill/prefill.cpp)
+  add_library(strata_prefill STATIC src/prefill/gemm.cu src/prefill/kernels.cu src/prefill/cold_stager.cpp src/prefill/prefill.cpp)
   if(STRATA_ENABLE_HIP)
     # #313: the RDNA3 WMMA GEMMs include hip_runtime.h: AMD builds only (a CUDA build never sees this file)
     target_sources(strata_prefill PRIVATE src/prefill/wmma_gemm.cu)
@@ -1136,6 +1136,21 @@ endif()
 if(STRATA_ORCA_Q4KS_MMQ AND NOT STRATA_NATIVE_EXPERTS)
   message(FATAL_ERROR "STRATA_ORCA_Q4KS_MMQ requires STRATA_NATIVE_EXPERTS=ON for GGML sources")
 endif()
+# Qwen35 text POC: build the pinned llama.cpp MODEL GRAPH (the QWEN35MOE architecture) and the Strata bridge
+# that routes its experts through the shared expert service.  Needs the whole llama.cpp checkout (not just
+# ggml): the patched graph (LLAMA_STRATA_QWEN35) calls the bridge from build_moe_ffn.  CUDA only.
+option(STRATA_QWEN35 "Qwen35 text POC: pinned llama.cpp graph + Strata expert bridge (CUDA)" OFF)
+if(STRATA_QWEN35)
+  if(NOT STRATA_NATIVE_EXPERTS)
+    message(FATAL_ERROR "STRATA_QWEN35 requires STRATA_NATIVE_EXPERTS=ON (ggml-cpu computes the native experts)")
+  endif()
+  if(NOT (STRATA_ENABLE_CUDA OR STRATA_HIP_GFX906))
+    message(FATAL_ERROR "STRATA_QWEN35 requires a CUDA build (STRATA_ENABLE_CUDA=ON)")
+  endif()
+  if(NOT STRATA_GGML_DIR)
+    message(FATAL_ERROR "STRATA_QWEN35 requires -DSTRATA_GGML_DIR=<the pinned llama.cpp checkout>")
+  endif()
+endif()
 if(STRATA_NATIVE_EXPERTS)
   enable_language(C)
   set(BUILD_SHARED_LIBS OFF CACHE BOOL "" FORCE)
@@ -1169,7 +1184,39 @@ if(STRATA_NATIVE_EXPERTS)
   else()
     set(GGML_NATIVE ON CACHE BOOL "" FORCE)
   endif()
-  if(STRATA_GGML_DIR)
+  if(STRATA_QWEN35)
+    # The whole pinned llama.cpp project, not just ggml: its `llama` target carries the QWEN35MOE graph.  The
+    # CUDA backend is BUILT IN (GGML_CUDA), not the prebuilt dynamic ggml-cuda.dll: a static exe plus that
+    # DLL would run two ggml-base instances and the vendor graph optimizer crashed at reservation.
+    set(LLAMA_BUILD_TESTS OFF CACHE BOOL "" FORCE)
+    set(LLAMA_BUILD_EXAMPLES OFF CACHE BOOL "" FORCE)
+    # Diagnostic A/B only: build the stock llama-bench from this tree (STRATA_QWEN35_TOOLS=ON)
+    if(STRATA_QWEN35_TOOLS)
+      set(LLAMA_BUILD_TOOLS ON CACHE BOOL "" FORCE)
+      set(LLAMA_BUILD_COMMON ON CACHE BOOL "" FORCE)
+    else()
+      set(LLAMA_BUILD_TOOLS OFF CACHE BOOL "" FORCE)
+      set(LLAMA_BUILD_SERVER OFF CACHE BOOL "" FORCE)
+      set(LLAMA_BUILD_COMMON OFF CACHE BOOL "" FORCE)
+      set(LLAMA_BUILD_APP OFF CACHE BOOL "" FORCE)
+    endif()
+    set(LLAMA_CURL OFF CACHE BOOL "" FORCE)
+    set(LLAMA_OPENSSL OFF CACHE BOOL "" FORCE)
+    set(GGML_CCACHE OFF CACHE BOOL "" FORCE)
+    set(GGML_BUILD_TESTS OFF CACHE BOOL "" FORCE)
+    set(GGML_BUILD_EXAMPLES OFF CACHE BOOL "" FORCE)
+    set(GGML_BUILD_COMMON OFF CACHE BOOL "" FORCE)
+    set(GGML_CUDA ON CACHE BOOL "" FORCE)
+    set(GGML_CUDA_FA_ALL_QUANTS ON CACHE BOOL "" FORCE)
+    # dynamic cudart (the Strata targets link CUDA::cudart); a static ggml-cuda against it redefines the runtime
+    set(GGML_STATIC OFF CACHE BOOL "" FORCE)
+    # llama.cpp is a C++17 project (u8 literals are char8_t under C++20 and llama-chat.cpp then does not
+    # compile); this project is C++20.  Add the subdirectory under its own standard and restore ours after.
+    set(_strata_cxx_std "${CMAKE_CXX_STANDARD}")
+    set(CMAKE_CXX_STANDARD 17)
+    add_subdirectory(${STRATA_GGML_DIR} ${CMAKE_BINARY_DIR}/llama EXCLUDE_FROM_ALL)
+    set(CMAKE_CXX_STANDARD "${_strata_cxx_std}")
+  elseif(STRATA_GGML_DIR)
     add_subdirectory(${STRATA_GGML_DIR}/ggml ${CMAKE_BINARY_DIR}/ggml EXCLUDE_FROM_ALL)
   else()
     include(FetchContent)
@@ -1259,8 +1306,15 @@ if(STRATA_NATIVE_EXPERTS)
     set(_strata_mmq ${_strata_gg}/src/ggml-cuda)
     # #136: the Q2_0 pack's prompt experts on Strata's own int8 kernels (moe_fused.cu, opt-in STRATA_PF_FUSED=1; CUDA
     # only: the HIP branch below keeps MMQ, and an sm_75 device or an sm_75-only build reports them unavailable)
-    add_library(strata_mmq STATIC src/prefill/moe_mmq.cu src/prefill/moe_fused.cu src/prefill/moe_fused_iq.cu
-                src/prefill/ggml_cuda_host.cu ${_strata_mmq}/quantize.cu)
+    if(STRATA_QWEN35)
+      # ggml-cuda is linked in (the Qwen35 build compiles it): its host symbols replace the copied
+      # ggml_cuda_host.cu shim, which would then define the same symbols twice
+      add_library(strata_mmq STATIC src/prefill/moe_mmq.cu src/prefill/moe_fused.cu src/prefill/moe_fused_iq.cu
+                  ${_strata_mmq}/quantize.cu)
+    else()
+      add_library(strata_mmq STATIC src/prefill/moe_mmq.cu src/prefill/moe_fused.cu src/prefill/moe_fused_iq.cu
+                  src/prefill/ggml_cuda_host.cu ${_strata_mmq}/quantize.cu)
+    endif()
     # q8_0: the drafter's matrices (E-9); STRATA_ORCA_Q4KS_MMQ adds q5_0 (#296, in _strata_mmq_types), and
     # STRATA_MMQ_KQUANTS q4_k q5_k q5_1, the experts of Unsloth's UD-Q4_K_XL (docs/UNSLOTH_Q4.md; the dispatch
     # follows eddoursul/Strata 7706c1b); q6_k is HIP only
@@ -1281,6 +1335,17 @@ if(STRATA_NATIVE_EXPERTS)
       target_compile_options(strata_mmq PRIVATE $<$<COMPILE_LANGUAGE:CUDA>:-Xcompiler=/bigobj>)
     endif()
     target_link_libraries(strata_mmq PUBLIC ggml-base ${_strata_gpu_runtime_target})
+    if(STRATA_QWEN35)
+      target_link_libraries(strata_mmq PUBLIC ggml-cuda)
+      # ODR: any translation unit that includes ggml-cuda/common.cuh and instantiates ggml_backend_cuda_context
+      # must see the same field layout as ggml-cuda itself.  ggml-cuda defines GGML_CUDA_USE_GRAPHS (directory
+      # scoped), which adds fields BEFORE concurrent_stream_context; without it here the linker picks these
+      # objects' constructor/destructor COMDATs and ggml-cuda reads the context shifted (crash in
+      # concurrent_events.find).  Keep this define in lockstep with ggml's GGML_CUDA_GRAPHS.
+      if(GGML_CUDA_GRAPHS)
+        target_compile_definitions(strata_mmq PRIVATE GGML_CUDA_USE_GRAPHS)
+      endif()
+    endif()
     if(STRATA_MMQ_KQUANTS)
       target_compile_definitions(strata_mmq PRIVATE STRATA_MMQ_KQUANTS=1)
     endif()
@@ -1431,6 +1496,37 @@ endif()
 if(STRATA_ENABLE_CUDA AND STRATA_BUILD_TESTS AND EXISTS "${CMAKE_CURRENT_SOURCE_DIR}/bench/micro/hit_cpu_order_parity.cu")
   add_executable(hit_cpu_order_parity bench/micro/hit_cpu_order_parity.cu)
   target_link_libraries(hit_cpu_order_parity PRIVATE strata_kernels strata_kernels_cpu ${_strata_gpu_runtime_target})
+endif()
+
+if(STRATA_QWEN35)
+  # The bridge + runner.  `strata_qwen35` links the shared expert service (`strata_engine`, which carries
+  # expert_source/expert_cache and the CPU pool) and the GPU expert kernels (`strata_kernels`); `llama` links
+  # it so the patched graph hooks (LLAMA_STRATA_QWEN35) resolve, and the `strata` executable links both.
+  add_library(strata_qwen35 STATIC src/core/qwen35_bridge.cpp src/core/qwen35_prefill.cu src/program/qwen35_model.cpp)
+  target_include_directories(strata_qwen35 PUBLIC ${CMAKE_CURRENT_SOURCE_DIR}/include
+                                  PRIVATE ${_strata_gpu_include_directories} ${STRATA_GGML_DIR}/include
+                                          ${STRATA_GGML_DIR}/ggml/include ${STRATA_GGML_DIR}/ggml/src)
+  target_link_libraries(strata_qwen35 PUBLIC strata_engine strata_kernels strata_prefill ggml-base
+                            ${_strata_gpu_runtime_target})
+  target_compile_definitions(strata_qwen35 PRIVATE STRATA_QWEN35=1)
+  if(GGML_CUDA_GRAPHS)
+    # same ODR rule as strata_mmq: strata_kernels' native_*.cu include ggml-cuda/common.cuh
+    target_compile_definitions(strata_kernels PRIVATE GGML_CUDA_USE_GRAPHS)
+  endif()
+  target_compile_definitions(llama PRIVATE LLAMA_STRATA_QWEN35=1)
+  target_include_directories(llama PRIVATE ${CMAKE_CURRENT_SOURCE_DIR}/include)
+  target_link_libraries(llama PRIVATE strata_qwen35)
+  target_link_libraries(strata PRIVATE llama)
+  target_compile_definitions(strata PRIVATE STRATA_QWEN35=1)
+  # the small real-weight numeric check for the IQ2_S scale fix and the DOWN21/DOWN23 dispatch
+  add_executable(qwen35-expert-check src/program/qwen35_expert_check.cpp)
+  target_include_directories(qwen35-expert-check PRIVATE ${_strata_gpu_include_directories}
+                               ${STRATA_GGML_DIR}/ggml/include)
+  target_link_libraries(qwen35-expert-check PRIVATE strata_engine strata_kernels strata_prefill ggml-base ggml-cpu
+                            ${_strata_gpu_runtime_target})
+  if(MSVC)
+    target_link_options(strata PRIVATE /MAP /OPT:NOICF)
+  endif()
 endif()
 
 if(STRATA_BUILD_TESTS)

@@ -1,0 +1,19 @@
+{
+  "strata": {
+    "repository": "https://github.com/Niko1221/Strata",
+    "tag": "v0.1.41",
+    "commit": "fb58e0dbc8399662c0e47c76578c6e878b14f6cf"
+  },
+  "llama_cpp": {
+    "repository": "https://github.com/ggml-org/llama.cpp",
+    "commit": "988190680d5a89fce97de3c20df2c2813731fd61",
+    "tag": "b11476"
+  },
+  "model": {
+    "file": "Qwen3.6-35B-A3B-UD-IQ3_S.gguf",
+    "size": 13676723168,
+    "sha256": "66a3ca888ce13482b40c333db2432c0ebde3a7b13754fc29f0c6f5e89703ec66"
+  },
+  "published_snapshot": "65, business acceptance 67; excludes GDN timing task68",
+  "reference_executable_sha256": "4dcfc1773411d33bdd446241218c725d37499dc3cc2cc6393eb4b78e9b622587"
+}

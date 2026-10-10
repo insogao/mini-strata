@@ -7,3 +7,40 @@ bench/prompts/** -text
 
 # copies of real packs' native_experts.txt, parsed byte for byte by tests/core/expert_layout_test.cpp
 tests/data/native_experts/** -text
+
+# Qwen publication: match original blob line endings for readable source diffs.
+CMakeLists.txt text eol=lf
+include/strata/core/expert_cache.hpp text eol=lf
+include/strata/core/expert_source.hpp text eol=lf
+include/strata/core/qwen35_bridge.hpp text eol=lf
+include/strata/core/qwen35_prefill.hpp text eol=lf
+include/strata/kernels/cpu/expert_layout.hpp text eol=lf
+include/strata/kernels/cpu/native_expert.hpp text eol=lf
+include/strata/kernels/cpu/pool.hpp text eol=lf
+include/strata/prefill/cold_stager.hpp text eol=lf
+include/strata/program/qwen35_model.hpp text eol=lf
+src/core/expert_cache.cpp text eol=lf
+src/core/expert_source.cpp text eol=lf
+src/core/qwen35_bridge.cpp text eol=lf
+src/core/qwen35_prefill.cu text eol=lf
+src/kernels/cpu/expert_layout.cpp text eol=lf
+src/kernels/cpu/native_expert.cpp text eol=lf
+src/kernels/cpu/pool.cpp text eol=lf
+src/kernels/cuda/iq_kernels.cu text eol=lf
+src/prefill/cold_stager.cpp text eol=lf
+src/prefill/prefill.cpp text eol=lf
+src/program/generate.cpp text eol=lf
+src/program/qwen35_expert_check.cpp text eol=lf
+src/program/qwen35_model.cpp text eol=lf
+vendor/llama.cpp/ggml/include/ggml-backend.h -text
+vendor/llama.cpp/ggml/src/ggml-backend.cpp -text
+vendor/llama.cpp/ggml/src/ggml-cuda/ggml-cuda.cu -text
+vendor/llama.cpp/src/llama-context.cpp -text
+vendor/llama.cpp/src/llama-graph.cpp -text
+vendor/llama.cpp/src/models/qwen35moe.cpp -text
+vendor/llama.cpp/ggml/src/ggml-cuda/gated_delta_net.cu -text
+vendor/llama.cpp/ggml/src/ggml-cuda/gated_delta_net.cuh -text
+README.md text eol=lf
+UPSTREAM_QWEN35.json text eol=lf
+docs/QWEN35* text eol=lf
+evidence/*.json text eol=lf

@@ -1,5 +1,9 @@
 #include "llama-graph.h"
 
+#ifdef LLAMA_STRATA_QWEN35
+#include "strata/core/qwen35_bridge.hpp"
+#endif
+
 #include "llama-impl.h"
 #include "llama-model.h"
 #include "llama-batch.h"
@@ -2205,6 +2209,23 @@ ggml_tensor * llm_graph_context::build_moe_ffn(
     //call early so that topk-moe can be used
     ggml_build_forward_expand(gf, weights);
 
+#ifdef LLAMA_STRATA_QWEN35
+    if (arch == LLM_ARCH_QWEN35MOE && strata::core::qwen35_native_layer_enabled(il,n_tokens)) {
+        GGML_ASSERT(type_op == LLM_FFN_SILU && !weight_before_ffn && loras->empty());
+        GGML_ASSERT(!gate_up_exps && !up_exps_b && !gate_exps_b && !down_exps_b);
+        GGML_ASSERT(!up_exps_s && !gate_exps_s && !down_exps_s);
+        auto* result = strata::core::qwen35_native_moe(ctx0, gf, cur, selected_experts, weights,
+            gate_exps, up_exps, down_exps, il);
+        cb(result, "ffn_moe_out", il);
+        return result;
+    }
+#endif
+
+#ifdef LLAMA_STRATA_QWEN35
+    if (arch == LLM_ARCH_QWEN35MOE) {
+        cur = strata::core::qwen35_reference_moe_marker(ctx0,gf,cur,selected_experts,weights,il,true);
+    }
+#endif
     cur = ggml_reshape_3d(ctx0, cur, n_embd, 1, n_tokens);
 
     if (weight_before_ffn) {
@@ -2405,6 +2426,12 @@ ggml_tensor * llm_graph_context::build_moe_ffn(
     }
 
     cb(moe_out, "ffn_moe_out", il);
+
+#ifdef LLAMA_STRATA_QWEN35
+    if (arch == LLM_ARCH_QWEN35MOE) {
+        moe_out = strata::core::qwen35_reference_moe_marker(ctx0,gf,moe_out,nullptr,nullptr,il,false);
+    }
+#endif
 
     return moe_out;
 }
