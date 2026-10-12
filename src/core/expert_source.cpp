@@ -3399,6 +3399,18 @@ double tier_now_ms() {
     static const auto epoch = std::chrono::steady_clock::now();
     return std::chrono::duration<double, std::milli>(std::chrono::steady_clock::now() - epoch).count();
 }
+
+/// 165: STRATA_QWEN35_TIER_SPLIT, exact value "1", read once per process (cached; same shape as the other
+/// Qwen35 opt-ins).  Unset or any other value keeps the original behaviour byte for byte: no timer read, no
+/// counter, no output.  When on, only expert_native_decode_layer/close add host chrono reads around the
+/// EXISTING calls (see ExpertDispatch::NativeTierSplit).
+bool tier_split_enabled() {
+    static const bool on = [] {
+        const char* v = std::getenv("STRATA_QWEN35_TIER_SPLIT");
+        return v != nullptr && std::strcmp(v, "1") == 0;
+    }();
+    return on;
+}
 }  // namespace
 
 bool expert_native_cache_open(ExpertDispatch& d, int64_t slots, const std::string& profile, std::string& err) {
@@ -3788,6 +3800,47 @@ bool expert_native_admit(ExpertDispatch& d, int64_t layer, const int32_t* ids, i
 }
 
 void expert_native_close(ExpertDispatch& d) {
+    // 165: the one-time split report (STRATA_QWEN35_TIER_SPLIT=1).  Printed before any teardown and only from
+    // this dispatch's own accumulators, so it never reads the pool or a freed object.
+    if (!d.tier_split.resolved) {
+        d.tier_split.resolved = true;
+        d.tier_split.enabled = tier_split_enabled();
+    }
+    if (d.tier_split.enabled && !d.tier_split.reported) {
+        d.tier_split.reported = true;
+        const ExpertDispatch::NativeTierSplit& ts = d.tier_split;
+        const double cpu_pool = ts.ms_pool_gu + ts.ms_pool_q + ts.ms_pool_down;
+        const double comp = ts.ms_act_wait + ts.ms_cpu + ts.ms_upload_enq;
+        const double residual = ts.ms_misses_sum - comp - ts.ms_bookkeeping;
+        std::fprintf(stderr,
+                     "strata: tier-split-165 ON (STRATA_QWEN35_TIER_SPLIT=1), domain: runtime T1 decode-layer "
+                     "calls, per-layer host windows (may include the last prompt token; not request-split; not "
+                     "pure CPU/GPU time and not the business decode total)\n");
+        std::fprintf(stderr,
+                     "strata: tier-split-165 counts: calls %lld | all-hit %lld | miss-calls %lld | "
+                     "all-miss(act D2H in ids window, not charged here) %lld | miss entries %lld | "
+                     "tier hits %lld misses %lld\n",
+                     (long long) ts.calls, (long long) ts.all_hit_calls, (long long) ts.miss_calls,
+                     (long long) ts.all_miss_calls, (long long) ts.miss_entries, (long long) d.native_hits,
+                     (long long) d.native_misses);
+        std::fprintf(stderr,
+                     "strata: tier-split-165 ms: misses-window %.3f = act-wait %.3f + cpu-dispatch %.3f + "
+                     "upload-enq %.3f + bookkeeping %.3f (identity residual %.6f; book min %.3f max %.3f; "
+                     "native_stats.ms_misses %.3f delta %.6f)\n",
+                     ts.ms_misses_sum, ts.ms_act_wait, ts.ms_cpu, ts.ms_upload_enq, ts.ms_bookkeeping, residual,
+                     ts.ms_bookkeeping_min, ts.ms_bookkeeping_max, d.native_stats.ms_misses,
+                     ts.ms_misses_sum - d.native_stats.ms_misses);
+        std::fprintf(stderr,
+                     "strata: tier-split-165 ms: cpu-dispatch pool split over %lld miss calls = gu-rows %.3f + "
+                     "host-quant %.3f + down-rows %.3f (pool %.3f); cpu-dispatch outside pool %.3f; pool drain "
+                     "differential (whole run_native_slice_jobs, redundant cross-check, NOT added) %.3f\n",
+                     (long long) ts.pool_diff_calls, ts.ms_pool_gu, ts.ms_pool_q, ts.ms_pool_down, cpu_pool,
+                     ts.ms_cpu - cpu_pool, ts.ms_pool_drain);
+        std::fprintf(stderr,
+                     "strata: tier-split-165 notes: pool wait-park/repark N/A (run_phase/run_native_slice_jobs "
+                     "do not update them; only run() does); ids window not split (its wait includes the upstream "
+                     "graph prefix)\n");
+    }
     for (void** p : {&d.native_meta_dev, &d.native_d_act, &d.native_x_q8_1, &d.native_scratch}) {
         if (*p != nullptr) { cudaFree(*p); *p = nullptr; }
     }
@@ -3864,10 +3917,21 @@ bool expert_native_decode_layer(ExpertDispatch& d, int64_t layer, int64_t k, con
     int nm = 0;
     for (int64_t i = 0; i < K; ++i)
         if (st.is_hit[i] == 0 && nm < 16) miss_rank[nm++] = (int) i;
+    // 165 (STRATA_QWEN35_TIER_SPLIT=1, default OFF): split this window (t2..t3) into the EXISTING steps.
+    // Host timers only; no sync, submission or data-path change.
+    ExpertDispatch::NativeTierSplit& ts = d.tier_split;
+    if (!ts.resolved) {
+        ts.resolved = true;
+        ts.enabled = tier_split_enabled();
+    }
+    const bool ts_on = ts.enabled;
+    double ts_act = 0.0, ts_cpu = 0.0, ts_up = 0.0;
     if (nm == 0) {
         ++d.native_stats.all_hit;
     } else {
+        double pool_gu0 = 0.0, pool_q0 = 0.0, pool_down0 = 0.0, pool_drain0 = 0.0;
         if (!all_miss) {
+            const double w0 = ts_on ? tier_now_ms() : 0.0;
             if (cudaMemcpyAsync(st.host_act, x_dev, (size_t) d.n_embd * sizeof(float), cudaMemcpyDeviceToHost,
                                 copy) != cudaSuccess) {
                 err = "native tier: the activation transfer failed";
@@ -3878,11 +3942,33 @@ bool expert_native_decode_layer(ExpertDispatch& d, int64_t layer, int64_t k, con
                 err = "native tier: the activation wait failed";
                 return false;
             }
+            if (ts_on) ts_act = tier_now_ms() - w0;
         }
         d.qwen_local_ids.resize((size_t) nm);
         for (int i = 0; i < nm; ++i) d.qwen_local_ids[(size_t) i] = st.host_ids[miss_rank[i]];
+        if (ts_on && d.pool != nullptr) {
+            pool_gu0 = d.pool->ms_multi_gu;
+            pool_q0 = d.pool->ms_multi_q;
+            pool_down0 = d.pool->ms_multi_down;
+            double pwp = 0.0, prp = 0.0;
+            d.pool->phase_ms(pwp, pool_drain0, prp);
+        }
+        const double c0 = ts_on ? tier_now_ms() : 0.0;
         if (!expert_native_misses(d, layer, st.host_act, d.qwen_local_ids.data(), nm, st.host_miss)) return false;
+        if (ts_on) {
+            ts_cpu = tier_now_ms() - c0;
+            if (d.pool != nullptr) {
+                ts.ms_pool_gu += d.pool->ms_multi_gu - pool_gu0;
+                ts.ms_pool_q += d.pool->ms_multi_q - pool_q0;
+                ts.ms_pool_down += d.pool->ms_multi_down - pool_down0;
+                double pwp = 0.0, pdr = 0.0, prp = 0.0;
+                d.pool->phase_ms(pwp, pdr, prp);
+                ts.ms_pool_drain += pdr - pool_drain0;
+                ++ts.pool_diff_calls;
+            }
+        }
         float* parts = expert_native_parts(d);
+        const double u0 = ts_on ? tier_now_ms() : 0.0;
         for (int i = 0; i < nm; ++i)
             if (cudaMemcpyAsync(parts + (size_t) miss_rank[i] * d.n_embd, st.host_miss + (size_t) i * d.n_embd,
                                 (size_t) d.n_embd * sizeof(float), cudaMemcpyHostToDevice, copy) != cudaSuccess) {
@@ -3894,6 +3980,7 @@ bool expert_native_decode_layer(ExpertDispatch& d, int64_t layer, int64_t k, con
             err = "native tier: the miss-upload ordering failed";
             return false;
         }
+        if (ts_on) ts_up = tier_now_ms() - u0;
         // Real overlap evidence: the CPU work just ended; SUCCESS here means the GPU hits finished during it.
         if (have_hits) {
             const cudaError_t ready = cudaEventQuery((cudaEvent_t) d.native_ev_hit_done);
@@ -3904,6 +3991,29 @@ bool expert_native_decode_layer(ExpertDispatch& d, int64_t layer, int64_t k, con
     }
     const double t3 = tier_now_ms();
     d.native_stats.ms_misses += t3 - t2;
+    if (ts_on) {
+        ++ts.calls;
+        ts.ms_misses_sum += t3 - t2;
+        if (nm == 0) {
+            ++ts.all_hit_calls;
+        } else {
+            ++ts.miss_calls;
+            ts.miss_entries += nm;
+            if (all_miss) ++ts.all_miss_calls;
+            ts.ms_act_wait += ts_act;
+            ts.ms_cpu += ts_cpu;
+            ts.ms_upload_enq += ts_up;
+        }
+        const double book = (t3 - t2) - ts_act - ts_cpu - ts_up;
+        ts.ms_bookkeeping += book;
+        if (ts.bookkeeping_observed++ == 0) {
+            ts.ms_bookkeeping_min = book;
+            ts.ms_bookkeeping_max = book;
+        } else {
+            if (book < ts.ms_bookkeeping_min) ts.ms_bookkeeping_min = book;
+            if (book > ts.ms_bookkeeping_max) ts.ms_bookkeeping_max = book;
+        }
+    }
     // COMBINE: the shared parts with the DEVICE router weights into the graph's output.
     if (!expert_native_combine(d, work, (const float*) weights_dev, (float*) out_dev, K)) return false;
     const double t4 = tier_now_ms();
