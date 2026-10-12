@@ -180,6 +180,43 @@ bool gdn_events_enabled() {
     return on;
 }
 
+// Task 153 M0 observation (both gates default off; host logs only - no GPU event, no extra synchronize, no
+// sampler/router/math/KV-state change, and the default-off JSON/behaviour is byte-identical):
+//  - STRATA_QWEN35_DECODE_TIMESTAMPS=1: per visible token a token_timing line with host steady_clock instants
+//    (ready = the sampler returned the token, emit = its token line was written and flushed) as seconds from
+//    the request boundary (the prefill start, the same boundary TTFT uses), plus one decode_observation line
+//    with the request-start anchor, E2E, ITL arrays/p50/p95/p99, first-4/steady splits and (n-1)/(last-first)
+//    DecodeTPS (null when n < 2).
+//  - STRATA_QWEN35_STOP_EOG=1: a real autoregressive run (no teacher prefix) stops at the first vocab EOG
+//    token; the EOG is not a visible output, is never fed back and never printed (it is reported in the stop
+//    record).  A teacher-forced replay is not autoregressive and never stops on EOG - it keeps its max-new
+//    budget and is labelled teacher_replay=true in the stop record.
+bool decode_timestamps_enabled() {
+    static const bool on = [] {
+        const char* v = std::getenv("STRATA_QWEN35_DECODE_TIMESTAMPS");
+        return v != nullptr && std::strcmp(v, "1") == 0;
+    }();
+    return on;
+}
+
+bool stop_eog_enabled() {
+    static const bool on = [] {
+        const char* v = std::getenv("STRATA_QWEN35_STOP_EOG");
+        return v != nullptr && std::strcmp(v, "1") == 0;
+    }();
+    return on;
+}
+
+// Nearest-rank percentile (p in [0,1]): sorted copy, rank = ceil(p*n) clamped to [1,n]; the caller gates on
+// a non-empty array.  Deterministic by construction and pinned in decode-benchmark-spec.md.
+double percentile_nearest_rank(std::vector<double> values, double p) {
+    std::sort(values.begin(), values.end());
+    size_t rank = (size_t) std::ceil(p * (double) values.size());
+    if (rank < 1) rank = 1;
+    if (rank > values.size()) rank = values.size();
+    return values[rank - 1];
+}
+
 // Runs the (idempotent) GDN flush on every return path of qwen35_run, so a failed run still reports its
 // partial counts.  The run declares it after the llama context, so it fires before context destruction.
 struct GdnEventsFlushGuard {
@@ -560,6 +597,7 @@ int qwen35_run(const Qwen35RunOptions& o) {
         }
     }
     const auto prefill_begin = Clock::now();
+    const double request_start_since_process_start = elapsed(process_start);   // task 153 M0 request anchor
     core::qwen35_a_split_mark(0);   // task 134 diagnostic (no-op unless the gate is on)
     // Additive prompt-phase split: prefill_process_seconds is the sum of the llama_process spans (the
     // submit calls below) and prefill_finish_seconds the finish_prompt span; the existing prefill_seconds
@@ -622,6 +660,14 @@ int qwen35_run(const Qwen35RunOptions& o) {
     std::vector<llama_token> generated;
     double decode_seconds = 0;
     int decode_evaluations = 0;
+    // Task 153 M0 observation state (default off; reads the same loop, changes no loop decision when off).
+    const bool decode_timestamps_on = decode_timestamps_enabled();
+    const bool stop_eog_on = stop_eog_enabled();
+    std::vector<double> decode_token_ready_s;   // visible tokens only, seconds from the request anchor
+    std::vector<double> decode_token_emit_s;
+    const char* decode_stop_reason = "max_new";   // eog | nan | decode_process_error keep their own value
+    long long decode_eog_id = -1;
+    const bool decode_entered = (rc == 0);
     // Additive decode timing (observation only - no new synchronize, no ordering change):
     //  - decode_eval_seconds: sum over completed evals of [just before llama_process -> return of the next
     //    llama_get_logits_ith], so a span holds its process, the next round's VRAM sample, host gap and the
@@ -712,6 +758,7 @@ int qwen35_run(const Qwen35RunOptions& o) {
             decode_scan_seconds += elapsed(scan_begin);
             ++decode_scan_rounds;
             if (scan_found_nan) {
+                decode_stop_reason = "nan";
                 decode_observe_seconds += elapsed(observe_begin);
                 ++decode_observe_rounds;
                 std::fprintf(stderr, "strata generate: NaN in the logits at output %lld; stopping\n",
@@ -723,6 +770,17 @@ int qwen35_run(const Qwen35RunOptions& o) {
             const llama_token token = llama_sampler_sample(sampler.get(), ctx.get(), -1);
             decode_sampler_seconds += elapsed(sampler_begin);
             ++decode_sampler_rounds;
+            // Task 153 M0 (STRATA_QWEN35_STOP_EOG=1 only): a true autoregressive run stops before the EOG
+            // becomes an output - it is not pushed, not printed and not fed back.  A teacher replay is not
+            // autoregressive and is exempt (max-new budget kept, labelled in the observation record).
+            if (stop_eog_on && teacher.empty() && llama_vocab_is_eog(vocab, token)) {
+                decode_stop_reason = "eog";
+                decode_eog_id = (long long) token;
+                std::printf("{\"event\":\"eog_stop\",\"index\":%lld,\"id\":%d}\n", (long long) i, token);
+                std::fflush(stdout);
+                break;
+            }
+            const double ready_s = decode_timestamps_on ? elapsed(prefill_begin) : -1.0;   // task 153 M0
             if (topk_stream.is_open()) {
                 const auto topk_begin = Clock::now();
                 if (logits != nullptr) {
@@ -786,6 +844,17 @@ int qwen35_run(const Qwen35RunOptions& o) {
             ++decode_flush_rounds;
             decode_piece_json_flush_seconds += elapsed(piece_begin);
             ++decode_piece_json_flush_rounds;
+            if (decode_timestamps_on) {
+                // Emit instant = the token event above was written and flushed (the consumer can read it).
+                // ready_s/emit_s are host steady_clock instants from the request anchor; this line performs
+                // no synchronization and is the only new write on the ON path.
+                const double emit_s = elapsed(prefill_begin);
+                decode_token_ready_s.push_back(ready_s);
+                decode_token_emit_s.push_back(emit_s);
+                std::printf("{\"event\":\"token_timing\",\"index\":%lld,\"ready_s\":%.9g,\"emit_s\":%.9g}\n",
+                            (long long) i, ready_s, emit_s);
+                std::fflush(stdout);
+            }
             decode_observe_seconds += elapsed(observe_begin);
             ++decode_observe_rounds;
             // Graph observation boundary (default off): one record per generated output; perf is read only
@@ -797,6 +866,7 @@ int qwen35_run(const Qwen35RunOptions& o) {
                 eval_span_begin = Clock::now();
                 const int process_rc = llama_process(ctx.get(), LLAMA_PROCESS_TYPE_DECODE, batch.get());
                 if (process_rc != 0) {
+                    decode_stop_reason = "decode_process_error";
                     std::fprintf(stderr, "strata generate: decode failed at %lld\n", (long long) i);
                     rc = 1;
                     break;
@@ -1011,6 +1081,111 @@ int qwen35_run(const Qwen35RunOptions& o) {
             decode_token_write_seconds, (long long) decode_token_write_rounds,
             decode_flush_seconds, (long long) decode_flush_rounds);
     std::fflush(stdout);
+    // Task 153 M0 observation (printed only when one of the two gates above is ON; with both OFF the stdout
+    // ends at the summary exactly as before).  The stop record is emitted for either gate; the timing block
+    // is filled only by TIMESTAMPS.  Everything is derived from the loop's own host instants: no new
+    // synchronization, no change to any earlier number, and the raw per-token instants are the
+    // token_timing lines on stdout.
+    if (decode_timestamps_on || stop_eog_on) {
+        const char* stop_reason = decode_stop_reason;
+        if (!decode_entered) stop_reason = loan_returned ? "prefill_failed" : "loan_failed";
+        const size_t n_visible = generated.size();
+        std::vector<double> itl_emit_ms, itl_ready_ms;
+        for (size_t k = 1; k < decode_token_emit_s.size(); ++k) {
+            itl_emit_ms.push_back((decode_token_emit_s[k] - decode_token_emit_s[k - 1]) * 1000.0);
+            itl_ready_ms.push_back((decode_token_ready_s[k] - decode_token_ready_s[k - 1]) * 1000.0);
+        }
+        std::vector<double> itl_steady_emit_ms, itl_steady_ready_ms;   // steady = deltas after the first 4
+        for (size_t k = 4; k < itl_emit_ms.size(); ++k) {
+            itl_steady_emit_ms.push_back(itl_emit_ms[k]);
+            itl_steady_ready_ms.push_back(itl_ready_ms[k]);
+        }
+        const std::vector<double> itl_first4_emit_ms(
+            itl_emit_ms.begin(), itl_emit_ms.begin() + std::min<size_t>(4, itl_emit_ms.size()));
+        const auto arrays_json = [](const std::vector<double>& v) {
+            std::string s = "[";
+            for (size_t k = 0; k < v.size(); ++k) {
+                char buf[64];
+                std::snprintf(buf, sizeof(buf), "%s%.9g", k ? "," : "", v[k]);
+                s += buf;
+            }
+            return s + "]";
+        };
+        const auto pct_json = [](const std::vector<double>& v, double p) {
+            if (v.empty()) return std::string("null");
+            char buf[64];
+            std::snprintf(buf, sizeof(buf), "%.6g", percentile_nearest_rank(v, p));
+            return std::string(buf);
+        };
+        std::string tps_emit = "null", tps_ready = "null";
+        if (n_visible >= 2) {
+            char buf[64];
+            const double span_emit = decode_token_emit_s.back() - decode_token_emit_s.front();
+            if (span_emit > 0) {
+                std::snprintf(buf, sizeof(buf), "%.6g", (double) (n_visible - 1) / span_emit);
+                tps_emit = buf;
+            }
+            const double span_ready = decode_token_ready_s.back() - decode_token_ready_s.front();
+            if (span_ready > 0) {
+                std::snprintf(buf, sizeof(buf), "%.6g", (double) (n_visible - 1) / span_ready);
+                tps_ready = buf;
+            }
+        }
+        std::string first_id = "null", last_id = "null", eog_id = "null", e2e_last = "null";
+        {
+            char buf[64];
+            if (n_visible >= 1) {
+                std::snprintf(buf, sizeof(buf), "%d", (int) generated.front());
+                first_id = buf;
+                std::snprintf(buf, sizeof(buf), "%d", (int) generated.back());
+                last_id = buf;
+                std::snprintf(buf, sizeof(buf), "%.9g", decode_token_emit_s.back());
+                e2e_last = buf;
+            }
+            if (decode_eog_id >= 0) {
+                std::snprintf(buf, sizeof(buf), "%lld", decode_eog_id);
+                eog_id = buf;
+            }
+        }
+        const double e2e_observation_s = elapsed(prefill_begin);
+        if (decode_timestamps_on) {
+            std::printf("{\"event\":\"decode_observation\",\"timestamps\":true,\"stop_eog\":%s,"
+                        "\"teacher_replay\":%s,\"request_boundary\":\"prefill_start\","
+                        "\"request_start_since_process_start_seconds\":%.9g,"
+                        "\"stop\":{\"reason\":\"%s\",\"eog_id\":%s,\"visible_output_tokens\":%zu,"
+                        "\"decode_evaluations\":%d,\"first_token_id\":%s,\"last_token_id\":%s},"
+                        "\"decode_timing\":{\"e2e_last_visible_token_seconds\":%s,"
+                        "\"e2e_observation_seconds\":%.9g,\"decode_tps_emit\":%s,\"decode_tps_ready\":%s,"
+                        "\"itl_emit_ms_p50\":%s,\"itl_emit_ms_p95\":%s,\"itl_emit_ms_p99\":%s,"
+                        "\"itl_ready_ms_p50\":%s,\"itl_ready_ms_p95\":%s,\"itl_ready_ms_p99\":%s,"
+                        "\"itl_steady_emit_ms_p50\":%s,\"itl_steady_emit_ms_p95\":%s,\"itl_steady_emit_ms_p99\":%s,"
+                        "\"itl_steady_ready_ms_p50\":%s,\"itl_steady_ready_ms_p95\":%s,\"itl_steady_ready_ms_p99\":%s,"
+                        "\"itl_first4_emit_ms\":%s,\"itl_emit_ms\":%s,\"itl_ready_ms\":%s}}\n",
+                        stop_eog_on ? "true" : "false", teacher.empty() ? "false" : "true",
+                        request_start_since_process_start, stop_reason, eog_id.c_str(), n_visible,
+                        decode_evaluations, first_id.c_str(), last_id.c_str(), e2e_last.c_str(),
+                        e2e_observation_s, tps_emit.c_str(), tps_ready.c_str(),
+                        pct_json(itl_emit_ms, 0.50).c_str(), pct_json(itl_emit_ms, 0.95).c_str(),
+                        pct_json(itl_emit_ms, 0.99).c_str(), pct_json(itl_ready_ms, 0.50).c_str(),
+                        pct_json(itl_ready_ms, 0.95).c_str(), pct_json(itl_ready_ms, 0.99).c_str(),
+                        pct_json(itl_steady_emit_ms, 0.50).c_str(), pct_json(itl_steady_emit_ms, 0.95).c_str(),
+                        pct_json(itl_steady_emit_ms, 0.99).c_str(), pct_json(itl_steady_ready_ms, 0.50).c_str(),
+                        pct_json(itl_steady_ready_ms, 0.95).c_str(), pct_json(itl_steady_ready_ms, 0.99).c_str(),
+                        arrays_json(itl_first4_emit_ms).c_str(), arrays_json(itl_emit_ms).c_str(),
+                        arrays_json(itl_ready_ms).c_str());
+        } else {
+            std::printf("{\"event\":\"decode_observation\",\"timestamps\":false,\"stop_eog\":%s,"
+                        "\"teacher_replay\":%s,\"request_boundary\":\"prefill_start\","
+                        "\"request_start_since_process_start_seconds\":%.9g,"
+                        "\"stop\":{\"reason\":\"%s\",\"eog_id\":%s,\"visible_output_tokens\":%zu,"
+                        "\"decode_evaluations\":%d,\"first_token_id\":%s,\"last_token_id\":%s},"
+                        "\"decode_timing\":null}\n",
+                        stop_eog_on ? "true" : "false", teacher.empty() ? "false" : "true",
+                        request_start_since_process_start, stop_reason, eog_id.c_str(), n_visible,
+                        decode_evaluations, first_id.c_str(), last_id.c_str());
+        }
+        std::fflush(stdout);
+    }
     // Task 68 explicit one-time GDN flush: after prefill/TTFT and the short decode output are recorded,
     // before the context is destroyed.  Its completion waits never enter those numbers.  The guard above
     // covers the failure paths with the same (idempotent) call.
