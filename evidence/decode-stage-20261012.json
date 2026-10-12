@@ -1,0 +1,85 @@
+{
+  "at": "2026-10-12T17:49:06.376549+08:00",
+  "closed_scope": "153-173",
+  "work_numbers": 21,
+  "GPU_batches": 6,
+  "closed_native_runs": 35,
+  "174_native_executed": 2,
+  "total_native_executed": 37,
+  "build_attempts": 5,
+  "additional_configure_failures": 1,
+  "confirmed_business_decode_speed_candidates": 0,
+  "approved_performance_merges": 0,
+  "budgets": {
+    "156": 12,
+    "157": 1,
+    "163": 4,
+    "166": 2,
+    "169": 4,
+    "171": 12,
+    "174": 2
+  },
+  "frozen_binary_SHA256": "0e00af8a11274c62789f47c1b5d21aed811f33adb9b79608ffb7df5525a906b6",
+  "M0_source_HEAD": "9bb9b6a556376f003d563f3e07a5d1e6dc91757f",
+  "M0_binary_SHA256": "573038fef0f7e5e2f3ed4ebd1d160b5e9d000c9bbe23fc660936f5af1af230ac",
+  "tier_split_source_HEAD": "4b3ec9bccb6bfd9b257b507d0664709ceabb4f1b",
+  "prod_profile_SHA256": "fab192ff3821d7ae4d3384ae57b4fe475153d22604dbe7eccf2b8bbc97ce754e",
+  "candidate_profile_SHA256": "a1fce9a7d150774a24dc56417c5d98768aa20fe9e33a37a832487d2adeecded1",
+  "benign_input_SHA256": "4e6b2529aaab49d3c7a0b4f8f34bf5312b3c18dacbc688befd437421ad6a631d",
+  "normal_prompt_tokens": 3896,
+  "actual_output_tokens": 16,
+  "context": 4096,
+  "threads": 8,
+  "max_new": 32,
+  "decode_formula": "(n-1)/(last_emit-first_emit)",
+  "JSON_window": "prefill_start to JSON close visible; excludes load, not full network E2E",
+  "171_normal_cases": [
+    {
+      "case": "prod1",
+      "prefill_s": 8.266,
+      "decode_TPS": 14.008,
+      "JSON_visible_s": 9.341,
+      "misses": 3033
+    },
+    {
+      "case": "candidate1",
+      "prefill_s": 8.41,
+      "decode_TPS": 15.271,
+      "JSON_visible_s": 9.397,
+      "misses": 2309
+    },
+    {
+      "case": "candidate2",
+      "prefill_s": 6.732,
+      "decode_TPS": 8.55,
+      "JSON_visible_s": 8.49,
+      "misses": 2309
+    },
+    {
+      "case": "prod2",
+      "prefill_s": 3.803,
+      "decode_TPS": 19.956,
+      "JSON_visible_s": 4.557,
+      "misses": 3033
+    },
+    {
+      "case": "prod3",
+      "prefill_s": 7.709,
+      "decode_TPS": 15.496,
+      "JSON_visible_s": 8.681,
+      "misses": 3033
+    },
+    {
+      "case": "candidate3",
+      "prefill_s": 5.326,
+      "decode_TPS": 21.31,
+      "JSON_visible_s": 6.033,
+      "misses": 2309
+    }
+  ],
+  "171_verdict": "inconclusive;no merge/default",
+  "known_quality": "risk2/true versuslabel3 in bothprofiles",
+  "174_status": "2executed; observerreport inprogress; diagnostics only",
+  "174_limits": "1Hz;actualsampler0.236/0.263core;seconddecode0samples;do not assert stable or causal",
+  "private_fixture_replay_available": false
+}

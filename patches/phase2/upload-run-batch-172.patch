@@ -1,0 +1,124 @@
+diff --git a/include/strata/core/expert_source.hpp b/include/strata/core/expert_source.hpp
+index 8162320..b87f5bc 100644
+--- a/include/strata/core/expert_source.hpp
++++ b/include/strata/core/expert_source.hpp
+@@ -493,6 +493,7 @@ struct ExpertDispatch {
+         bool resolved = false;        ///< the feature gate was read (once per dispatch)
+         bool enabled = false;         ///< STRATA_QWEN35_TIER_SPLIT=1
+         bool reported = false;        ///< the one-time close report was printed
++        bool upload_run_batch = false;///< 172: STRATA_QWEN35_UPLOAD_RUN_BATCH=1 (resolved once per dispatch)
+         int64_t calls = 0;            ///< expert_native_decode_layer calls
+         int64_t all_hit_calls = 0;
+         int64_t miss_calls = 0;       ///< calls with at least one CPU miss (nm > 0)
+@@ -508,6 +509,10 @@ struct ExpertDispatch {
+         int64_t bookkeeping_observed = 0;
+         double ms_pool_gu = 0, ms_pool_q = 0, ms_pool_down = 0;
+         double ms_pool_drain = 0;
++        // 172: the miss-row upload copy counters (diagnostic only, no math/cache effect; runtime T1 domain).
++        int64_t upload_rows = 0;      ///< per-row copies the original loop would issue (Sigma nm)
++        int64_t upload_copies = 0;    ///< actual cudaMemcpyAsync calls (Sigma runs when the run gate is on)
++        uint64_t upload_bytes = 0;    ///< bytes these copies move (identical in both modes)
+     };
+     NativeTierSplit tier_split;
+     /// The prompt path's loan state: the borrowed tail slots (see expert_native_loan_plan / _return).
+diff --git a/src/core/expert_source.cpp b/src/core/expert_source.cpp
+index 62d17f9..2a7840a 100644
+--- a/src/core/expert_source.cpp
++++ b/src/core/expert_source.cpp
+@@ -3411,6 +3411,18 @@ bool tier_split_enabled() {
+     }();
+     return on;
+ }
++
++/// 172: STRATA_QWEN35_UPLOAD_RUN_BATCH, exact value "1", read once per process (cached; same shape as the other
++/// Qwen35 opt-ins).  Unset or any other value keeps the original per-row upload loop.  When on, the contiguous
++/// rank runs of one decode layer's miss-row H2D uploads are merged into single copies; dst/src/bytes of every
++/// row, the copy stream and the ev_miss/work ordering are unchanged (no new buffer, kernel or CUDA API).
++bool upload_run_batch_enabled() {
++    static const bool on = [] {
++        const char* v = std::getenv("STRATA_QWEN35_UPLOAD_RUN_BATCH");
++        return v != nullptr && std::strcmp(v, "1") == 0;
++    }();
++    return on;
++}
+ }  // namespace
+ 
+ bool expert_native_cache_open(ExpertDispatch& d, int64_t slots, const std::string& profile, std::string& err) {
+@@ -3840,6 +3852,12 @@ void expert_native_close(ExpertDispatch& d) {
+                      "strata: tier-split-165 notes: pool wait-park/repark N/A (run_phase/run_native_slice_jobs "
+                      "do not update them; only run() does); ids window not split (its wait includes the upstream "
+                      "graph prefix)\n");
++        std::fprintf(stderr,
++                     "strata: tier-split-165 upload: gate %s (STRATA_QWEN35_UPLOAD_RUN_BATCH=1 only); legacy rows "
++                     "%lld | actual run copies %lld | bytes %llu (same bytes either way; runs merge contiguous "
++                     "miss ranks; domain = runtime T1 incl. prompt-tail; diagnostic only)\n",
++                     ts.upload_run_batch ? "ON" : "off", (long long) ts.upload_rows, (long long) ts.upload_copies,
++                     (unsigned long long) ts.upload_bytes);
+     }
+     for (void** p : {&d.native_meta_dev, &d.native_d_act, &d.native_x_q8_1, &d.native_scratch}) {
+         if (*p != nullptr) { cudaFree(*p); *p = nullptr; }
+@@ -3923,8 +3941,10 @@ bool expert_native_decode_layer(ExpertDispatch& d, int64_t layer, int64_t k, con
+     if (!ts.resolved) {
+         ts.resolved = true;
+         ts.enabled = tier_split_enabled();
++        ts.upload_run_batch = upload_run_batch_enabled();
+     }
+     const bool ts_on = ts.enabled;
++    const bool run_batch = ts.upload_run_batch;
+     double ts_act = 0.0, ts_cpu = 0.0, ts_up = 0.0;
+     if (nm == 0) {
+         ++d.native_stats.all_hit;
+@@ -3969,18 +3989,47 @@ bool expert_native_decode_layer(ExpertDispatch& d, int64_t layer, int64_t k, con
+         }
+         float* parts = expert_native_parts(d);
+         const double u0 = ts_on ? tier_now_ms() : 0.0;
+-        for (int i = 0; i < nm; ++i)
+-            if (cudaMemcpyAsync(parts + (size_t) miss_rank[i] * d.n_embd, st.host_miss + (size_t) i * d.n_embd,
+-                                (size_t) d.n_embd * sizeof(float), cudaMemcpyHostToDevice, copy) != cudaSuccess) {
+-                err = "native tier: a miss-row upload failed";
+-                return false;
++        // 172 (STRATA_QWEN35_UPLOAD_RUN_BATCH=1, default OFF): miss_rank is ascending and host_miss row i maps to
++        // rank miss_rank[i], so consecutive ranks are consecutive host_miss rows - merge each run into ONE H2D
++        // copy.  Every row's dst/src/bytes are identical to the original loop; runs cover miss ranks only (never a
++        // hit row, and no whole-tile copy); same copy stream, same ev_miss record + work waitEvent order; no new
++        // buffer, kernel, API, math, quant or launch sync.  nm <= 16 (K <= 16, top8 on this model), so the merged
++        // byte count and the rank arithmetic cannot overflow.
++        int64_t run_copies = 0;
++        if (run_batch) {
++            int i = 0;
++            while (i < nm) {
++                int j = i;
++                while (j + 1 < nm && miss_rank[j + 1] == miss_rank[j] + 1) ++j;
++                if (cudaMemcpyAsync(parts + (size_t) miss_rank[i] * d.n_embd, st.host_miss + (size_t) i * d.n_embd,
++                                    (size_t) (j - i + 1) * (size_t) d.n_embd * sizeof(float),
++                                    cudaMemcpyHostToDevice, copy) != cudaSuccess) {
++                    err = "native tier: a miss-row upload failed";
++                    return false;
++                }
++                if (ts_on) ++run_copies;
++                i = j + 1;
+             }
++        } else {
++            for (int i = 0; i < nm; ++i)
++                if (cudaMemcpyAsync(parts + (size_t) miss_rank[i] * d.n_embd, st.host_miss + (size_t) i * d.n_embd,
++                                    (size_t) d.n_embd * sizeof(float), cudaMemcpyHostToDevice, copy) != cudaSuccess) {
++                    err = "native tier: a miss-row upload failed";
++                    return false;
++                }
++            if (ts_on) run_copies = nm;
++        }
+         if (cudaEventRecord((cudaEvent_t) d.native_ev_miss, copy) != cudaSuccess ||
+             cudaStreamWaitEvent(work, (cudaEvent_t) d.native_ev_miss, 0) != cudaSuccess) {
+             err = "native tier: the miss-upload ordering failed";
+             return false;
+         }
+-        if (ts_on) ts_up = tier_now_ms() - u0;
++        if (ts_on) {
++            ts_up = tier_now_ms() - u0;
++            ts.upload_rows += nm;
++            ts.upload_copies += run_copies;
++            ts.upload_bytes += (uint64_t) nm * (uint64_t) d.n_embd * sizeof(float);
++        }
+         // Real overlap evidence: the CPU work just ended; SUCCESS here means the GPU hits finished during it.
+         if (have_hits) {
+             const cudaError_t ready = cudaEventQuery((cudaEvent_t) d.native_ev_hit_done);

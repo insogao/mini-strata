@@ -1,0 +1,64 @@
+diff --git a/src/core/qwen35_bridge.cpp b/src/core/qwen35_bridge.cpp
+index 6004b1b..d7fc07d 100644
+--- a/src/core/qwen35_bridge.cpp
++++ b/src/core/qwen35_bridge.cpp
+@@ -284,6 +284,28 @@ const char* routing_detail_path() {
+     return v;
+ }
+ 
++/// The routing-detail row cap (task 162/163): STRATA_QWEN35_ROUTING_DETAIL_MAX overrides the historical
++/// 2248-row (281-layer) bound.  It must be a plain decimal integer in [1, 81920]; unset, empty, sign/space,
++/// trailing junk, zero, or any value beyond 81920 (which also rejects every 64-bit overflow) keeps 2248,
++/// so the default path is unchanged.  Read once (cached); only the diagnostic writer consults it.
++uint64_t routing_detail_max_rows() {
++    static const uint64_t v = [] {
++        constexpr uint64_t kFallback = (uint64_t) 2248;
++        constexpr uint64_t kHardMax = (uint64_t) 81920;
++        const char* e = std::getenv("STRATA_QWEN35_ROUTING_DETAIL_MAX");
++        if (e == nullptr) return kFallback;
++        uint64_t acc = 0;
++        for (const char* p = e; *p != '\0'; ++p) {
++            if (*p < '0' || *p > '9') return kFallback;             // no sign, space or trailing junk
++            const uint64_t d = (uint64_t) (*p - '0');
++            if (acc > (kHardMax - d) / 10) return kFallback;        // beyond 81920 (covers uint64 overflow)
++            acc = acc * 10 + d;
++        }
++        return acc == 0 ? kFallback : acc;                          // zero rejected
++    }();
++    return v;
++}
++
+ uint64_t routing_detail_fnv(uint64_t h, const void* p, size_t n) {
+     constexpr uint64_t kPrime = 1099511628211ull;
+     const uint8_t* b = (const uint8_t*) p;
+@@ -755,15 +777,15 @@ bool seam_exec(ggml_backend_t backend, ggml_tensor* node) {
+         // before_count,layer,rank,id,hit,slot_after.  before_count is S.decode_layers BEFORE this layer's
+         // increment; the marker's decode_base is the already-counted prompt-tail T1 call, so the logged rows
+         // start after it and cover only post-prompt layers (the fixed short teacher8 run: 2240 rows / 280
+-        // layers, before_count 1..280).  2248 is only a hard cap: for a longer run the log is a prefix and the
++        // layers, before_count 1..280).  2248 (overridable by STRATA_QWEN35_ROUTING_DETAIL_MAX, task 162) is only a hard cap: for a longer run the log is a prefix and the
+         // row sums then match the stats deltas only up to that prefix - they never cover the whole request.
+         // slot_after is the read-only residence query at service return (admissions made inside the call are
+         // already visible); it is NOT the slot the kernel actually used.  With the diagnostic enabled, each
+         // layer's rows are flushed and the stream is checked, so a delayed write error stops the run through
+         // the seam error path; that per-layer flush perturbs scheduling - not a speed-comparison configuration.
+-        if (S.routing_detail_armed && S.routing_detail_rows < 2248) {
++        if (S.routing_detail_armed && S.routing_detail_rows < routing_detail_max_rows()) {
+             const int64_t before_count = (int64_t) S.decode_layers;
+-            for (int64_t r = 0; r < K && S.routing_detail_rows < 2248; ++r) {
++            for (int64_t r = 0; r < K && S.routing_detail_rows < routing_detail_max_rows(); ++r) {
+                 const int32_t id = L.host_ids[r];
+                 const int32_t slot_after = (S.dispatch.cache != nullptr && id >= 0 && id < S.NE)
+                                                ? S.dispatch.cache->slot_of(layer, id)
+@@ -939,8 +961,9 @@ void qwen35_bridge_shutdown() {
+         if (!S.routing_detail.good())
+             std::fprintf(stderr, "strata qwen35: routing detail log final flush failed (best effort, rc unchanged)\n");
+         else
+-            std::fprintf(stderr, "strata qwen35: routing detail log: request %u rows %llu (last request, cap 2248)\n",
+-                         S.routing_detail_request, (unsigned long long) S.routing_detail_rows);
++            std::fprintf(stderr, "strata qwen35: routing detail log: request %u rows %llu (last request, cap %llu)\n",
++                         S.routing_detail_request, (unsigned long long) S.routing_detail_rows,
++                         (unsigned long long) routing_detail_max_rows());
+     }
+     for (auto& lp : S.layers) {
+         if (lp == nullptr) continue;

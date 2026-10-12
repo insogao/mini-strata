@@ -1,0 +1,37 @@
+{
+  "source_commit": "4b3ec9bccb6bfd9b257b507d0664709ceabb4f1b",
+  "base_commit": "7f4bba9dc6010c40d2c7260c57a36b131679ced1",
+  "meaning": "immutable committed OpenCode-authored review source; no new build; not production acceptance",
+  "files": [
+    {
+      "path": "include/strata/core/expert_source.hpp",
+      "git_blob_SHA256": "7636ae67c9dee71c20be617c0ffb21e13a150f9106fb0d24418a425bf621c716",
+      "bytes": 78791
+    },
+    {
+      "path": "src/core/expert_source.cpp",
+      "git_blob_SHA256": "36e7ba5fd72e64688aad7213a8c8d0659302f083f9366bb01444ba02bd84844f",
+      "bytes": 267443
+    },
+    {
+      "path": "src/kernels/cuda/native_mmvq.cu",
+      "git_blob_SHA256": "555384ee4a66889079c780024401d6776d3b1384ddc0a28796b00c2d90df2c96",
+      "bytes": 125182
+    },
+    {
+      "path": "src/program/qwen35_model.cpp",
+      "git_blob_SHA256": "4a60cec3a99f190eab1838d7e97d0776326330575cde7026a4580dadd4ce1fbb",
+      "bytes": 89429
+    },
+    {
+      "path": "vendor/llama.cpp/ggml/src/ggml-cuda/ggml-cuda.cu",
+      "git_blob_SHA256": "b877b3260ff56555858e389cdca4f5e9339a9ac2480789c4e1ef9e0d46840336",
+      "bytes": 273816
+    },
+    {
+      "path": "vendor/llama.cpp/ggml/src/ggml-cuda/norm.cu",
+      "git_blob_SHA256": "0e38735eb764661c9c3c9c6770e8bc921154dc3386f8e7b4154efa37139f5a82",
+      "bytes": 35638
+    }
+  ]
+}
