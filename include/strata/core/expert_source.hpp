@@ -493,6 +493,7 @@ struct ExpertDispatch {
         bool resolved = false;        ///< the feature gate was read (once per dispatch)
         bool enabled = false;         ///< STRATA_QWEN35_TIER_SPLIT=1
         bool reported = false;        ///< the one-time close report was printed
+        bool upload_run_batch = false;///< 172: STRATA_QWEN35_UPLOAD_RUN_BATCH=1 (resolved once per dispatch)
         int64_t calls = 0;            ///< expert_native_decode_layer calls
         int64_t all_hit_calls = 0;
         int64_t miss_calls = 0;       ///< calls with at least one CPU miss (nm > 0)
@@ -508,6 +509,10 @@ struct ExpertDispatch {
         int64_t bookkeeping_observed = 0;
         double ms_pool_gu = 0, ms_pool_q = 0, ms_pool_down = 0;
         double ms_pool_drain = 0;
+        // 172: the miss-row upload copy counters (diagnostic only, no math/cache effect; runtime T1 domain).
+        int64_t upload_rows = 0;      ///< per-row copies the original loop would issue (Sigma nm)
+        int64_t upload_copies = 0;    ///< actual cudaMemcpyAsync calls (Sigma runs when the run gate is on)
+        uint64_t upload_bytes = 0;    ///< bytes these copies move (identical in both modes)
     };
     NativeTierSplit tier_split;
     /// The prompt path's loan state: the borrowed tail slots (see expert_native_loan_plan / _return).
