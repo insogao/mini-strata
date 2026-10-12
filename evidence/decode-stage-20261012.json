@@ -79,7 +79,15 @@
   ],
   "171_verdict": "inconclusive;no merge/default",
   "known_quality": "risk2/true versuslabel3 in bothprofiles",
-  "174_status": "2executed; observerreport inprogress; diagnostics only",
+  "174_status": "completed exit0;2native;measurement-only;doesnotprove_stable",
   "174_limits": "1Hz;actualsampler0.236/0.263core;seconddecode0samples;do not assert stable or causal",
-  "private_fixture_replay_available": false
+  "private_fixture_replay_available": false,
+  "total_completed_GPU_batches": 7,
+  "total_completed_native_runs": 37,
+  "task174_exit": 0,
+  "task174_status": "completed_reviewed_with_sampler_caveats",
+  "PR_urls": [
+    "https://github.com/insogao/mini-strata/pull/1",
+    "https://github.com/insogao/mini-strata/pull/2"
+  ]
 }

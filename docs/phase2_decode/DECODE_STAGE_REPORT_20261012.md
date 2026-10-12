@@ -19,8 +19,8 @@ Prefill已有实质收益；本Decode阶段**已确认的完整业务加速方�
 | 169静态profile初筛 | 4 | 单次优势，需确认 |
 | 171静态profile确认 | 12 | 全部交错案例；miss机制复现，速度inconclusive |
 | **截至173已结束的6批合计** | **35** | 没有稳定业务Decode增益 |
-| 174同基线资源采样 | **2已执行，收尾中** | 诊断；不属于新优化候选 |
-| **截至本报告实际执行总数** | **37** | 不含早期Prefill、149/151探针或纯CPU单测 |
+| 174同基线资源采样 | **2，已结束CLI0** | 诊断；不属于新优化候选 |
+| **截至本报告7批实际执行总数** | **37** | 不含早期Prefill、149/151探针或纯CPU单测 |
 
 153/156累计2次构建尝试，163实际2次整编，166一次，**共5次**；163另有一次无正确环境的configure失败。163原allowed1build却做了2次，预算偏离保留，不能以“有效构建”洗掉失败。151此前Prefill图探针另有2build/3native，不混入Decode35。162及重复主管162a在构建/native前停止，不算GPU实验。159/160结束通知工具及Go路由核证不算模型加速。
 
@@ -93,6 +93,8 @@ Prefill历史COLD_PREAD：修首触页错的收益被DMA pacing吸收，净墙�
 外部建议请给：针对哪个函数/等待边、收益上限、文件/stream/state所有权、最小改动、同条件对照、有限预算与退出条件、Prefill保护。不接受“GPU不满所以增加batch必快”或多卡/其它模型分数换算本机。
 
 ## 7. GitHub审核结构与出处
+
+已发布：[M0/诊断源码草稿PR #1](https://github.com/insogao/mini-strata/pull/1) · [未测试上传合并草稿PR #2](https://github.com/insogao/mini-strata/pull/2)。两PR已推送且附于主管聊天，未合并。
 
 原Strata v0.1.41 `fb58e0dbc8399662c0e47c76578c6e878b14f6cf`；llama.cpp固定 `988190680d5a89fce97de3c20df2c2813731fd61`。原项目代码/依赖历史已在仓库，已有baseline与依赖tag，可完整比较魔改。
 

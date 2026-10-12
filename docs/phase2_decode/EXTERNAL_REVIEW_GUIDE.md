@@ -1,6 +1,6 @@
 # 外部审核指南
 
-先读 [阶段报告](DECODE_STAGE_REPORT_20261012.md)。目标是审核完整T=1专家流水线和短JSON响应，不把profile命中或micro数字当整体加速。
+先读 [阶段报告](DECODE_STAGE_REPORT_20261012.md)。源码入口：[PR #1](https://github.com/insogao/mini-strata/pull/1)与[PR #2](https://github.com/insogao/mini-strata/pull/2)。目标是审核完整T=1专家流水线和短JSON响应，不把profile命中或micro数字当整体加速。
 
 ## 源码与审查入口
 
