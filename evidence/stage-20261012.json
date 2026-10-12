@@ -1,0 +1,123 @@
+{
+  "stage": "2026-10-12",
+  "hardware": "RTX4060 Laptop 8GiB",
+  "delivery": {
+    "exe_sha256": "0e00af8a11274c62789f47c1b5d21aed811f33adb9b79608ffb7df5525a906b6",
+    "ubatch": 4096,
+    "cache_slots": 3200,
+    "env": [
+      "STRATA_QWEN35_ROUTER_WEIGHTS_DEVICE=1",
+      "STRATA_QWEN35_PACKED_IDS=1",
+      "STRATA_QWEN35_EXPERT_ORDER=count_desc"
+    ],
+    "producer_default": 4,
+    "ring_default": 16,
+    "context": 4096,
+    "threads": 8,
+    "max_new": 1,
+    "diagnostics": "all default off"
+  },
+  "official_protocol": "single-process full prefill, fast state, load excluded",
+  "official": {
+    "han_risk": {
+      "median": 1121.0,
+      "n": 119,
+      "ge1000_pct": 99.2
+    },
+    "han_benign": {
+      "median": 1114.01,
+      "n": 120,
+      "ge1000_pct": 100
+    },
+    "chars_risk": {
+      "median": 992.75,
+      "n": 119,
+      "ge1000_pct": 46.7
+    },
+    "chars_benign": {
+      "median": 983.36,
+      "n": 120,
+      "ge1000_pct": 0
+    }
+  },
+  "service_form": {
+    "note": "resident same-process steady state, n=30, upper-bound family",
+    "han_risk": 1429.96,
+    "han_benign": 1428.43,
+    "chars_risk": 1377.34,
+    "chars_benign": 1362.17,
+    "ratios": {
+      "han_risk": 1.2761,
+      "han_benign": 1.2733,
+      "chars_risk": 1.3791,
+      "chars_benign": 1.3837
+    }
+  },
+  "stability": {
+    "risk_samples": 240,
+    "risk_answer_flips": 0,
+    "risk_wilson_upper_pct": 1.58,
+    "benign_samples": 123,
+    "benign_answer_flips": 0,
+    "benign_wilson_upper_pct": 3.03
+  },
+  "wall_structure_official_ms": {
+    "A_plus_Z": 730,
+    "GDN_total_approx": 1075,
+    "expert_path": 727,
+    "norms": 149,
+    "attention": 101,
+    "shared_expert": 77,
+    "router": 22,
+    "supply_wait": 862,
+    "inter_layer_host_gap": 58.28,
+    "note": "overlapping upper-bound family; not a partition"
+  },
+  "phase1_20261012": {
+    "resident_wall_ms": 2723.4,
+    "resident_tok_s": 1420.65,
+    "engine_segment_ms": 2544.0,
+    "finish_ms": 74.6,
+    "residual_upper_bound_ms": 103.5,
+    "cold_device_classes_ms": {
+      "gdn_proj": 411.07,
+      "gdn_op_eager": 538.66,
+      "norms": 150.5,
+      "attention": 98.4,
+      "shared_expert": 78.1,
+      "router": 21.8
+    },
+    "loan_refill_per_request_ms": 72.5,
+    "gap_to_1600_ms": 305,
+    "resident_per_class": "unavailable (CUDA Graph capture)"
+  },
+  "cold_bitwidth_experiment": {
+    "status": "candidates produced (CPU-only), byte account PASS; GPU speed/quality untested",
+    "O6": {
+      "cold_set_reduction_pct": 28.25,
+      "stream_delta_risk_bytes": -2069772001
+    },
+    "O5": {
+      "cold_set_reduction_pct": 22.45,
+      "stream_delta_risk_bytes": -1644931052
+    },
+    "time_model_note": "with the corrected official center ~1122, the 1200 gap is ~225 ms; transfer savings alone do not reach 1200"
+  },
+  "known_limits": [
+    "34-root strict bitwise compare still exit 1",
+    "one unlocated illegal-memory crash (task 112; 18/18 non-repro)",
+    "routing nondeterminism count-level ~16.7 pct/round, answer-flip Wilson upper bounds 1.58/3.03 pct",
+    "chars official below 1000",
+    "service form is an upper-bound estimate protocol"
+  ],
+  "banned_figures": [
+    "4656.79",
+    "1476.42",
+    "-1.12s"
+  ],
+  "snapshot": {
+    "source_files": 33,
+    "manifest": "evidence/source-snapshot-20261012.json",
+    "excludes": "in-flight task 151 norm.cu edit; models; business text; binaries; logs"
+  }
+}

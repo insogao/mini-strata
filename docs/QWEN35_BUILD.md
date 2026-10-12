@@ -1,6 +1,6 @@
 # 构建与复现范围
 
-发布快照65对应原本机exe SHA256 `4dcfc1773411d33bdd446241218c725d37499dc3cc2cc6393eb4b78e9b622587`（130102272 bytes）。搬移源码与重新构建后不要求得到同一二进制SHA：编译器版本、源路径、PDB等会变。此仓库本轮未重新编译/测速，不能把本地旧构建Gate自动继承给任意新构建。
+发布快照 2026-10-12 对应本机交付 exe SHA256 `0e00af8a11274c62789f47c1b5d21aed811f33adb9b79608ffb7df5525a906b6`。搬移源码与重新构建后不要求得到同一二进制SHA：编译器版本、源路径、PDB等会变。此仓库本轮未重新编译/测速，不能把本地旧构建Gate自动继承给任意新构建。
 
 已用工具链：Windows/MSVC14.44/CUDA12.8.1/Ninja，C++20，sm89。来源锁见`UPSTREAM_QWEN35.json`。在VS Developer PowerShell、CUDA Toolkit已配置的环境，按原CMake选项构建（这里是可移植路径表达，不是本轮重新验证过的命令）：
 
@@ -21,17 +21,17 @@ cmake --build build --target strata
 下面假定本机已有`models`下上述模型、正确native索引，fixtures下独立校准profile、固定审核token文件。仓库未发布业务文本，以下是参数表达而非一键公开精确重放：
 
 ```powershell
-$env:STRATA_QWEN35_STAGER_THREADS = '2'
+$env:STRATA_QWEN35_ROUTER_WEIGHTS_DEVICE = '1'
+$env:STRATA_QWEN35_PACKED_IDS = '1'
 $env:STRATA_QWEN35_EXPERT_ORDER = 'count_desc'
-Remove-Item Env:STRATA_QWEN35_STAGER_WC -ErrorAction SilentlyContinue
-# 清除继承的STRATA/ GGML/ LLAMA_GRAPH诊断覆盖；其余诊断off，CUDA graphs保持默认。
+# 清除继承的STRATA/ GGML/ LLAMA_GRAPH诊断覆盖；其余诊断off，CUDA graphs保持默认；producer/ring默认4/16。
 ./build/strata.exe --qwen35-model models/Qwen3.6-35B-A3B-UD-IQ3_S.gguf `
   --qwen35-pack models --tokens-file fixtures/risk.prompt.tokens `
   --max-new 1 --max-context 4096 --qwen35-threads 8 `
-  --qwen35-cache-slots 3700 --qwen35-profile fixtures/calibration-expanded.profile `
-  --qwen35-ubatch 2048
+  --qwen35-cache-slots 3200 --qwen35-profile fixtures/calibration-expanded.profile `
+  --qwen35-ubatch 4096
 ```
 
-perf应通过Python subprocess直接继承stdout/stderr文件句柄（本机task67口径）；PowerShell消费者重定向可能改变wall，不能把不同sink当产品优化。加载另列，记录prefill wall/token/s、TTFT、actualGPU峰值、payload、hit/miss/cold/MMQ计数、loan恢复、输出格式/审核结论。物理ub2048与上下文c4096独立。
+perf应通过Python subprocess直接继承stdout/stderr文件句柄；PowerShell消费者重定向可能改变wall，不能把不同sink当产品优化。加载另列，记录prefill wall/token/s、TTFT、actualGPU峰值、payload、hit/miss/cold/MMQ计数、loan恢复、输出格式/审核结论。物理ub4096与上下文c4096独立；cache 3200是本阶段交付标准（3700可再快约1.65%但余量仅26–29MiB，不作为默认）。
 
 不必为审阅代码下载模型。先从README的diff命令和review map讨论具体路径；各候选后续实测仍由唯一GPU所有者有界串行进行。

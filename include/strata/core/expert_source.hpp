@@ -203,6 +203,9 @@ public:
     /// blob of (layers[i], experts[i]).  A source that reads a drive may merge neighbouring blobs into one request.
     /// Default: copy_blob one by one.
     virtual bool copy_blobs(const int32_t* layers, const int32_t* experts, uint8_t* const* dst, size_t n);
+    /// The same blobs through the plain mapped/file path, never a direct-read fast path: the byte-check reference
+    /// when the exact cold direct-read opt-in (STRATA_QWEN35_COLD_PREAD=1) is on.  Default: copy_blobs.
+    virtual bool copy_blobs_mapped(const int32_t* layers, const int32_t* experts, uint8_t* const* dst, size_t n);
     /// The `n` experts of `layer` the CPU is about to ask `blob` for, all at once: a source that reads a file may
     /// fetch them in parallel.  The bytes `blob` then returns are the same.  Default: nothing.
     virtual void prefetch(int64_t layer, const int64_t* experts, int64_t n) { (void) layer; (void) experts; (void) n; }
@@ -784,6 +787,11 @@ public:
     bool copy_blob(int64_t layer, int64_t expert, uint8_t* dst) override;
     /// pp-opt, unbuffered: the file-tier blobs of the run in one read_direct batch (neighbours merged into one request)
     bool copy_blobs(const int32_t* layers, const int32_t* experts, uint8_t* const* dst, size_t n) override;
+    /// The byte-check reference: the same blobs with the cold direct-read opt-in forced off (same bytes as the
+    /// default path); the producer's direct reads are compared against this.
+    bool copy_blobs_mapped(const int32_t* layers, const int32_t* experts, uint8_t* const* dst, size_t n) override;
+    /// The exact-value cold direct-read opt-in (STRATA_QWEN35_COLD_PREAD=1, default off; set at open).
+    bool cold_pread() const { return cold_pread_; }
     /// CS-T: advances the assembled blobs' age (see staged_blob).
     void begin_layer(int64_t layer, const int32_t* ids, int64_t k) override;
     /// CS-T: the GGUF in place assembles the missed experts on `fetch_threads_` threads.
@@ -835,6 +843,17 @@ private:
     const uint8_t* mapped_blob(int64_t layer, int64_t expert) const;
     /// The blob's bytes from the mapped file(s) - experts.bin, or the three GGUF role slices - into `dst`.
     bool copy_from_files(int64_t layer, int64_t expert, uint8_t* dst) const;
+    /// copy_blob's body; `allow_direct` false keeps the cold direct-read opt-in out (the byte-check reference).
+    bool copy_blob_impl(int64_t layer, int64_t expert, uint8_t* dst, bool allow_direct);
+    /// The cold direct-read opt-in: the three role slices read straight from their files into `dst` (no mapping
+    /// touch, no page faults).  Requires role_ptr_/maps_; a read failure is a failure (no fallback).
+    bool copy_blob_direct(int64_t layer, int64_t expert, uint8_t* dst);
+    /// Windows: take/return a read handle of shard `fi` (created on demand); nullptr when none can be opened.
+    void* pread_acquire(int fi);
+    void pread_release(int fi, void* h);
+    /// One role slice at `off` in file `fi`, `n` bytes, directly into `dst`; `h` is the acquired handle
+    /// (Windows; unused elsewhere: pread on the mapping's descriptor).
+    bool read_slice_direct(int fi, void* h, uint8_t* dst, uint64_t n, uint64_t off) const;
     bool open_gguf(std::string& err);
     const uint8_t* staged_blob(int64_t layer, int64_t expert);
     bool claim_stage(int64_t key, size_t& v, bool& fill, bool ahead = false);
@@ -868,6 +887,13 @@ private:
     std::vector<Map> maps_;
     std::vector<const uint8_t*> role_ptr_;    ///< 3 x n_layers: gate / up / down of the layer's expert 0
     std::vector<uint64_t> role_bytes_;        ///< 3 x n_layers: bytes per expert of that role
+    // ---- the cold direct-read opt-in (STRATA_QWEN35_COLD_PREAD=1, default off; decided in open_gguf)
+    bool cold_pread_ = false;
+    /// Windows only: per mapped shard, a small pool of plain read handles (one per concurrent producer thread
+    /// that needs one): a thread takes a handle for its read run and returns it, so concurrent readers never
+    /// share a file pointer and no overlapped/NULL-event completion state is involved (task 96's readfile arm).
+    std::vector<std::vector<void*>> pread_pool_;
+    mutable std::mutex pread_mu_;
     // the blobs assembled for `blob()`: a small pool of buffers, one per recent (layer, expert).  A buffer is
     // reused only once `kStageAge` layer changes have passed since its blob was last asked for, so a pointer holds
     // through the layer it was asked in and the next ones (the pool computes a layer's misses before the next).

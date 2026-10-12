@@ -18,3 +18,10 @@
 适配功能差异为23个Strata文件和6个llama.cpp文件；两份GDN源/header在65快照仍原版未改。包含了此前验收用的默认关诊断，不能把所有新增行都称性能优化。`evidence/source-snapshot65.json`列逐文件原始字节SHA；仓库checkout受Git换行策略影响时以来源SHA与`.gitattributes`说明为准。
 
 GitHub用`upstream-dependencies...main`查看适配提交；本地用`git diff upstream-dependencies..main -- src include CMakeLists.txt vendor/llama.cpp`。完整与原版差异另包含依赖引入和新增讨论文档，故建议分开阅读。
+
+## 更新（2026-10-12）
+
+- 适配文件现为 **25 个 Strata 文件 + 8 个 llama.cpp 文件**（逐文件 SHA 见 `evidence/source-snapshot-20261012.json`）。
+- 65 快照之后新增/变化的源码：`include/strata/prefill/moe_mmq.hpp`、`src/prefill/moe_mmq.cu`（任务 74 direct-to-group 掩码 gather，默认关）；`vendor/llama.cpp/ggml/src/ggml-cuda/gated_delta_net.cu` 与 `.cuh`（任务 68 GDN eager 计时，默认关）——65 快照时这两份 GDN 源/header 仍为原版。
+- 默认关诊断 gate 清单（本快照内含）：A_SPLIT、SEAM_GAP、OP_TIMING、PREFILL_PHASES、GPU_EVENTS、STAGER_STATS、LAYER_CAPTURE、ROUTE_FP、GGML_MOE 等；交付 exe 中默认全关，OFF 等价已核。
+- **施工中任务对 `norm.cu` 的改动未复核，不包含在本快照。**

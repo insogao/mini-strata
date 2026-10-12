@@ -1,0 +1,205 @@
+{
+  "snapshot": "2026-10-12 stage (reviewed through tasks 148/149/150)",
+  "excludes": "in-flight task 151 norm.cu edit; business text/models/binaries/logs",
+  "reference_exe_sha256": "0e00af8a11274c62789f47c1b5d21aed811f33adb9b79608ffb7df5525a906b6",
+  "files": [
+    {
+      "path": "CMakeLists.txt",
+      "sha256": "d70d05b3f707d5fed2dc1bf1e90d3d84624831e3bed305ea62d0e68e6962d3e3",
+      "bytes": 109588,
+      "source": "vendor/Strata/CMakeLists.txt"
+    },
+    {
+      "path": "include/strata/core/expert_cache.hpp",
+      "sha256": "b13c25229798d855119295a02baeb145f41dea5acf1e189352f12ac0099b3103",
+      "bytes": 19239,
+      "source": "vendor/Strata/include/strata/core/expert_cache.hpp"
+    },
+    {
+      "path": "include/strata/core/expert_source.hpp",
+      "sha256": "a65cce63ddd1bc62edc47646255e8f40c594d18e025411032f618688a8f8bed7",
+      "bytes": 77353,
+      "source": "vendor/Strata/include/strata/core/expert_source.hpp"
+    },
+    {
+      "path": "include/strata/core/qwen35_bridge.hpp",
+      "sha256": "005beb0f3b5cb6c8a7944bc8d77eaa4831e1fc2ce79eb46d6ff565231b1cb574",
+      "bytes": 7707,
+      "source": "vendor/Strata/include/strata/core/qwen35_bridge.hpp"
+    },
+    {
+      "path": "include/strata/core/qwen35_prefill.hpp",
+      "sha256": "277e8376f19649cd05741eff1e1b3851a76d000fc7e09097e64dd6170363a75a",
+      "bytes": 3444,
+      "source": "vendor/Strata/include/strata/core/qwen35_prefill.hpp"
+    },
+    {
+      "path": "include/strata/kernels/cpu/expert_layout.hpp",
+      "sha256": "f40537829c42187623ceb3a5c2108370f4512378cc75d93099eca35670feb0f4",
+      "bytes": 7166,
+      "source": "vendor/Strata/include/strata/kernels/cpu/expert_layout.hpp"
+    },
+    {
+      "path": "include/strata/kernels/cpu/native_expert.hpp",
+      "sha256": "681e09285c086d3dd3609182b0531adf8fc2909f5b09d16390ac7bbe9dd92758",
+      "bytes": 3522,
+      "source": "vendor/Strata/include/strata/kernels/cpu/native_expert.hpp"
+    },
+    {
+      "path": "include/strata/kernels/cpu/pool.hpp",
+      "sha256": "b24e41e8545066ffe80500c9a452ef35b873e954fdad06bae71a22ddf7ce43fc",
+      "bytes": 20193,
+      "source": "vendor/Strata/include/strata/kernels/cpu/pool.hpp"
+    },
+    {
+      "path": "include/strata/prefill/cold_stager.hpp",
+      "sha256": "3d0fc5f769e2ae038aa14741e7639f92cec86020b0a74369cd0c08e6efad6e6f",
+      "bytes": 8510,
+      "source": "vendor/Strata/include/strata/prefill/cold_stager.hpp"
+    },
+    {
+      "path": "include/strata/prefill/moe_mmq.hpp",
+      "sha256": "a527863cf2955004f9a7a0e8898e349b4d6fa1118d513630eeff34359d924591",
+      "bytes": 6011,
+      "source": "vendor/Strata/include/strata/prefill/moe_mmq.hpp"
+    },
+    {
+      "path": "include/strata/program/qwen35_model.hpp",
+      "sha256": "11020331ebc9831c3e1a1127d53d4dd22b4983c827c6afbd9f664ed8aca8d879",
+      "bytes": 2525,
+      "source": "vendor/Strata/include/strata/program/qwen35_model.hpp"
+    },
+    {
+      "path": "src/core/expert_cache.cpp",
+      "sha256": "29722d638cc6ff068df6f0051453ff38257a0882e53360f3b0a423eacfabe5b4",
+      "bytes": 35327,
+      "source": "vendor/Strata/src/core/expert_cache.cpp"
+    },
+    {
+      "path": "src/core/expert_source.cpp",
+      "sha256": "b9f4b7346c7683befa9f49c7f8cca8a5027ae68964da22fc499fc46045084395",
+      "bytes": 261475,
+      "source": "vendor/Strata/src/core/expert_source.cpp"
+    },
+    {
+      "path": "src/core/qwen35_bridge.cpp",
+      "sha256": "d0f537dea43374a90e23a693a8d7fb81405ef16d1b56a73be82efbb9b52ed47b",
+      "bytes": 66217,
+      "source": "vendor/Strata/src/core/qwen35_bridge.cpp"
+    },
+    {
+      "path": "src/core/qwen35_prefill.cu",
+      "sha256": "00df13c70e62d3ca6f94a0861e0c750ba794d82e3bd61e723e8cd0532bbceaf3",
+      "bytes": 177347,
+      "source": "vendor/Strata/src/core/qwen35_prefill.cu"
+    },
+    {
+      "path": "src/kernels/cpu/expert_layout.cpp",
+      "sha256": "e95eeee63d9a1eefc4f17f2c92e5a8eb02e4f5a10a2d51ca04b06ba3f376203a",
+      "bytes": 20200,
+      "source": "vendor/Strata/src/kernels/cpu/expert_layout.cpp"
+    },
+    {
+      "path": "src/kernels/cpu/native_expert.cpp",
+      "sha256": "741c5da462554cd2da9abaf5a5d24c0b15c6814b4eb14443c0c9cfcbf249dee0",
+      "bytes": 13553,
+      "source": "vendor/Strata/src/kernels/cpu/native_expert.cpp"
+    },
+    {
+      "path": "src/kernels/cpu/pool.cpp",
+      "sha256": "f5337b5123bfdebe4d770c82c1cbc86be8e8f1ae9bf5a4214f14b3695508d16d",
+      "bytes": 44382,
+      "source": "vendor/Strata/src/kernels/cpu/pool.cpp"
+    },
+    {
+      "path": "src/kernels/cuda/iq_kernels.cu",
+      "sha256": "f97fc5b4ae1ff8a5a6248d2ea38c10d0979fae489ef4ed37c5f9d632d8bcf0cc",
+      "bytes": 197029,
+      "source": "vendor/Strata/src/kernels/cuda/iq_kernels.cu"
+    },
+    {
+      "path": "src/prefill/cold_stager.cpp",
+      "sha256": "5bc329a953a058eae23973f63896142902a0c16aec181be2d33c1014c97dcf9c",
+      "bytes": 17433,
+      "source": "vendor/Strata/src/prefill/cold_stager.cpp"
+    },
+    {
+      "path": "src/prefill/moe_mmq.cu",
+      "sha256": "d54d067d029081d039cfc6b86abde022526d5b33719791a21a50b019372ecbfc",
+      "bytes": 15304,
+      "source": "vendor/Strata/src/prefill/moe_mmq.cu"
+    },
+    {
+      "path": "src/prefill/prefill.cpp",
+      "sha256": "244b351cec53a88f7c6ef9fa36163aac88605958320736b987e552fd543670ec",
+      "bytes": 261883,
+      "source": "vendor/Strata/src/prefill/prefill.cpp"
+    },
+    {
+      "path": "src/program/generate.cpp",
+      "sha256": "c2c27b4003c2c87f1b0f15d3df35de0dd02bccd5c426e31ee5d4d44e4db79499",
+      "bytes": 828651,
+      "source": "vendor/Strata/src/program/generate.cpp"
+    },
+    {
+      "path": "src/program/qwen35_expert_check.cpp",
+      "sha256": "50e4c51d3d8a004079edc147179e3cc142eb2243ee6e4afb50468df91cbdb997",
+      "bytes": 29140,
+      "source": "vendor/Strata/src/program/qwen35_expert_check.cpp"
+    },
+    {
+      "path": "src/program/qwen35_model.cpp",
+      "sha256": "ee7dea04c70d8193f0564e91dbdcc4e7faf5e630a93d2559050ea9a93604661f",
+      "bytes": 72692,
+      "source": "vendor/Strata/src/program/qwen35_model.cpp"
+    },
+    {
+      "path": "vendor/llama.cpp/ggml/include/ggml-backend.h",
+      "sha256": "26b36a8e6c1590bd312b9455321cda6351f2fdce6c4743d2db3249b423b0913c",
+      "bytes": 27641,
+      "source": "vendor/llama.cpp/ggml/include/ggml-backend.h"
+    },
+    {
+      "path": "vendor/llama.cpp/ggml/src/ggml-backend.cpp",
+      "sha256": "9182108b43799f042b45d27766b729cca9bfe61b0b48cb875ac1b20a20c83bec",
+      "bytes": 109576,
+      "source": "vendor/llama.cpp/ggml/src/ggml-backend.cpp"
+    },
+    {
+      "path": "vendor/llama.cpp/ggml/src/ggml-cuda/gated_delta_net.cu",
+      "sha256": "633080df918dc411220ba4bd9fea465e4faf6f83324ef2842cb60c305a89687d",
+      "bytes": 23029,
+      "source": "vendor/llama.cpp/ggml/src/ggml-cuda/gated_delta_net.cu"
+    },
+    {
+      "path": "vendor/llama.cpp/ggml/src/ggml-cuda/gated_delta_net.cuh",
+      "sha256": "d7ec1ab741cf5c4e1d65541748fed5b3d2033ceef32ce03e7ef16adec65638a9",
+      "bytes": 1177,
+      "source": "vendor/llama.cpp/ggml/src/ggml-cuda/gated_delta_net.cuh"
+    },
+    {
+      "path": "vendor/llama.cpp/ggml/src/ggml-cuda/ggml-cuda.cu",
+      "sha256": "d1084fed8a971d5673c175cb570718e91a07f1b84f7b0a3f9d048dafe3689f9c",
+      "bytes": 273825,
+      "source": "vendor/llama.cpp/ggml/src/ggml-cuda/ggml-cuda.cu"
+    },
+    {
+      "path": "vendor/llama.cpp/src/llama-context.cpp",
+      "sha256": "6ad257c65faa3a06ffb7ff391537ba24c1fec3e882fac8349d38380b51f585c7",
+      "bytes": 168381,
+      "source": "vendor/llama.cpp/src/llama-context.cpp"
+    },
+    {
+      "path": "vendor/llama.cpp/src/llama-graph.cpp",
+      "sha256": "e506e07b544b30a41e61235f1d52d16e63eb49fe7d1dd546358c2c1dc27b40c3",
+      "bytes": 149106,
+      "source": "vendor/llama.cpp/src/llama-graph.cpp"
+    },
+    {
+      "path": "vendor/llama.cpp/src/models/qwen35moe.cpp",
+      "sha256": "f617c8b012be90b7a3d3e9adb3131308e9f58ea5e57f3853631b1d5620e9d3b1",
+      "bytes": 34231,
+      "source": "vendor/llama.cpp/src/models/qwen35moe.cpp"
+    }
+  ]
+}

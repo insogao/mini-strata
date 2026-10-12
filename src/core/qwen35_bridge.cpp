@@ -37,6 +37,11 @@
 #include <vector>
 
 namespace strata::core {
+// Task 127 (diagnostic, default off; defined in qwen35_prefill.cu): the prompt path's optional d2h split.
+// The gate accessor keeps the off path untouched: unset -> this file makes no further call; on -> the setter
+// hands the current call's `pre` graph-prefix event handle to the prompt path.
+bool qwen_prefill_d2h_split_on();
+void qwen_prefill_d2h_split_set_pre(void* ev);
 namespace {
 
 /// The graph boundary's per-layer state: the scheduler events, the two streams, and the BOUNDED pinned staging
@@ -505,6 +510,173 @@ bool seam_marker_exec(ggml_backend_t backend, ggml_tensor* node) {
     return true;
 }
 
+// ---- Task 133: seam-outside host gap vs backend-stream device span (exact STRATA_QWEN35_SEAM_GAP=1, off by
+// default).  For every seam callback: host_gap = host wall from the previous callback's return to this one's
+// entry; dev_span = the backend-stream event window recorded at those same two points (E0 at exit, E1 at
+// entry).  host_only = host_gap - dev_span.  Flushed from qwen35_bridge_stats, i.e. after the request's
+// prefill/TTFT windows.  Unset: zero calls, zero output, the default path untouched.
+bool seam_gap_enabled() {
+    static const bool on = [] {
+        const char* v = std::getenv("STRATA_QWEN35_SEAM_GAP");
+        return v != nullptr && std::strcmp(v, "1") == 0;
+    }();
+    return on;
+}
+struct SeamGapState {
+    struct Pair {
+        ggml_backend_event_t e0 = nullptr, e1 = nullptr;
+        int layer = -1;
+        bool decode = false;
+        double host_gap_ms = 0.0;
+    };
+    std::vector<Pair> pairs;
+    ggml_backend_event_t pending_e0 = nullptr;  ///< recorded at the last seam exit; paired at the next entry
+    double t_arm = -1.0, t_prev_exit = -1.0, t_last_exit = -1.0, pre0_ms = -1.0;
+    int64_t create_fail = 0, read_fail = 0, dropped = 0;
+    bool flushed = false;
+};
+SeamGapState g_seam_gap;
+
+// Task 149 (diagnostic; STRATA_QWEN35_SEAM_GAP=1 only, default path untouched): cudaEventElapsedTime
+// refuses the backend's own events (cudaEventDisableTiming - the 133 read_fail), so the seam-gap gate
+// allocates its own timing-capable event and wraps it in the same ggml_backend_event struct that
+// ggml_backend_event_record/free already understand.  Never called when the gate is off.
+ggml_backend_event_t seam_timing_event_new(ggml_backend_t backend) {
+    cudaEvent_t ev = nullptr;
+    if (cudaEventCreateWithFlags(&ev, cudaEventDefault) != cudaSuccess) return nullptr;
+    return new ggml_backend_event{ggml_backend_get_device(backend), (void*) ev};
+}
+
+void seam_gap_enter(ggml_backend_t backend, int layer, bool decode, double now) {
+    SeamGapState& G = g_seam_gap;
+    if (G.t_prev_exit < 0.0) {
+        // The request's first seam: nothing precedes it but the arm point (the request-start account).
+        if (G.t_arm >= 0.0 && G.pre0_ms < 0.0) G.pre0_ms = (now - G.t_arm) * 1000.0;
+        return;
+    }
+    if (G.pending_e0 == nullptr) { ++G.dropped; G.t_prev_exit = now; return; }
+    ggml_backend_event_t e1 = seam_timing_event_new(backend);
+    if (e1 == nullptr) {
+        ++G.create_fail;
+        ++G.dropped;
+        ggml_backend_event_free(G.pending_e0);
+        G.pending_e0 = nullptr;
+        G.t_prev_exit = now;
+        return;
+    }
+    ggml_backend_event_record(e1, backend);
+    G.pairs.push_back({G.pending_e0, e1, layer, decode, (now - G.t_prev_exit) * 1000.0});
+    G.pending_e0 = nullptr;
+}
+
+void seam_gap_exit(ggml_backend_t backend, double now) {
+    SeamGapState& G = g_seam_gap;
+    if (G.pending_e0 == nullptr) {
+        ggml_backend_event_t e0 = seam_timing_event_new(backend);
+        if (e0 == nullptr) { ++G.create_fail; }
+        else { ggml_backend_event_record(e0, backend); G.pending_e0 = e0; }
+    }
+    G.t_prev_exit = now;
+    G.t_last_exit = now;
+}
+
+void seam_gap_flush() {
+    SeamGapState& G = g_seam_gap;
+    G.flushed = true;
+    double host_sum = 0.0, dev_sum = 0.0, host_min = 0.0, host_max = 0.0, dev_min = 0.0, dev_max = 0.0;
+    int ok = 0, prefill_windows = 0, decode_windows = 0;
+    double decode_host = -1.0, decode_dev = -1.0;
+    std::string per;
+    char buf[160];
+    for (const auto& p : G.pairs) {
+        double dev = -1.0;
+        if (p.e0 != nullptr && p.e1 != nullptr) {
+            cudaError_t q = cudaEventQuery((cudaEvent_t) p.e1->context);
+            if (q == cudaErrorNotReady) q = cudaEventSynchronize((cudaEvent_t) p.e1->context);   // request tail only
+            float ms = -1.0f;
+            if (q == cudaSuccess &&
+                cudaEventElapsedTime(&ms, (cudaEvent_t) p.e0->context, (cudaEvent_t) p.e1->context) == cudaSuccess) {
+                dev = (double) ms;
+            } else {
+                ++G.read_fail;
+            }
+        } else {
+            ++G.read_fail;
+        }
+        if (dev >= 0.0) {
+            ++ok;
+            dev_sum += dev;
+            host_sum += p.host_gap_ms;
+            if (ok == 1) { host_min = host_max = p.host_gap_ms; dev_min = dev_max = dev; }
+            else {
+                if (p.host_gap_ms < host_min) host_min = p.host_gap_ms;
+                if (p.host_gap_ms > host_max) host_max = p.host_gap_ms;
+                if (dev < dev_min) dev_min = dev;
+                if (dev > dev_max) dev_max = dev;
+            }
+            if (p.decode) { ++decode_windows; decode_host = p.host_gap_ms; decode_dev = dev; }
+            else ++prefill_windows;
+        }
+        std::snprintf(buf, sizeof buf, "%d%s:%.2f:%.2f ", p.layer, p.decode ? "d" : "", p.host_gap_ms, dev);
+        per += buf;
+    }
+    const double tail = G.t_last_exit >= 0.0 ? (now_seconds() - G.t_last_exit) * 1000.0 : -1.0;
+    std::fprintf(stderr,
+                 "strata qwen35: seam gap (STRATA_QWEN35_SEAM_GAP=1): windows %d pairs_ok %d create_fail %lld "
+                 "read_fail %lld dropped %lld | host_gap_ms %.2f dev_span_ms %.2f host_only_ms %.2f | "
+                 "per_window host avg %.3f max %.3f min %.3f | dev avg %.3f max %.3f min %.3f | "
+                 "prefill_windows %d decode_windows %d decode host_gap_ms %.3f dev_span_ms %.3f | "
+                 "pre0_ms %.3f tail_ms %.3f\n",
+                 (int) G.pairs.size(), ok, (long long) G.create_fail, (long long) G.read_fail,
+                 (long long) G.dropped, host_sum, dev_sum, host_sum - dev_sum,
+                 ok > 0 ? host_sum / ok : 0.0, host_max, host_min,
+                 ok > 0 ? dev_sum / ok : 0.0, dev_max, dev_min,
+                 prefill_windows, decode_windows, decode_host, decode_dev, G.pre0_ms, tail);
+    std::fprintf(stderr, "strata qwen35: seam gap per-window (enter_layer[d=decode]:host_gap_ms:dev_span_ms): %s\n",
+                 per.c_str());
+    for (auto& p : G.pairs) {
+        if (p.e0 != nullptr) ggml_backend_event_free(p.e0);
+        if (p.e1 != nullptr) ggml_backend_event_free(p.e1);
+    }
+    G.pairs.clear();
+    if (G.pending_e0 != nullptr) { ggml_backend_event_free(G.pending_e0); G.pending_e0 = nullptr; }
+}
+
+// ---- Task 134 (exact STRATA_QWEN35_A_SPLIT=1, default off): the A-window split ---------------------------
+// The runner marks the request start and the end of its batch fill; llama's process_ubatch marks its entry,
+// the end of the graph build, the end of the sched allocation and a graph-reuse (see the patch's
+// llama-context.cpp); the bridge records the first seam callback entry of each round here.  mark(0) starts a
+// new round, so a second, identical-shape prompt pass in the same process gets its own phases.  Unset: no
+// calls, no output, the default path untouched.
+bool a_split_enabled() {
+    static const bool on = [] {
+        const char* v = std::getenv("STRATA_QWEN35_A_SPLIT");
+        return v != nullptr && std::strcmp(v, "1") == 0;
+    }();
+    return on;
+}
+struct ASplitRound { double t0 = -1, t1 = -1, t2 = -1, t3 = -1, t4 = -1, t5 = -1; bool reused = false; };
+struct ASplitState { std::vector<ASplitRound> rounds; bool flushed = false; };
+ASplitState g_a_split;
+
+void a_split_flush() {
+    ASplitState& A = g_a_split;
+    A.flushed = true;
+    std::fprintf(stderr, "strata qwen35: A split (STRATA_QWEN35_A_SPLIT=1): rounds %d\n", (int) A.rounds.size());
+    for (size_t i = 0; i < A.rounds.size(); ++i) {
+        const ASplitRound& r = A.rounds[i];
+        const double fill = (r.t0 >= 0 && r.t1 >= 0) ? (r.t1 - r.t0) * 1e3 : -1.0;
+        const double entry = (r.t1 >= 0 && r.t2 >= 0) ? (r.t2 - r.t1) * 1e3 : -1.0;
+        const double build = (r.t2 >= 0 && r.t3 >= 0) ? (r.t3 - r.t2) * 1e3 : -1.0;
+        const double alloc = (r.t3 >= 0 && r.t4 >= 0) ? (r.t4 - r.t3) * 1e3 : -1.0;
+        const double dispatch = (r.t4 >= 0 && r.t5 >= 0) ? (r.t5 - r.t4) * 1e3 : -1.0;
+        const double a = (r.t0 >= 0 && r.t5 >= 0) ? (r.t5 - r.t0) * 1e3 : -1.0;
+        std::fprintf(stderr, "strata qwen35: A split round %d: fill_ms %.3f entry_ms %.3f build_ms %.3f "
+                             "alloc_ms %.3f dispatch_ms %.3f A_ms %.3f reused %d\n",
+                     (int) i, fill, entry, build, alloc, dispatch, a, r.reused ? 1 : 0);
+    }
+}
+
 bool seam_exec(ggml_backend_t backend, ggml_tensor* node) {
     State& S = *g_state;
     ExpertDispatch& d = S.dispatch;
@@ -519,6 +691,12 @@ bool seam_exec(ggml_backend_t backend, ggml_tensor* node) {
     }
     const int64_t K = S.K;
     const double t0 = now_seconds();
+    // Task 133 (off by default): close the host-gap/device-span window opened at the previous seam exit.
+    if (seam_gap_enabled()) seam_gap_enter(backend, layer, node->ne[1] == 1, t0);
+    // Task 134 (off by default): the first seam callback of the current round closes the A window.
+    if (a_split_enabled() && !g_a_split.rounds.empty() && g_a_split.rounds.back().t5 < 0) {
+        g_a_split.rounds.back().t5 = t0;
+    }
     // The overlap prototype: the decode pre marker already recorded `pre` before the shared expert was
     // submitted.  `join`, recorded now, covers the whole backend-stream prefix (router + shared expert); the
     // work stream waits on it, so the CPU miss window stays free to overlap the shared expert while the hits
@@ -607,6 +785,9 @@ bool seam_exec(ggml_backend_t backend, ggml_tensor* node) {
         // Prompt layer: the shared service's GPU expert pipeline (grouped experts, resident cache slots, the
         // bounded cold ring, the MMQ products).  Its counters carry the evidence.
         const int64_t T = node->ne[1];
+        // Task 127 (diagnostic, default off): hand the prompt path the graph-prefix boundary event so the
+        // optional d2h split can attribute its wait; zero calls when the exact gate is unset.
+        if (qwen_prefill_d2h_split_on()) qwen_prefill_d2h_split_set_pre((void*) (cudaEvent_t) L.pre->context);
         if (!qwen_prefill_experts(d, layer, T, node->src[0]->data, node->src[0]->nb[1], node->src[1]->data,
                                   node->src[1]->nb[1], node->src[2]->data, node->src[2]->nb[1], node->src[2]->nb[2],
                                   node->data, L.work, err)) {
@@ -628,6 +809,8 @@ bool seam_exec(ggml_backend_t backend, ggml_tensor* node) {
         }
     }
     S.seconds_us.fetch_add((uint64_t) ((now_seconds() - t0) * 1e6), std::memory_order_relaxed);
+    // Task 133 (off by default): open the next window's backend-stream event at this seam's exit.
+    if (seam_gap_enabled()) seam_gap_exit(backend, now_seconds());
     return true;
 }
 
@@ -654,6 +837,30 @@ bool seam_callback(ggml_backend_t backend, ggml_tensor* node, bool ask, void*) {
 }
 
 }  // namespace
+
+/// Task 134 (diagnostic, exact STRATA_QWEN35_A_SPLIT=1, default off): phase marks for the A window, called
+/// from the runner (0 = request start, 1 = batch fill done) and from llama's process_ubatch (2 = entry,
+/// 3 = graph built, 4 = sched allocation done, 6 = graph reused); 5 is recorded internally at the first seam
+/// callback of the round.  One no-op call when the gate is off (no CUDA call, no output, no timing change).
+void qwen35_a_split_mark(int phase) {
+    if (!a_split_enabled()) return;
+    ASplitState& A = g_a_split;
+    const double now = now_seconds();
+    switch (phase) {
+        case 0: A.rounds.push_back(ASplitRound{}); A.rounds.back().t0 = now; break;
+        case 1: if (!A.rounds.empty() && A.rounds.back().t1 < 0) A.rounds.back().t1 = now; break;
+        case 2: if (!A.rounds.empty() && A.rounds.back().t2 < 0) A.rounds.back().t2 = now; break;
+        case 3: if (!A.rounds.empty() && A.rounds.back().t3 < 0) A.rounds.back().t3 = now; break;
+        case 4: if (!A.rounds.empty() && A.rounds.back().t4 < 0) A.rounds.back().t4 = now; break;
+        case 5: if (!A.rounds.empty() && A.rounds.back().t5 < 0) A.rounds.back().t5 = now; break;
+        case 6: if (!A.rounds.empty()) {
+                    A.rounds.back().reused = true;
+                    A.rounds.back().t3 = now;
+                    A.rounds.back().t4 = now;
+                } break;
+        default: break;
+    }
+}
 
 bool qwen35_bridge_init(const Qwen35BridgeConfig& cfg, std::string& err) {
     if (g_state != nullptr) { err = "qwen35: the bridge is already initialised"; return false; }
@@ -754,6 +961,10 @@ void qwen35_bridge_shutdown() {
 void qwen35_bridge_stats(Qwen35BridgeStats& out) {
     out = Qwen35BridgeStats{};
     if (g_state == nullptr) return;
+    // Task 133 (off by default): the request's timing windows are closed by now; flush the seam-gap account.
+    if (seam_gap_enabled() && !g_seam_gap.flushed) seam_gap_flush();
+    // Task 134 (off by default): flush the A-window account at the same request-tail boundary.
+    if (a_split_enabled() && !g_a_split.flushed) a_split_flush();
     State& S = *g_state;
     out.decode_layers = S.decode_layers;
     out.prefill_layers = S.prefill_layers;
@@ -831,6 +1042,8 @@ void qwen35_install_decode_seam(ggml_backend_sched* sched) {
 
 void qwen35_arm_decode_seam(bool on) {
     if (g_state != nullptr) g_state->seam_armed.store(on, std::memory_order_relaxed);
+    // Task 133 (off by default): the runner arms at the request's real start; latch it for the pre0 account.
+    if (on && seam_gap_enabled()) g_seam_gap.t_arm = now_seconds();
 }
 
 bool qwen35_bridge_finish_prompt() {

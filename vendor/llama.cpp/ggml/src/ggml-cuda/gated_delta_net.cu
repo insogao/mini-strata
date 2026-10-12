@@ -1,6 +1,220 @@
 #include "gated_delta_net.cuh"
 #include "ggml-cuda/common.cuh"
 
+#include <cstdio>
+#include <cstdlib>
+#include <cstring>
+#include <vector>
+
+// ---- GDN eager stream-elapsed events (task 68 diagnostic, default off; exact STRATA_QWEN35_GDN_EVENTS=1) ----
+// One begin/end event pair per eligible GDN eager call (armed, T > 1, stream not capturing), recorded on the
+// op's real ctx.stream().  The pair measures the stream elapsed between the two records: it can include gaps
+// and contention on that stream, it is NOT SM/kernel-busy time and NOT the critical path.  Calls made while a
+// CUDA graph is captured are refused (counted, never recorded); graph replays do not run this op at all, so a
+// report covers the armed eager calls only (capture/replay stay unmeasured = unknown).  Nothing here runs
+// while the env is unset: no event, no record, no sync and no output.
+
+namespace {
+
+constexpr int kGdnEventsMaxPairs = 512;
+
+struct gdn_event_pair {
+    cudaEvent_t beg = nullptr;
+    cudaEvent_t end = nullptr;
+    cudaStream_t stream = nullptr;
+    long long T = 0;
+    int state = 1;  // 1 confirmed, 0 not ready at the first query, -1 unconfirmed at the flush
+};
+
+gdn_event_pair g_gdn_pairs[kGdnEventsMaxPairs];
+int g_gdn_pairs_n = 0;
+int g_gdn_env = -1;  // -1 unchecked, 0 off, 1 on
+int g_gdn_armed = 0;
+int g_gdn_flushed = 0;
+int g_gdn_disabled = 0;  // a create/record error stopped further collection
+int g_gdn_truncated = 0;
+long long g_gdn_eager = 0;
+long long g_gdn_capture_skipped = 0;
+long long g_gdn_capture_query_failed = 0;
+long long g_gdn_t1_skipped = 0;
+long long g_gdn_create_failed = 0;
+long long g_gdn_record_failed = 0;
+long long g_gdn_arm_calls = 0;
+long long g_gdn_reset_calls = 0;
+long long g_gdn_flush_calls = 0;
+
+bool gdn_events_on() {
+    if (g_gdn_env < 0) {
+        const char * v = std::getenv("STRATA_QWEN35_GDN_EVENTS");
+        g_gdn_env = (v != nullptr && std::strcmp(v, "1") == 0) ? 1 : 0;
+    }
+    return g_gdn_env == 1;
+}
+
+void gdn_events_drop_pairs() {
+    for (int i = 0; i < g_gdn_pairs_n; ++i) {
+        if (g_gdn_pairs[i].beg != nullptr) cudaEventDestroy(g_gdn_pairs[i].beg);
+        if (g_gdn_pairs[i].end != nullptr) cudaEventDestroy(g_gdn_pairs[i].end);
+        g_gdn_pairs[i] = gdn_event_pair{};
+    }
+    g_gdn_pairs_n = 0;
+}
+
+// Returns the pair slot to close, or -1 when nothing is recorded.
+int gdn_events_begin(cudaStream_t stream, long long T) {
+    if (!g_gdn_armed || g_gdn_disabled) return -1;
+    if (T <= 1) { ++g_gdn_t1_skipped; return -1; }
+    if (g_gdn_pairs_n >= kGdnEventsMaxPairs) { g_gdn_truncated = 1; return -1; }
+    cudaStreamCaptureStatus cs = cudaStreamCaptureStatusNone;
+    if (cudaStreamIsCapturing(stream, &cs) != cudaSuccess) { ++g_gdn_capture_query_failed; return -1; }
+    if (cs != cudaStreamCaptureStatusNone) { ++g_gdn_capture_skipped; return -1; }
+    cudaEvent_t beg = nullptr;
+    cudaEvent_t end = nullptr;
+    if (cudaEventCreateWithFlags(&beg, cudaEventDefault) != cudaSuccess ||
+        cudaEventCreateWithFlags(&end, cudaEventDefault) != cudaSuccess) {
+        if (beg != nullptr) cudaEventDestroy(beg);
+        if (end != nullptr) cudaEventDestroy(end);
+        ++g_gdn_create_failed;
+        g_gdn_disabled = 1;
+        return -1;
+    }
+    if (cudaEventRecord(beg, stream) != cudaSuccess) {
+        cudaEventDestroy(beg);
+        cudaEventDestroy(end);
+        ++g_gdn_record_failed;
+        g_gdn_disabled = 1;
+        return -1;
+    }
+    const int slot = g_gdn_pairs_n++;
+    g_gdn_pairs[slot].beg = beg;
+    g_gdn_pairs[slot].end = end;
+    g_gdn_pairs[slot].stream = stream;
+    g_gdn_pairs[slot].T = T;
+    return slot;
+}
+
+void gdn_events_end(int slot) {
+    if (slot < 0) return;
+    gdn_event_pair & p = g_gdn_pairs[slot];
+    if (cudaEventRecord(p.end, p.stream) != cudaSuccess) {
+        ++g_gdn_record_failed;
+        g_gdn_disabled = 1;
+        p.state = -1;
+        return;
+    }
+    ++g_gdn_eager;
+}
+
+}  // namespace
+
+extern "C" void strata_gdn_events_reset(void) {
+    if (!gdn_events_on()) return;
+    ++g_gdn_reset_calls;
+    gdn_events_drop_pairs();
+    g_gdn_armed = 0;
+    g_gdn_flushed = 0;
+    g_gdn_disabled = 0;
+    g_gdn_truncated = 0;
+    g_gdn_eager = 0;
+    g_gdn_capture_skipped = 0;
+    g_gdn_capture_query_failed = 0;
+    g_gdn_t1_skipped = 0;
+    g_gdn_create_failed = 0;
+    g_gdn_record_failed = 0;
+}
+
+extern "C" void strata_gdn_events_arm(void) {
+    if (!gdn_events_on()) return;
+    ++g_gdn_arm_calls;
+    g_gdn_armed = 1;
+}
+
+extern "C" void strata_gdn_events_flush(void) {
+    if (!gdn_events_on()) return;
+    ++g_gdn_flush_calls;
+    if (g_gdn_flushed) return;
+    g_gdn_flushed = 1;
+    g_gdn_armed = 0;
+
+    // Pass 1: query every end event once; collect the (deduplicated) streams that still have work pending.
+    std::vector<cudaStream_t> pending;
+    for (int i = 0; i < g_gdn_pairs_n; ++i) {
+        gdn_event_pair & p = g_gdn_pairs[i];
+        if (p.state == -1) continue;
+        const cudaError_t q = cudaEventQuery(p.end);
+        if (q == cudaSuccess) {
+            p.state = 1;
+        } else if (q == cudaErrorNotReady) {
+            p.state = 0;
+            bool seen = false;
+            for (cudaStream_t s : pending) if (s == p.stream) { seen = true; break; }
+            if (!seen) pending.push_back(p.stream);
+        } else {
+            p.state = -1;
+        }
+    }
+    // One synchronization per pending (real) stream, at the end of the request only.
+    int sync_failed = 0;
+    for (cudaStream_t s : pending) {
+        if (cudaStreamSynchronize(s) != cudaSuccess) ++sync_failed;
+    }
+    // Pass 2: after the syncs, confirm again; unconfirmed pairs are kept (never destroyed while unclear).
+    for (int i = 0; i < g_gdn_pairs_n; ++i) {
+        gdn_event_pair & p = g_gdn_pairs[i];
+        if (p.state != 0) continue;
+        p.state = (cudaEventQuery(p.end) == cudaSuccess) ? 1 : -1;
+    }
+
+    long long measured = 0, elapsed_failed = 0, unknown = 0, kept = 0;
+    double sum_ms = 0.0, max_ms = 0.0;
+    long long t_vals[8] = {0};
+    long long t_counts[8] = {0};
+    int n_t = 0;
+    for (int i = 0; i < g_gdn_pairs_n; ++i) {
+        gdn_event_pair & p = g_gdn_pairs[i];
+        if (p.state == 1) {
+            float ms = 0.0f;
+            if (cudaEventElapsedTime(&ms, p.beg, p.end) == cudaSuccess) {
+                ++measured;
+                sum_ms += (double) ms;
+                if ((double) ms > max_ms) max_ms = (double) ms;
+                int ti = -1;
+                for (int k = 0; k < n_t; ++k) if (t_vals[k] == p.T) { ti = k; break; }
+                if (ti < 0 && n_t < 8) { ti = n_t++; t_vals[ti] = p.T; }
+                if (ti >= 0) ++t_counts[ti];
+                cudaEventDestroy(p.beg);
+                cudaEventDestroy(p.end);
+                g_gdn_pairs[i] = gdn_event_pair{};
+            } else {
+                ++elapsed_failed;
+                kept += 2;
+            }
+        } else {
+            if (p.state == -1) ++unknown; else ++kept;  // (state 0 cannot survive pass 2)
+            kept += 2;
+        }
+    }
+    char per_t[128];
+    int at = 0;
+    per_t[0] = '\0';
+    for (int k = 0; k < n_t; ++k) {
+        at += std::snprintf(per_t + at, sizeof(per_t) - (size_t) at, "%s%lld:%lld", k ? "," : "",
+                            t_vals[k], t_counts[k]);
+    }
+    std::fprintf(stderr,
+                 "strata qwen35: gdn eager events: eager_calls %lld pairs %d measured %lld sum_ms %.6f "
+                 "max_ms %.6f per_T %s capture_skipped %lld capture_query_failed %lld t1_skipped %lld "
+                 "truncated %d disabled %d create_failed %lld record_failed %lld elapsed_failed %lld "
+                 "unknown %lld kept_events %lld pending_sync_streams %zu sync_failed %d arm %lld reset %lld "
+                 "flush %lld coverage \"armed eager only; capture/replay unmeasured=unknown\"\n",
+                 g_gdn_eager, g_gdn_pairs_n, measured, sum_ms, max_ms, per_t, g_gdn_capture_skipped,
+                 g_gdn_capture_query_failed, g_gdn_t1_skipped, g_gdn_truncated, g_gdn_disabled,
+                 g_gdn_create_failed, g_gdn_record_failed, elapsed_failed, unknown, kept, pending.size(),
+                 sync_failed, g_gdn_arm_calls, g_gdn_reset_calls, g_gdn_flush_calls);
+    g_gdn_pairs_n = 0;  // confirmed pairs are destroyed; unconfirmed events are intentionally kept alive
+}
+
+
 template <int S_v, bool KDA, bool keep_rs_t>
 __global__ void __launch_bounds__((ggml_cuda_get_physical_warp_size() < S_v ? ggml_cuda_get_physical_warp_size() : S_v) * 4, 2)
 gated_delta_net_cuda(const float * q,
@@ -281,6 +495,8 @@ static void ggml_cuda_op_gated_delta_net_impl(
     const float scale = 1.0f / sqrtf((float) S_v);
 
     cudaStream_t stream = ctx.stream();
+    // Task 68 diagnostic (default off): one begin event before the launches below, closed right after them.
+    const int gdn_events_slot = gdn_events_begin(stream, n_tokens);
 
     // K (snapshot slot count) is an op param; state holds s0 only [S_v, S_v, H, n_seqs].
     const int K = ggml_get_op_params_i32(dst, 0);
@@ -315,6 +531,7 @@ static void ggml_cuda_op_gated_delta_net_impl(
                 sb1, sb2, sb3, neqk1, rq3, scale, state_slot_stride, K, stream);
         }
     }
+    gdn_events_end(gdn_events_slot);
 }
 
 void ggml_cuda_op_gated_delta_net(ggml_backend_cuda_context & ctx, ggml_tensor * dst) {

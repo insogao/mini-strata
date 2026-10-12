@@ -2,6 +2,9 @@
 
 #ifdef LLAMA_STRATA_QWEN35
 #include "strata/core/qwen35_bridge.hpp"
+// Task 134 diagnostic, default off (defined in vendor/Strata/src/core/qwen35_bridge.cpp): no-op unless
+// STRATA_QWEN35_A_SPLIT=1.
+namespace strata::core { void qwen35_a_split_mark(int phase); }
 #endif
 
 #include "ggml.h"
@@ -1421,6 +1424,10 @@ llm_graph_result * llama_context::process_ubatch(const llama_ubatch & ubatch, ll
         return nullptr;
     }
 
+#ifdef LLAMA_STRATA_QWEN35
+    strata::core::qwen35_a_split_mark(2);   // task 134 diagnostic (default off)
+#endif
+
     auto * res = get_gf_res_prev();
     auto * gf  = res->get_gf();
 
@@ -1438,6 +1445,10 @@ llm_graph_result * llama_context::process_ubatch(const llama_ubatch & ubatch, ll
             ggml_backend_sched_synchronize(sched.get());
         }
 
+#ifdef LLAMA_STRATA_QWEN35
+        strata::core::qwen35_a_split_mark(6);   // task 134: graph reused (build/alloc skipped)
+#endif
+
         n_reused++;
     } else {
         gf_res_prev_active = nullptr;
@@ -1449,6 +1460,10 @@ llm_graph_result * llama_context::process_ubatch(const llama_ubatch & ubatch, ll
         //const auto t_start_us = ggml_time_us();
 
         gf = model.build_graph(gparams);
+
+#ifdef LLAMA_STRATA_QWEN35
+        strata::core::qwen35_a_split_mark(3);   // task 134: graph built
+#endif
 
         //LLAMA_LOG_INFO("graph build time: %.3f ms\n", (ggml_time_us() - t_start_us)/1000.0);
 
@@ -1463,6 +1478,10 @@ llm_graph_result * llama_context::process_ubatch(const llama_ubatch & ubatch, ll
             ret = GGML_STATUS_ALLOC_FAILED;
             return nullptr;
         }
+
+#ifdef LLAMA_STRATA_QWEN35
+        strata::core::qwen35_a_split_mark(4);   // task 134: sched allocation done
+#endif
 
         gf_res_prev_active = res;
     }

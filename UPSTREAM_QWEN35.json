@@ -14,6 +14,6 @@
     "size": 13676723168,
     "sha256": "66a3ca888ce13482b40c333db2432c0ebde3a7b13754fc29f0c6f5e89703ec66"
   },
-  "published_snapshot": "65, business acceptance 67; excludes GDN timing task68",
-  "reference_executable_sha256": "4dcfc1773411d33bdd446241218c725d37499dc3cc2cc6393eb4b78e9b622587"
+  "published_snapshot": "2026-10-12 stage: reviewed through tasks 148/149/150 (delivery 0e00af8a + ubatch4096 + cache3200); han official 1000+ reached, service form 1362-1430; excludes in-flight task 151 norm.cu edit",
+  "reference_executable_sha256": "0e00af8a11274c62789f47c1b5d21aed811f33adb9b79608ffb7df5525a906b6"
 }

@@ -31,6 +31,10 @@
 #include <string>
 #include <vector>
 
+// Task 134 diagnostic (defined in strata/core/qwen35_bridge.cpp; default off): A-window phase marks.  The
+// calls below are no-ops unless STRATA_QWEN35_A_SPLIT=1 (no output, no timing change).
+namespace strata::core { void qwen35_a_split_mark(int phase); }
+
 namespace strata::program {
 namespace {
 
@@ -159,6 +163,30 @@ void graph_stats_record(const char* at, long long output_index, const llama_cont
                  "warmup_reset=%llu n_reused=%lld n_reused_delta=%lld\n",
                  at, output_index, uid_reused, warmup_complete, warmup_reset, n_reused, n_reused_delta);
 }
+
+// Task 68 GDN eager event diagnostic (default off): collected inside the CUDA backend
+// (ggml/src/ggml-cuda/gated_delta_net.cu), whose public export is reset/arm at the real prompt start plus
+// exactly one final flush.  This file only builds in the CUDA target (it calls cudaMalloc/cudaMemGetInfo
+// directly), so the declarations resolve against the backend.  Off: no call, no event, no output.
+extern "C" void strata_gdn_events_reset(void);
+extern "C" void strata_gdn_events_arm(void);
+extern "C" void strata_gdn_events_flush(void);
+
+bool gdn_events_enabled() {
+    static const bool on = [] {
+        const char* v = std::getenv("STRATA_QWEN35_GDN_EVENTS");
+        return v != nullptr && std::strcmp(v, "1") == 0;
+    }();
+    return on;
+}
+
+// Runs the (idempotent) GDN flush on every return path of qwen35_run, so a failed run still reports its
+// partial counts.  The run declares it after the llama context, so it fires before context destruction.
+struct GdnEventsFlushGuard {
+    bool on;
+    explicit GdnEventsFlushGuard(bool on_) : on(on_) {}
+    ~GdnEventsFlushGuard() { if (on) strata_gdn_events_flush(); }
+};
 
 }  // namespace
 
@@ -358,7 +386,181 @@ int qwen35_run(const Qwen35RunOptions& o) {
     std::fprintf(stdout, "]}\n");
     std::printf("{\"event\":\"prefill_start\",\"since_process_start_seconds\":%.9g}\n", elapsed(process_start));
     std::fflush(stdout);
+    // Task 68: the real prompt boundary arms the GDN eager events (load, reserve and context warmup happen
+    // before this point; capture calls inside the backend are refused).  The guard flushes on every return.
+    const bool gdn_events_on = gdn_events_enabled();
+    if (gdn_events_on) { strata_gdn_events_reset(); strata_gdn_events_arm(); }
+    GdnEventsFlushGuard gdn_flush_guard(gdn_events_on);
+    // Task 135 diagnostic (STRATA_QWEN35_WARM_ROUND=1 only, default off): one DISCARD prompt pass in this
+    // process (same prompt; memory cleared afterwards), so the measured pass below runs with the process's
+    // kernels resident and its expert pages already touched.  The discard pass sits outside every measured
+    // window (it uses its own clocks and never feeds prefill_process_seconds); its wall/strata/byte line is
+    // printed separately.  Unset: nothing runs, no output, the default path is unchanged.
+    bool warm_discard_ok = false;
+    double warm_discard_wall_s = -1.0;
+    double warm_discard_process_s = -1.0;
+    double warm_discard_finish_s = -1.0;
+    core::Qwen35BridgeStats warm_after{};
+    llama_perf_context_data perf_warm{};
+    {
+        const char* warm_env = std::getenv("STRATA_QWEN35_WARM_ROUND");
+        if (warm_env != nullptr && std::strcmp(warm_env, "1") == 0) {
+            const auto wd_begin = Clock::now();
+            fill_batch(batch.get(), prompt.data(), (int) prompt.size(), 0);
+            const auto wd_process_begin = Clock::now();
+            const int wd_rc = llama_process(ctx.get(), LLAMA_PROCESS_TYPE_DECODE, batch.get());
+            warm_discard_process_s = elapsed(wd_process_begin);
+            const auto wd_finish_begin = Clock::now();
+            const bool wd_loan = core::qwen35_bridge_finish_prompt();
+            warm_discard_finish_s = elapsed(wd_finish_begin);
+            if (llama_memory_t mem = llama_get_memory(ctx.get())) {
+                llama_memory_clear(mem, true);   // the measured pass is a fresh request again
+            }
+            warm_discard_wall_s = elapsed(wd_begin);
+            if (wd_rc != 0 || !wd_loan) {
+                std::fprintf(stderr, "strata generate: warm round discard failed\n");
+                core::qwen35_bridge_shutdown();
+                return 1;
+            }
+            core::qwen35_bridge_stats(warm_after);   // round-1 cumulative snapshot
+            perf_warm = llama_perf_context(ctx.get());
+            warm_discard_ok = true;
+        }
+    }
+    // Task 137 diagnostic (STRATA_QWEN35_MULTI_ROUND=N >= 2 + STRATA_QWEN35_MULTI_ROUND_FILE, default off):
+    // alternate two different prompts (A = --tokens-file, B = the env file) in this one process for N rounds
+    // (A,B,A,...); the memory is cleared between rounds; rounds 1..N-1 run here with their own clocks, an
+    // answer sample and per-round byte deltas, and the existing measured flow below runs round N on the
+    // round-N sample.  Unset: nothing runs, no output, the default path is unchanged.
+    bool multi_round_ok = false;
+    int multi_rounds = 0;
+    core::Qwen35BridgeStats multi_after{};
+    llama_perf_context_data perf_multi{};
+    {
+        const char* mr_env = std::getenv("STRATA_QWEN35_MULTI_ROUND");
+        if (mr_env != nullptr) {
+            const int rounds = std::atoi(mr_env);
+            const char* mr_file = std::getenv("STRATA_QWEN35_MULTI_ROUND_FILE");
+            std::vector<llama_token> prompt_b;
+            std::string mr_err;
+            if (rounds < 2 || rounds > 32 || mr_file == nullptr || mr_file[0] == '\0') {
+                std::fprintf(stderr, "strata generate: invalid multi-round gate (STRATA_QWEN35_MULTI_ROUND=%s, "
+                                     "file %s)\n", mr_env, mr_file != nullptr ? mr_file : "unset");
+                core::qwen35_bridge_shutdown();
+                return 1;
+            }
+            {
+                std::ifstream mr_input(mr_file);
+                if (!mr_input) mr_err = "cannot open the second prompt file";
+                else {
+                    std::string mr_text((std::istreambuf_iterator<char>(mr_input)),
+                                        std::istreambuf_iterator<char>());
+                    if (mr_input.bad()) mr_err = "cannot read the second prompt file";
+                    else if (mr_text.find('\0') != std::string::npos) mr_err = "the second prompt file holds a NUL byte";
+                    else {
+                        const char* p = mr_text.c_str();
+                        while (*p != '\0' && mr_err.empty()) {
+                            if (*p == '-' || (*p >= '0' && *p <= '9')) {
+                                char* mr_end = nullptr;
+                                const long long v = std::strtoll(p, &mr_end, 10);
+                                if (mr_end == p) mr_err = "malformed number in the second prompt file";
+                                else { prompt_b.push_back((llama_token) v); p = mr_end; }
+                            } else if (*p == ',' || *p == ' ' || *p == '\n' || *p == '\r' || *p == '\t') {
+                                ++p;
+                            } else {
+                                mr_err = "unexpected character in the second prompt file";
+                            }
+                        }
+                    }
+                }
+            }
+            if (mr_err.empty() && prompt_b.empty()) mr_err = "the second prompt file is empty";
+            if (mr_err.empty()) {
+                for (llama_token t : prompt_b) {
+                    if (t < 0 || t >= llama_vocab_n_tokens(vocab)) { mr_err = "second prompt token out of vocab"; break; }
+                }
+            }
+            if (mr_err.empty() && ((int64_t) prompt.size() > (int64_t) cp.n_batch ||
+                                   (int64_t) prompt_b.size() > (int64_t) cp.n_batch)) {
+                mr_err = "a prompt does not fit one batch";
+            }
+            if (mr_err.empty() && (int64_t) prompt_b.size() + o.max_new > o.max_context) {
+                mr_err = "the second prompt does not fit --max-context";
+            }
+            if (!mr_err.empty()) {
+                std::fprintf(stderr, "strata generate: multi-round setup failed: %s\n", mr_err.c_str());
+                core::qwen35_bridge_shutdown();
+                return 1;
+            }
+            std::fprintf(stderr, "strata qwen35: multi round plan (STRATA_QWEN35_MULTI_ROUND=%d): rounds %d, "
+                                 "sequence", rounds, rounds);
+            for (int k = 1; k <= rounds; ++k) std::fprintf(stderr, " %c", (k % 2) ? 'A' : 'B');
+            std::fprintf(stderr, " (round %d = the measured flow below)\n", rounds);
+            for (int k = 1; k <= rounds - 1; ++k) {
+                const std::vector<llama_token>& src = (k % 2) ? prompt : prompt_b;
+                core::Qwen35BridgeStats before;
+                core::qwen35_bridge_stats(before);
+                const auto mr_begin = Clock::now();
+                fill_batch(batch.get(), src.data(), (int) src.size(), 0);
+                const auto mr_process_begin = Clock::now();
+                const int mr_rc = llama_process(ctx.get(), LLAMA_PROCESS_TYPE_DECODE, batch.get());
+                const double mr_process_s = elapsed(mr_process_begin);
+                const auto mr_finish_begin = Clock::now();
+                const bool mr_loan = core::qwen35_bridge_finish_prompt();
+                const double mr_finish_s = elapsed(mr_finish_begin);
+                int mr_answer = -1;
+                std::string mr_hex = "null";
+                if (const float* mr_logits = llama_get_logits_ith(ctx.get(), -1); mr_logits != nullptr) {
+                    const llama_token mr_token = llama_sampler_sample(sampler.get(), ctx.get(), -1);
+                    mr_answer = (int) mr_token;
+                    char mr_piece[256];
+                    const int mr_size = llama_token_to_piece(vocab, mr_token, mr_piece, sizeof(mr_piece), 0, true);
+                    mr_hex.clear();
+                    for (int j = 0; j < (mr_size > 0 ? mr_size : 0); ++j) {
+                        char byte[3];
+                        std::snprintf(byte, sizeof(byte), "%02x", (unsigned char) mr_piece[j]);
+                        mr_hex += byte;
+                    }
+                }
+                const double mr_prefill_s = elapsed(mr_begin);
+                if (llama_memory_t mr_mem = llama_get_memory(ctx.get())) {
+                    llama_memory_clear(mr_mem, true);   // every round is a fresh request again
+                }
+                if (mr_rc != 0 || !mr_loan) {
+                    std::fprintf(stderr, "strata generate: multi round %d failed\n", k);
+                    core::qwen35_bridge_shutdown();
+                    return 1;
+                }
+                core::Qwen35BridgeStats after;
+                core::qwen35_bridge_stats(after);
+                std::fprintf(stderr,
+                             "strata qwen35: multi round %d/%d (STRATA_QWEN35_MULTI_ROUND=%d): sample %c "
+                             "tokens %zu prefill_s %.7f process_s %.7f finish_s %.7f tok_s %.3f strata_s %.5f "
+                             "layers %llu entries %llu stream_mib %.2f resident %lld streamed %lld products %lld "
+                             "loan %lld/%lld owned_mib %.2f answer_id %d answer_hex %s\n",
+                             k, rounds, rounds, (k % 2) ? 'A' : 'B', src.size(), mr_prefill_s, mr_process_s,
+                             mr_finish_s, mr_prefill_s > 0 ? (double) src.size() / mr_prefill_s : 0.0,
+                             after.expert_seconds - before.expert_seconds,
+                             (unsigned long long) (after.prefill_layers - before.prefill_layers),
+                             (unsigned long long) (after.prefill_entries - before.prefill_entries),
+                             (double) (after.prefill_stream_bytes - before.prefill_stream_bytes) / 1048576.0,
+                             (long long) (after.prefill_resident - before.prefill_resident),
+                             (long long) (after.prefill_streamed - before.prefill_streamed),
+                             (long long) (after.prefill_product_calls - before.prefill_product_calls),
+                             (long long) after.prefill_loan_slots, (long long) after.prefill_loan_restored,
+                             (double) after.prefill_owned_bytes / 1048576.0, mr_answer, mr_hex.c_str());
+            }
+            if (rounds % 2 == 0) {
+                prompt = prompt_b;   // the measured flow below runs round `rounds` on its sample
+            }
+            core::qwen35_bridge_stats(multi_after);
+            perf_multi = llama_perf_context(ctx.get());
+            multi_round_ok = true;
+            multi_rounds = rounds;
+        }
+    }
     const auto prefill_begin = Clock::now();
+    core::qwen35_a_split_mark(0);   // task 134 diagnostic (no-op unless the gate is on)
     // Additive prompt-phase split: prefill_process_seconds is the sum of the llama_process spans (the
     // submit calls below) and prefill_finish_seconds the finish_prompt span; the existing prefill_seconds
     // stays the composite prompt wall (process + finish + bookkeeping), do not add the parts on top of it.
@@ -367,6 +569,7 @@ int qwen35_run(const Qwen35RunOptions& o) {
     int rc = 0;
     if (prompt.size() <= cp.n_batch) {
         fill_batch(batch.get(), prompt.data(), (int) prompt.size(), 0);
+        core::qwen35_a_split_mark(1);   // task 134 diagnostic (no-op unless the gate is on)
         const auto process_begin = Clock::now();
         const int process_rc = llama_process(ctx.get(), LLAMA_PROCESS_TYPE_DECODE, batch.get());
         prefill_process_seconds += elapsed(process_begin);
@@ -605,9 +808,103 @@ int qwen35_run(const Qwen35RunOptions& o) {
         decode_seconds = elapsed(decode_begin);
         perf_last = llama_perf_context(ctx.get());
     }
+    // Task 134 diagnostic (STRATA_QWEN35_A_SPLIT=1 only, default off): a second, identical-shape prompt pass
+    // in the SAME process; the memory is cleared first so it is a fresh request.  It sits outside every
+    // measured window (the answer is already sampled; prefill/decode timings are already frozen) and only
+    // feeds the A-split marks.  Skipped when the context cannot hold the prompt twice.
+    {
+        const char* a_env = std::getenv("STRATA_QWEN35_A_SPLIT");
+        if (a_env != nullptr && std::strcmp(a_env, "1") == 0 &&
+            prompt.size() * 2 <= (size_t) o.max_context) {
+            if (llama_memory_t mem = llama_get_memory(ctx.get())) {
+                llama_memory_clear(mem, true);
+            }
+            core::qwen35_a_split_mark(0);   // round 2 begin
+            fill_batch(batch.get(), prompt.data(), (int) prompt.size(), 0);
+            core::qwen35_a_split_mark(1);   // round 2 fill done
+            const int process_rc2 = llama_process(ctx.get(), LLAMA_PROCESS_TYPE_DECODE, batch.get());
+            if (process_rc2 != 0) std::fprintf(stderr, "strata generate: the a-split second round failed\n");
+        }
+    }
     vram.sample();
     core::Qwen35BridgeStats st;
     core::qwen35_bridge_stats(st);
+    if (warm_discard_ok) {
+        // Task 135: the bridge counters read here are process-cumulative, so the measured round is the
+        // cumulative value minus the post-discard snapshot.  Only the cumulative counters are corrected;
+        // per-epoch fields (resident/streamed/products/stream bytes/loan) are already the measured
+        // round's own values.
+        st.jobs -= warm_after.jobs;
+        st.expert_seconds -= warm_after.expert_seconds;
+        st.decode_layers -= warm_after.decode_layers;
+        st.decode_hits -= warm_after.decode_hits;
+        st.decode_misses -= warm_after.decode_misses;
+        st.prefill_layers -= warm_after.prefill_layers;
+        st.prefill_entries -= warm_after.prefill_entries;
+        st.prefill_layers_gpu -= warm_after.prefill_layers_gpu;
+        const double warm_discard_tps =
+            warm_discard_wall_s > 0 ? (double) prompt.size() / warm_discard_wall_s : 0.0;
+        std::fprintf(stderr,
+                     "strata qwen35: warm round discard (STRATA_QWEN35_WARM_ROUND=1): prefill_s %.7f "
+                     "process_s %.7f finish_s %.7f tok_s %.3f strata_s %.5f stream_mib %.2f resident %lld "
+                     "streamed %lld products %lld loan %lld/%lld refill_ms %.1f\n",
+                     warm_discard_wall_s, warm_discard_process_s, warm_discard_finish_s, warm_discard_tps,
+                     warm_after.expert_seconds, (double) warm_after.prefill_stream_bytes / 1048576.0,
+                     (long long) warm_after.prefill_resident, (long long) warm_after.prefill_streamed,
+                     (long long) warm_after.prefill_product_calls,
+                     (long long) warm_after.prefill_loan_slots, (long long) warm_after.prefill_loan_restored,
+                     warm_after.prefill_loan_refill_ms);
+        const double warm_measured_tps =
+            prefill_seconds > 0 ? (double) prompt.size() / prefill_seconds : 0.0;
+        std::fprintf(stderr,
+                     "strata qwen35: warm round measured (STRATA_QWEN35_WARM_ROUND=1): prefill_s %.7f "
+                     "process_s %.7f finish_s %.7f tok_s %.3f strata_s %.5f stream_mib %.2f resident %lld "
+                     "streamed %lld products %lld loan %lld/%lld refill_ms %.1f\n",
+                     prefill_seconds, prefill_process_seconds, prefill_finish_seconds, warm_measured_tps,
+                     st.expert_seconds, (double) st.prefill_stream_bytes / 1048576.0,
+                     (long long) st.prefill_resident, (long long) st.prefill_streamed,
+                     (long long) st.prefill_product_calls,
+                     (long long) st.prefill_loan_slots, (long long) st.prefill_loan_restored,
+                     st.prefill_loan_refill_ms);
+    }
+    if (multi_round_ok) {
+        // Task 137: the measured round (round N) is the cumulative bridge counters minus the post-warm
+        // snapshot, including the four native_stats byte fields and the hit/overlap counters (they are
+        // process-cumulative - established by the 135/136 adjudications).  Per-epoch fields (loan,
+        // workspace, ring, cache) are already round N's own values.
+        st.jobs -= multi_after.jobs;
+        st.expert_seconds -= multi_after.expert_seconds;
+        st.decode_layers -= multi_after.decode_layers;
+        st.decode_hits -= multi_after.decode_hits;
+        st.decode_misses -= multi_after.decode_misses;
+        st.prefill_layers -= multi_after.prefill_layers;
+        st.prefill_entries -= multi_after.prefill_entries;
+        st.prefill_layers_gpu -= multi_after.prefill_layers_gpu;
+        st.prefill_resident -= multi_after.prefill_resident;
+        st.prefill_streamed -= multi_after.prefill_streamed;
+        st.prefill_product_calls -= multi_after.prefill_product_calls;
+        st.prefill_stream_bytes -= multi_after.prefill_stream_bytes;
+        st.hit_overlap -= multi_after.hit_overlap;
+        st.hit_late -= multi_after.hit_late;
+        st.hit_inflight -= multi_after.hit_inflight;
+        st.all_hit -= multi_after.all_hit;
+        st.ms_ids -= multi_after.ms_ids;
+        st.ms_launch -= multi_after.ms_launch;
+        st.ms_misses -= multi_after.ms_misses;
+        st.ms_combine -= multi_after.ms_combine;
+        st.ms_queue -= multi_after.ms_queue;
+        std::fprintf(stderr,
+                     "strata qwen35: multi round measured (STRATA_QWEN35_MULTI_ROUND=%d): prefill_s %.7f "
+                     "process_s %.7f finish_s %.7f tok_s %.3f strata_s %.5f stream_mib %.2f resident %lld "
+                     "streamed %lld products %lld loan %lld/%lld owned_mib %.2f\n",
+                     multi_rounds, prefill_seconds, prefill_process_seconds, prefill_finish_seconds,
+                     prefill_seconds > 0 ? (double) prompt.size() / prefill_seconds : 0.0,
+                     st.expert_seconds, (double) st.prefill_stream_bytes / 1048576.0,
+                     (long long) st.prefill_resident, (long long) st.prefill_streamed,
+                     (long long) st.prefill_product_calls,
+                     (long long) st.prefill_loan_slots, (long long) st.prefill_loan_restored,
+                     (double) st.prefill_owned_bytes / 1048576.0);
+    }
     const double prefill_tps = prefill_seconds > 0 ? (double) prompt.size() / prefill_seconds : 0.0;
     const double decode_eps = decode_seconds > 0 ? (double) decode_evaluations / decode_seconds : 0.0;
     // Additive rate: completed eval spans per decode_eval_seconds (submission-to-sync wall), 0 when there
@@ -632,6 +929,18 @@ int qwen35_run(const Qwen35RunOptions& o) {
         engine_n_eval_last = (long long) perf_last.n_eval;
         engine_n_eval_delta = (long long) perf_last.n_eval - (long long) perf_first.n_eval;
         engine_n_p_eval_first = (long long) perf_first.n_p_eval;
+        if (warm_discard_ok) {
+            // Task 135: perf_first is a cumulative read taken after the measured round, so subtract the
+            // post-discard snapshot to report the measured round's own prompt eval.
+            engine_t_p_eval_ms_first -= perf_warm.t_p_eval_ms;
+            engine_n_p_eval_first -= (long long) perf_warm.n_p_eval;
+        }
+        if (multi_round_ok) {
+            // Task 137: same correction for the multi-round warm rounds (each round's get_logits flushed its
+            // own perf accounting, so the snapshot holds rounds 1..N-1 exactly).
+            engine_t_p_eval_ms_first -= perf_multi.t_p_eval_ms;
+            engine_n_p_eval_first -= (long long) perf_multi.n_p_eval;
+        }
     }
     std::printf("{\"event\":\"summary\",\"exit\":%d,\"prompt_tokens\":%zu,\"output_tokens\":%zu,"
                 "\"decode_evaluations\":%d,\"prefill_seconds\":%.9g,\"decode_seconds\":%.9g,"
@@ -702,6 +1011,10 @@ int qwen35_run(const Qwen35RunOptions& o) {
             decode_token_write_seconds, (long long) decode_token_write_rounds,
             decode_flush_seconds, (long long) decode_flush_rounds);
     std::fflush(stdout);
+    // Task 68 explicit one-time GDN flush: after prefill/TTFT and the short decode output are recorded,
+    // before the context is destroyed.  Its completion waits never enter those numbers.  The guard above
+    // covers the failure paths with the same (idempotent) call.
+    if (gdn_events_on) strata_gdn_events_flush();
     core::qwen35_report_decode_seam();
     core::qwen35_bridge_shutdown();
     llama_backend_free();

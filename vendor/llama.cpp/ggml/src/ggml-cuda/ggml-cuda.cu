@@ -3263,6 +3263,39 @@ static bool ggml_cuda_match_moe_weighted_reduction(
 }
 
 
+// Task 151 (STRATA_QWEN35_FUSE_ADD_RMS_NORM, default off; launcher defined in norm.cu): fused
+// add -> rms_norm -> mul.  Declared here so the change stays within two files.
+void ggml_cuda_op_add_rms_norm_fused(ggml_backend_cuda_context & ctx, ggml_tensor * add_tensor,
+                                     ggml_tensor * rms_tensor, ggml_tensor * mul_tensor);
+
+// Validates the exact contract of the fused add+rms+mul kernel: F32, contiguous, a/b/add/mul same shape,
+// weight broadcast 1-D [ncols].  Adjacency and single-use are already checked by ggml_can_fuse.
+static bool ggml_cuda_should_fuse_add_rms_norm(const ggml_tensor * add, const ggml_tensor * rms, const ggml_tensor * mul) {
+    if (add->type != GGML_TYPE_F32 || rms->type != GGML_TYPE_F32 || mul->type != GGML_TYPE_F32) {
+        return false;
+    }
+    if (!ggml_is_contiguous(add) || !ggml_is_contiguous(rms) || !ggml_is_contiguous(mul) ||
+        !ggml_is_contiguous(add->src[0]) || !ggml_is_contiguous(add->src[1])) {
+        return false;
+    }
+    if (rms->src[0] != add) {
+        return false;
+    }
+    const ggml_tensor * w = nullptr;
+    if (mul->src[0] == rms) {
+        w = mul->src[1];
+    } else if (mul->src[1] == rms) {
+        w = mul->src[0];
+    } else {
+        return false;
+    }
+    if (w->type != GGML_TYPE_F32 || !ggml_is_contiguous(w) || w->ne[0] != add->ne[0] ||
+        w->ne[1] != 1 || w->ne[2] != 1 || w->ne[3] != 1) {
+        return false;
+    }
+    return ggml_are_same_shape(add->src[0], add->src[1]) && ggml_are_same_shape(add, mul);
+}
+
 static bool ggml_cuda_can_fuse(const struct ggml_cgraph *                cgraph,
                                int                                       node_idx,
                                std::initializer_list<enum ggml_op>       ops,
@@ -4254,6 +4287,22 @@ static int ggml_cuda_try_fuse(ggml_backend_cuda_context * cuda_ctx, ggml_cgraph 
         return fused_node_count - 1;
     }
 
+    // Task 151 (default off, STRATA_QWEN35_FUSE_ADD_RMS_NORM=1): fuse the residual ADD + RMS_NORM + weight MUL
+    // triple into one kernel (reads a, b, w once, writes the mul output, both intermediates elided).
+    static const bool fuse_add_rms_norm = []() {
+        const char * env = getenv("STRATA_QWEN35_FUSE_ADD_RMS_NORM");
+        return env != nullptr && std::atoi(env) == 1;
+    }();
+    if (fuse_add_rms_norm && i + 2 < cgraph->n_nodes &&
+        ggml_cuda_can_fuse(cgraph, i, { GGML_OP_ADD, GGML_OP_RMS_NORM, GGML_OP_MUL }, {}) &&
+        ggml_cuda_should_fuse_add_rms_norm(node, cgraph->nodes[i + 1], cgraph->nodes[i + 2])) {
+        const int out_node = i + 2;
+        if (ggml_cuda_check_fusion_memory_ranges(cgraph, i, 3, &out_node, 1)) {
+            ggml_cuda_op_add_rms_norm_fused(*cuda_ctx, node, cgraph->nodes[i + 1], cgraph->nodes[i + 2]);
+            return 2;
+        }
+    }
+
     if (ggml_cuda_can_fuse(cgraph, i, { GGML_OP_RMS_NORM, GGML_OP_MUL, GGML_OP_ROPE, GGML_OP_VIEW, GGML_OP_SET_ROWS }, {})) {
         ggml_cuda_op_rms_norm_mul_rope_fused(*cuda_ctx, node, cgraph->nodes[i + 1], cgraph->nodes[i + 2], cgraph->nodes[i + 4]);
         return 4;
@@ -4307,6 +4356,357 @@ static int ggml_cuda_try_fuse(ggml_backend_cuda_context * cuda_ctx, ggml_cgraph 
     }
 
     return 0;
+}
+
+// ---- Task 141 in-loop op timing by node-name whitelist (diagnostic; exact STRATA_QWEN35_OP_TIMING=1) ----
+// A fixed ring of 512 cudaEventDefault pairs on each node's launch stream.  Every node that reaches the
+// compute dispatch below (views and no-op nodes are skipped before this point; a fused root's pair covers the
+// kernels of the nodes fused into it) gets one begin/end pair around its launch.  The ring is reused with a
+// query-before-overwrite and never waits inside the graph: a pair that is not complete when its slot comes
+// around again is counted dropped, never forced and never reported as zero.  Classes are the task whitelist
+// (6 classes + unmatched).  Nodes whose own name is not on the whitelist fall back to the GGUF name of the
+// MUL_MAT weight (several cb() names land on the reshape/view nodes that are skipped here), counted per class
+// as via_weight; norm ops fall back to via_op.  One summary is printed from an atexit handler, i.e. at the
+// request tail, outside every measured window.  Gate unset: nothing records, waits or prints; the compute path
+// is unchanged.
+namespace {
+
+constexpr int kOpTimingSlots   = 512;
+constexpr int kOpTimingClasses = 6;
+constexpr int kOpTimingKeys    = 64;
+constexpr int kOpTimingTopKeys = 10;
+
+const char * const kOpTimingClassName[kOpTimingClasses] = {
+    "gdn_proj", "attn_proj", "router", "norms", "shexp", "seam_experts",
+};
+
+const char * const kOpTimingNames0[] = {
+    "linear_attn_qkv_mixed", "z", "l_out", "linear_attn_out", "conv_output_raw", "conv_output_silu",
+    "q_conv", "k_conv", "v_conv", "q_conv_predelta", "k_conv_predelta", "v_conv_predelta", "state_predelta",
+    "alpha", "beta", "a_softplus", "beta_sigmoid", "gate",
+};
+const char * const kOpTimingNames1[] = {
+    "Qcur", "Qcur_normed", "Qcur_reshaped", "Qcur_full", "Kcur", "Kcur_normed", "Vcur", "attn_gated",
+    "attn_output", "attn_pregate", "fattn_mla",
+};
+const char * const kOpTimingNames2[] = { "ffn_moe_logits", "ffn_moe_gate", "ffn_moe_topk", "ffn_moe_probs" };
+const char * const kOpTimingNames3[] = {
+    "attn_norm", "attn_post_norm", "post_moe", "attn_residual", "result_norm", "ffn_out",
+};
+const char * const kOpTimingNames4[] = {
+    "ffn_shexp", "ffn_shexp_gated", "shared_expert_gate", "shared_expert_gate_sigmoid",
+};
+const char * const kOpTimingNames5[] = { "ffn_moe_out", "ffn_moe_gate_up", "ffn_moe_down", "ffn_moe_swiglu" };
+
+const char * const * const kOpTimingNames[kOpTimingClasses] = {
+    kOpTimingNames0, kOpTimingNames1, kOpTimingNames2, kOpTimingNames3, kOpTimingNames4, kOpTimingNames5,
+};
+const int kOpTimingNameCount[kOpTimingClasses] = { 18, 11, 4, 6, 4, 4 };
+
+struct op_timing_slot {
+    cudaEvent_t  beg    = nullptr;
+    cudaEvent_t  end    = nullptr;
+    cudaStream_t stream = nullptr;
+    int          cls    = -1;
+    bool         pending = false;
+    char         key[56] = {};
+};
+
+struct op_timing_stats {
+    long long entered = 0, via_weight = 0, via_op = 0;
+    long long measured = 0, dropped = 0, failed = 0;
+    double    sum_ms = 0.0, max_ms = 0.0;
+};
+
+struct op_timing_key { char key[56]; long long count; double sum_ms; bool used; };
+
+op_timing_slot  g_opt_slots[kOpTimingSlots];
+op_timing_stats g_opt_cls[kOpTimingClasses];
+op_timing_stats g_opt_unmatched;
+op_timing_key   g_opt_keys[kOpTimingKeys];
+long long       g_opt_keys_overflow = 0;
+int             g_opt_env = -1;
+bool            g_opt_ready = false;
+bool            g_opt_disable = false;
+bool            g_opt_armed = false;
+bool            g_opt_printed = false;
+int             g_opt_next = 0;
+long long       g_opt_nodes = 0, g_opt_matched = 0, g_opt_folded = 0, g_opt_capture_skipped = 0;
+long long       g_opt_segments = 0;
+long long       g_opt_create_failed = 0, g_opt_record_failed = 0, g_opt_query_failed = 0;
+long long       g_opt_elapsed_failed = 0, g_opt_dropped = 0;
+
+bool opt_on() {
+    if (g_opt_env < 0) {
+        const char * v = getenv("STRATA_QWEN35_OP_TIMING");
+        g_opt_env = (v != nullptr && strcmp(v, "1") == 0) ? 1 : 0;
+    }
+    return g_opt_env == 1;
+}
+
+bool opt_name_hit(const char * name, const char * base) {
+    const size_t n = strlen(base);
+    if (strncmp(name, base, n) != 0) return false;
+    return name[n] == '\0' || name[n] == '-';
+}
+
+int opt_class_from_weight(const char * w) {
+    if (w == nullptr || w[0] == '\0') return -1;
+    if (strstr(w, "shexp") != nullptr) return 4;
+    if (strstr(w, "ffn_gate_inp") != nullptr) return 2;
+    if (strstr(w, "attn_qkv.") != nullptr || strstr(w, "attn_gate.") != nullptr ||
+        strstr(w, "ssm_alpha.") != nullptr || strstr(w, "ssm_beta.") != nullptr ||
+        strstr(w, "ssm_out.") != nullptr) return 0;
+    if (strstr(w, "attn_q.") != nullptr || strstr(w, "attn_k.") != nullptr ||
+        strstr(w, "attn_v.") != nullptr || strstr(w, "attn_output.") != nullptr) return 1;
+    return -1;
+}
+
+bool opt_is_norm_op(enum ggml_op op) {
+    return op == GGML_OP_RMS_NORM || op == GGML_OP_L2_NORM || op == GGML_OP_NORM || op == GGML_OP_GROUP_NORM;
+}
+
+// 0-based class or -1; via: 0 name whitelist, 1 weight name, 2 norm op.
+int opt_classify(const ggml_tensor * node, int * via) {
+    *via = 0;
+    if (node->name[0] != '\0') {
+        for (int c = 0; c < kOpTimingClasses; ++c) {
+            for (int i = 0; i < kOpTimingNameCount[c]; ++i) {
+                if (opt_name_hit(node->name, kOpTimingNames[c][i])) return c;
+            }
+        }
+    }
+    if ((node->op == GGML_OP_MUL_MAT || node->op == GGML_OP_MUL_MAT_ID) && node->src[0] != nullptr) {
+        const int c = opt_class_from_weight(node->src[0]->name);
+        if (c >= 0) { *via = 1; return c; }
+    }
+    if (opt_is_norm_op(node->op)) { *via = 2; return 3; }
+    return -1;
+}
+
+void opt_key_of(const ggml_tensor * node, char * out, size_t cap) {
+    if ((node->op == GGML_OP_MUL_MAT || node->op == GGML_OP_MUL_MAT_ID) && node->src[0] != nullptr &&
+        node->src[0]->name[0] != '\0') {
+        snprintf(out, cap, "MM:%s", node->src[0]->name);
+    } else if (node->name[0] != '\0') {
+        size_t l = 0;
+        while (node->name[l] != '\0' && node->name[l] != ' ' && l + 1 < cap) { out[l] = node->name[l]; ++l; }
+        out[l] = '\0';
+    } else {
+        snprintf(out, cap, "(unnamed)/%s", ggml_op_name(node->op));
+    }
+}
+
+void opt_create_events() {
+    if (g_opt_ready || g_opt_disable) return;
+    for (int i = 0; i < kOpTimingSlots; ++i) {
+        if (cudaEventCreateWithFlags(&g_opt_slots[i].beg, cudaEventDefault) != cudaSuccess ||
+            cudaEventCreateWithFlags(&g_opt_slots[i].end, cudaEventDefault) != cudaSuccess) {
+            g_opt_create_failed = i + 1;
+            g_opt_disable = true;
+            return;
+        }
+    }
+    g_opt_ready = true;
+}
+
+op_timing_stats & opt_stats(int cls) { return cls >= 0 ? g_opt_cls[cls] : g_opt_unmatched; }
+
+void opt_collect(op_timing_slot & s) {
+    float ms = 0.0f;
+    if (cudaEventElapsedTime(&ms, s.beg, s.end) == cudaSuccess) {
+        op_timing_stats & st = opt_stats(s.cls);
+        st.measured++;
+        st.sum_ms += (double) ms;
+        if ((double) ms > st.max_ms) st.max_ms = (double) ms;
+        if (s.cls < 0) {
+            for (int i = 0; i < kOpTimingKeys; ++i) {
+                if (!g_opt_keys[i].used) {
+                    snprintf(g_opt_keys[i].key, sizeof(g_opt_keys[i].key), "%s", s.key);
+                    g_opt_keys[i].used = true;
+                    g_opt_keys[i].count = 0;
+                    g_opt_keys[i].sum_ms = 0.0;
+                }
+                if (strcmp(g_opt_keys[i].key, s.key) == 0) {
+                    g_opt_keys[i].count++;
+                    g_opt_keys[i].sum_ms += (double) ms;
+                    return;
+                }
+            }
+            g_opt_keys_overflow++;
+        }
+    } else {
+        opt_stats(s.cls).failed++;
+        g_opt_elapsed_failed++;
+    }
+}
+
+}  // namespace
+
+extern "C" int strata_op_timing_begin(cudaStream_t stream, const ggml_tensor * node) {
+    if (!g_opt_armed || g_opt_disable) return -1;
+    ++g_opt_nodes;
+    int via = 0;
+    const int cls = opt_classify(node, &via);
+    op_timing_stats & st = opt_stats(cls);
+    st.entered++;
+    if (via == 1) st.via_weight++;
+    else if (via == 2) st.via_op++;
+    if (cls >= 0) ++g_opt_matched;
+    if (!g_opt_ready) {
+        opt_create_events();
+        if (!g_opt_ready) return -1;
+    }
+    cudaStreamCaptureStatus cs = cudaStreamCaptureStatusNone;
+    if (cudaStreamIsCapturing(stream, &cs) != cudaSuccess) {
+        ++g_opt_query_failed;
+        return -1;
+    }
+    if (cs != cudaStreamCaptureStatusNone) {
+        ++g_opt_capture_skipped;
+        return -1;
+    }
+    op_timing_slot & s = g_opt_slots[g_opt_next];
+    if (s.pending) {
+        const cudaError_t q = cudaEventQuery(s.end);
+        if (q == cudaSuccess) {
+            opt_collect(s);
+        } else if (q == cudaErrorNotReady) {
+            opt_stats(s.cls).dropped++;
+            ++g_opt_dropped;
+        } else {
+            opt_stats(s.cls).failed++;
+            ++g_opt_query_failed;
+        }
+        s.pending = false;
+    }
+    if (cudaEventRecord(s.beg, stream) != cudaSuccess) {
+        ++g_opt_record_failed;
+        g_opt_disable = true;
+        return -1;
+    }
+    s.stream = stream;
+    s.cls = cls;
+    s.pending = true;
+    if (cls < 0) opt_key_of(node, s.key, sizeof(s.key));
+    else s.key[0] = '\0';
+    const int slot = g_opt_next;
+    g_opt_next = (g_opt_next + 1) % kOpTimingSlots;
+    return slot;
+}
+
+extern "C" void strata_op_timing_end(int slot) {
+    if (slot < 0 || !g_opt_armed || g_opt_disable) return;
+    op_timing_slot & s = g_opt_slots[slot];
+    if (!s.pending || s.end == nullptr) return;
+    if (cudaEventRecord(s.end, s.stream) != cudaSuccess) {
+        ++g_opt_record_failed;
+        opt_stats(s.cls).failed++;
+        g_opt_disable = true;
+        s.pending = false;
+    }
+}
+
+extern "C" void strata_op_timing_folded(int n) {
+    if (g_opt_armed) g_opt_folded += n;
+}
+
+// Collects every pending pair (query only; syncs at most one stream per distinct stream, and only when a pair
+// from the finished request is still not ready) and prints the one summary plus the per-class lines.
+static void opt_flush_and_print() {
+    if (g_opt_printed) return;
+    g_opt_printed = true;
+    g_opt_armed = false;
+    cudaStream_t wait[8] = {};
+    int n_wait = 0;
+    for (int i = 0; i < kOpTimingSlots; ++i) {
+        op_timing_slot & s = g_opt_slots[i];
+        if (!s.pending) continue;
+        const cudaError_t q = cudaEventQuery(s.end);
+        if (q == cudaSuccess) {
+            opt_collect(s);
+            s.pending = false;
+        } else if (q == cudaErrorNotReady) {
+            bool seen = false;
+            for (int k = 0; k < n_wait; ++k) if (wait[k] == s.stream) { seen = true; break; }
+            if (!seen && n_wait < 8) wait[n_wait++] = s.stream;
+        } else {
+            opt_stats(s.cls).failed++;
+            ++g_opt_query_failed;
+            s.pending = false;
+        }
+    }
+    int sync_failed = 0;
+    for (int k = 0; k < n_wait; ++k) {
+        if (cudaStreamSynchronize(wait[k]) != cudaSuccess) ++sync_failed;
+    }
+    for (int i = 0; i < kOpTimingSlots; ++i) {
+        op_timing_slot & s = g_opt_slots[i];
+        if (!s.pending) continue;
+        if (cudaEventQuery(s.end) == cudaSuccess) {
+            opt_collect(s);
+        } else {
+            opt_stats(s.cls).failed++;
+        }
+        s.pending = false;
+    }
+    std::fprintf(stderr,
+                 "strata qwen35: op timing (STRATA_QWEN35_OP_TIMING=1) summary: segments %lld nodes %lld "
+                 "matched %lld folded %lld dropped %lld capture_skipped %lld slots %d create_failed %lld "
+                 "record_failed %lld query_failed %lld elapsed_failed %lld pending_sync_streams %d "
+                 "sync_failed %d coverage \"compute-loop nodes on the launch stream; views/no-ops skipped; "
+                 "fused members inside the root span; capture/replay unmeasured=unknown\"\n",
+                 g_opt_segments, g_opt_nodes, g_opt_matched, g_opt_folded,
+                 g_opt_dropped, g_opt_capture_skipped, kOpTimingSlots, g_opt_create_failed, g_opt_record_failed,
+                 g_opt_query_failed, g_opt_elapsed_failed, n_wait, sync_failed);
+    for (int c = 0; c < kOpTimingClasses; ++c) {
+        const op_timing_stats & st = g_opt_cls[c];
+        std::fprintf(stderr,
+                     "strata qwen35: op timing class %d %s: entered %lld measured %lld dropped %lld failed %lld "
+                     "sum_ms %.6f mean_ms %.6f max_ms %.6f via_weight %lld via_op %lld\n",
+                     c, kOpTimingClassName[c], st.entered, st.measured, st.dropped, st.failed, st.sum_ms,
+                     st.measured > 0 ? st.sum_ms / (double) st.measured : 0.0, st.max_ms, st.via_weight, st.via_op);
+    }
+    {
+        const op_timing_stats & st = g_opt_unmatched;
+        std::fprintf(stderr,
+                     "strata qwen35: op timing class unmatched: entered %lld measured %lld dropped %lld failed "
+                     "%lld sum_ms %.6f mean_ms %.6f max_ms %.6f via_weight %lld via_op %lld keys_overflow %lld\n",
+                     st.entered, st.measured, st.dropped, st.failed, st.sum_ms,
+                     st.measured > 0 ? st.sum_ms / (double) st.measured : 0.0, st.max_ms, st.via_weight, st.via_op,
+                     g_opt_keys_overflow);
+    }
+    for (int top = 0; top < kOpTimingTopKeys; ++top) {
+        int best = -1;
+        for (int i = 0; i < kOpTimingKeys; ++i) {
+            if (!g_opt_keys[i].used || g_opt_keys[i].count <= 0) continue;
+            if (best < 0 || g_opt_keys[i].sum_ms > g_opt_keys[best].sum_ms) best = i;
+        }
+        if (best < 0) break;
+        std::fprintf(stderr,
+                     "strata qwen35: op timing unmatched top%d [%s] count %lld sum_ms %.6f mean_ms %.6f\n",
+                     top, g_opt_keys[best].key, g_opt_keys[best].count, g_opt_keys[best].sum_ms,
+                     g_opt_keys[best].sum_ms / (double) g_opt_keys[best].count);
+        g_opt_keys[best].count = 0;
+    }
+    if (g_opt_ready) {
+        for (int i = 0; i < kOpTimingSlots; ++i) {
+            if (g_opt_slots[i].beg != nullptr) cudaEventDestroy(g_opt_slots[i].beg);
+            if (g_opt_slots[i].end != nullptr) cudaEventDestroy(g_opt_slots[i].end);
+            g_opt_slots[i].beg = nullptr;
+            g_opt_slots[i].end = nullptr;
+        }
+        g_opt_ready = false;
+    }
+}
+
+extern "C" void strata_op_timing_segment_begin(void) {
+    if (!opt_on()) return;
+    if (!g_opt_armed) {
+        g_opt_armed = true;
+        std::atexit(opt_flush_and_print);
+    }
+    ++g_opt_segments;
 }
 
 static void ggml_cuda_graph_evaluate_and_capture(ggml_backend_cuda_context * cuda_ctx, ggml_cgraph * cgraph, const bool use_cuda_graph, const bool cuda_graph_update_required, const void * graph_key) {
@@ -4456,9 +4856,12 @@ static void ggml_cuda_graph_evaluate_and_capture(ggml_backend_cuda_context * cud
                     continue;
                 }
 
+                const int op_timing_pair = strata_op_timing_begin(cuda_ctx->stream(), node);
                 int nodes_to_skip = ggml_cuda_try_fuse(cuda_ctx, cgraph, i);
 
                 if (nodes_to_skip != 0) {
+                    strata_op_timing_end(op_timing_pair);
+                    strata_op_timing_folded(nodes_to_skip);
 #ifdef GGML_CUDA_DEBUG
                     const int last_fused = i + nodes_to_skip;
                     GGML_LOG_INFO("nodes_fused: %d, first: %s (%s), last: %s (%s)\n",
@@ -4486,6 +4889,7 @@ static void ggml_cuda_graph_evaluate_and_capture(ggml_backend_cuda_context * cud
 #endif  // NDEBUG
 
                 bool ok = ggml_cuda_compute_forward(*cuda_ctx, node);
+                strata_op_timing_end(op_timing_pair);
                 if (!ok) {
                     GGML_LOG_ERROR("%s: op not supported %s (%s)\n", __func__, node->name, ggml_op_name(node->op));
                 }
@@ -4555,6 +4959,8 @@ static enum ggml_status ggml_backend_cuda_graph_compute(ggml_backend_t backend, 
     ggml_backend_cuda_context * cuda_ctx = (ggml_backend_cuda_context *) backend->context;
 
     ggml_cuda_set_device(cuda_ctx->device);
+
+    strata_op_timing_segment_begin();   // task 141 diagnostic (no-op while the gate is unset; arms once)
 
     bool use_cuda_graph             = false;
     bool cuda_graph_update_required = false;

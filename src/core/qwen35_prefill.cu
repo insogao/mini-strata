@@ -65,6 +65,147 @@ bool prefill_phases_enabled() {
     }();
     return on;
 }
+/// Task 127 diagnostic (exact STRATA_QWEN35_D2H_SPLIT=1, default off): split the EXISTING d2h_sync host wall
+/// into prefix_wait (the call's `pre` graph-prefix boundary completing on the backend stream) + ids_tail (our
+/// pack/packed-ids work-stream sync returning).  The two waits run in sequence, and the work stream already
+/// ordered itself behind `pre` (the bridge's cudaStreamWaitEvent), so their total equals the original single
+/// stream sync's max(pre, pack+D2H) wait - the split only re-attributes one existing window.  Unset: the
+/// original path, no CUDA call, no output, no timing change.
+bool d2h_split_enabled() {
+    static const bool on = [] {
+        const char* v = std::getenv("STRATA_QWEN35_D2H_SPLIT");
+        return v != nullptr && std::strcmp(v, "1") == 0;
+    }();
+    return on;
+}
+// The bridge hands over the current prompt call's `pre` event handle just before invoking the prompt path
+// (gate on only): a host pointer store, never a CUDA call.
+cudaEvent_t g_d2h_split_pre = nullptr;
+// ---- Task 69: router weights stay-device (exact STRATA_QWEN35_ROUTER_WEIGHTS_DEVICE=1, default off) ----
+// When on, the combine reads the ORIGINAL router weights tensor in place through its real byte strides
+// (t*w_nb2 + r*w_nb1, the same addresses the legacy host unpack read), so the per-call strided weights D2H,
+// the host repack and the contiguous weights H2D do not run on the normal path.  The ids D2H and its sync
+// stay.  Default off = the original path, bit for bit.  The optional exact STRATA_QWEN35_ROUTER_WEIGHTS_CHECK=1
+// adds ONE first-call index check (see qwen_prefill_experts); it is diagnostic and never used for speed.
+bool router_weights_device_on() {
+    static const bool on = [] {
+        const char* v = std::getenv("STRATA_QWEN35_ROUTER_WEIGHTS_DEVICE");
+        return v != nullptr && std::strcmp(v, "1") == 0;
+    }();
+    return on;
+}
+bool router_weights_check_on() {
+    static const bool on = [] {
+        const char* v = std::getenv("STRATA_QWEN35_ROUTER_WEIGHTS_CHECK");
+        return v != nullptr && std::strcmp(v, "1") == 0;
+    }();
+    return on;
+}
+// Cumulative call counters of the stays-device path (process-local; printed once at prefill close).  Separate
+// counters keep the normal-path round trips auditable: 0 on the ON normal path, the explicit diagnostic copies
+// counted on their own so they can never look like 0.
+long long g_rwd_device_calls = 0;
+long long g_rwd_legacy_calls = 0;
+long long g_rwd_weights_d2h_bytes = 0;      // legacy strided weights D2H bytes (OFF normal path)
+long long g_rwd_weights_h2d_bytes = 0;      // legacy contiguous weights H2D bytes (OFF normal path)
+long long g_rwd_diag_d2h_bytes = 0;         // ON-path explicit diagnostic copies (route fp only)
+long long g_rwd_check_runs = 0;
+long long g_rwd_check_elems = 0;
+long long g_rwd_check_eq = 0;
+long long g_rwd_check_fail = 0;
+long long g_rwd_check_nb1 = -1;
+long long g_rwd_check_nb2 = -1;
+long long g_rwd_check_alloc_failed = 0;
+bool g_rwd_check_done = false;
+
+// ---- Task 72: packed router ids (exact STRATA_QWEN35_PACKED_IDS=1, default off) ----
+// The ids tensor is llama's strided argsort view (ids_nb1 = n_expert*4 bytes = 1024 here, T=2048 -> ~2 MiB per
+// layer call).  When on, a small in-file kernel packs the real T*K int32 ranks into the contiguous [T, K]
+// staging buffer (the temporary s->src region, free until the row-map upload overwrites it on the same
+// stream), and the one existing D2H sync then carries only T*K*4 bytes instead of the strided raw span.  The
+// host reads become contiguous; cnt/order/src_h/entry_h, the id range check, route fp, capture, cache/cold,
+// group16, MMQ and the loan are unchanged.  Off = the original raw strided path, bit for bit.
+bool packed_ids_on() {
+    static const bool on = [] {
+        const char* v = std::getenv("STRATA_QWEN35_PACKED_IDS");
+        return v != nullptr && std::strcmp(v, "1") == 0;
+    }();
+    return on;
+}
+bool packed_ids_check_on() {
+    static const bool on = [] {
+        const char* v = std::getenv("STRATA_QWEN35_PACKED_IDS_CHECK");
+        return v != nullptr && std::strcmp(v, "1") == 0;
+    }();
+    return on;
+}
+long long g_pid_packed_calls = 0;
+long long g_pid_raw_calls = 0;
+long long g_pid_packed_d2h_bytes = 0;   // formal packed path: T*K*4 per call
+long long g_pid_raw_d2h_bytes = 0;      // OFF normal path: the original strided raw span per call
+long long g_pid_diag_d2h_bytes = 0;     // B's explicit raw-reference copy (listed separately, never 0-pretended)
+long long g_pid_check_shapes = 0;
+long long g_pid_check_elems = 0;
+long long g_pid_check_fail = 0;
+long long g_pid_check_nb1 = -1;
+int64_t g_pid_seen_T[2] = {0, 0};
+int g_pid_seen_n = 0;
+
+// ---- Task 74: cold direct-to-group (exact STRATA_QWEN35_COLD_DIRECT_GROUP=1, default off) ----
+// Cold experts are copied straight from the producer's pinned blob into the current group buffer's slots (the
+// same in-slot layout the gather would produce), skipping the device ring and the cold gather.  Two ping-pong
+// group sets give copy/compute overlap: the copy stream waits a set's previous compute-done event before
+// reusing it, and the work stream waits the set's copy-ready event before the products read it.  The host
+// stager protocol (ready/wait/issued_one DMA recorded after the expert's copies) is unchanged, so a pinned
+// buffer is never overwritten before its DMA.  Default off = the original ring + unmasked gather path.
+bool cold_direct_group_on() {
+    static const bool on = [] {
+        const char* v = std::getenv("STRATA_QWEN35_COLD_DIRECT_GROUP");
+        return v != nullptr && std::strcmp(v, "1") == 0;
+    }();
+    return on;
+}
+bool cold_direct_check_on() {
+    static const bool on = [] {
+        const char* v = std::getenv("STRATA_QWEN35_COLD_DIRECT_CHECK");
+        return v != nullptr && std::strcmp(v, "1") == 0;
+    }();
+    return on;
+}
+long long g_cdg_cold_direct = 0;
+long long g_cdg_direct_bytes = 0;
+long long g_cdg_gather_skipped = 0;
+long long g_cdg_resident_gathered = 0;
+long long g_cdg_pingpong_copy_waits = 0;
+long long g_cdg_pingpong_cs_waits = 0;
+long long g_cdg_check_combos = 0;
+long long g_cdg_check_bytes = 0;
+long long g_cdg_check_fail = 0;
+long long g_cdg_check_unsupported = 0;
+int32_t g_cdg_chk_gu[4] = {0, 0, 0, 0};
+int32_t g_cdg_chk_d[4] = {0, 0, 0, 0};
+int g_cdg_chk_n = 0;
+
+// Checked byte-span (task 72, addition fixed by task 74): false on any overflow in last_outer*nb_outer,
+// last_inner*nb_inner, their SUM, + item, or when the base pointer plus the span would wrap.  A single
+// outer/inner element is not rejected just because a stride exceeds the span.
+bool checked_span(uintptr_t base, size_t nb_outer, size_t last_outer, size_t nb_inner, size_t last_inner,
+                  size_t item, size_t& span) {
+    const uint64_t uo = (uint64_t) last_outer, ui = (uint64_t) last_inner;
+    const uint64_t no = (uint64_t) nb_outer, ni = (uint64_t) nb_inner;
+    if (uo != 0 && no > UINT64_MAX / uo) return false;
+    if (ui != 0 && ni > UINT64_MAX / ui) return false;
+    const uint64_t p1 = uo * no;
+    const uint64_t p2 = ui * ni;
+    if (p1 > UINT64_MAX - p2) return false;              // the sum of the two checked products must not wrap
+    const uint64_t off = p1 + p2;
+    if (off > (uint64_t) SIZE_MAX - (uint64_t) item) return false;
+    const uint64_t sp = off + (uint64_t) item;
+    if (sp > (uint64_t) UINTPTR_MAX) return false;
+    if ((uint64_t) base > (uint64_t) UINTPTR_MAX - sp) return false;
+    span = (size_t) sp;
+    return true;
+}
 /// Exact-value gate for the bounded per-request group-gather counters (diagnostic, default off).
 bool gather_stats_enabled() {
     static const bool on = [] {
@@ -159,11 +300,62 @@ bool rowhist_enabled() {
     }();
     return on;
 }
+/// Exact-value gate for the chunk1 -> chunk2 cold-expert prefetch (default off; exact "1").  On, the chunk2
+/// call starts the original stager on the layer's predicted cold set BEFORE the ids D2H (so the producer's
+/// copies overlap the sync window) and parks the blobs in a bounded pinned side pool; the formal generation
+/// skips them and the group loop takes them from the pool.  Off: no pool, no bitmap, no extra work anywhere.
+bool prefetch_v1_enabled() {
+    static const bool on = [] {
+        const char* v = std::getenv("STRATA_QWEN35_PREFETCH_V1");
+        return v != nullptr && std::strcmp(v, "1") == 0;
+    }();
+    return on;
+}
 /// The one-shot single-layer capture gate (default off): STRATA_QWEN35_LAYER_CAPTURE is an existing directory;
 /// only a non-empty value enables it, and only for the first T==2048 call of layer 16.
 const char* layer_capture_dir() {
     static const char* v = [] {
         const char* e = std::getenv("STRATA_QWEN35_LAYER_CAPTURE");
+        return (e != nullptr && e[0] != '\0') ? e : nullptr;
+    }();
+    return v;
+}
+/// Task 122 diagnostic-only layer list for the capture above: STRATA_QWEN35_LAYER_CAPTURE_LAYERS is a
+/// comma-separated layer list (e.g. "31,33,35,38").  Unset: the original one-shot layer 16.  Set: each listed
+/// layer's first T==2048 call is captured once (the per-layer files carry a "-L<layer>" suffix so several
+/// layers fit one directory).  This only widens WHICH layers the existing capture may fire on; the trigger
+/// condition itself and the default (unset) behaviour are unchanged.
+const std::vector<int64_t>& capture_layer_list() {
+    static const std::vector<int64_t> v = [] {
+        std::vector<int64_t> out;
+        const char* e = std::getenv("STRATA_QWEN35_LAYER_CAPTURE_LAYERS");
+        if (e != nullptr && e[0] != '\0') {
+            const char* p = e;
+            while (*p != '\0') {
+                char* end = nullptr;
+                const long n = std::strtol(p, &end, 10);
+                if (end == p) break;
+                if (n >= 0 && n < 1024) out.push_back((int64_t) n);
+                p = end;
+                if (*p == ',') ++p;
+            }
+        }
+        return out;
+    }();
+    return v;
+}
+bool capture_layer_selected(int64_t layer) {
+    const std::vector<int64_t>& sel = capture_layer_list();
+    if (sel.empty()) return layer == 16;   // default: byte-identical to the previous behaviour
+    return std::find(sel.begin(), sel.end(), layer) != sel.end();
+}
+/// The per-call routing dump opt-in (default off): STRATA_QWEN35_ROUTE_DUMP is a directory; only a non-empty
+/// value enables it.  Every prompt call appends one header line and one line per non-empty expert (expert,
+/// count, resident flag) to <dir>/route-dump.jsonl - host only, appended at the rowhist point, no CUDA call,
+/// no event, no sync, launch order untouched.  Unset: no file, no output, no work beyond the cached check.
+const char* route_dump_dir() {
+    static const char* v = [] {
+        const char* e = std::getenv("STRATA_QWEN35_ROUTE_DUMP");
         return (e != nullptr && e[0] != '\0') ? e : nullptr;
     }();
     return v;
@@ -231,6 +423,7 @@ struct StagerChkPair {
     int64_t layer = -1;
     int32_t expert = -1;
     size_t bytes = 0;
+    int32_t pf_checked = 0;   ///< prefetch v1: the first prestaged member of this type was byte-checked
 };
 constexpr int kStagerChkMax = 8;
 /// Controlled negative source (STRATA_QWEN35_STAGER_FAIL=1, default off): delegates to the real source except
@@ -294,6 +487,11 @@ struct PrefillState {
     cudaStream_t copy = nullptr;
     cudaEvent_t* copied = nullptr;
     cudaEvent_t* used = nullptr;
+    // Task 74 cold direct-to-group ping-pong (created only when the exact env is on at allocation time)
+    cudaEvent_t grp_ready[2] = {nullptr, nullptr};  ///< copy stream: a set's cold H2D is complete
+    cudaEvent_t grp_done[2] = {nullptr, nullptr};   ///< work stream: a set's products have consumed it
+    size_t grp_gu_alloc = 0, grp_d_alloc = 0;       ///< one set's sizes (the set stride for the base pointer)
+    bool cdg_alloc = false;                         ///< the ON allocation shape is live (2 sets, no device ring)
     std::unique_ptr<strata::prefill::mmq::Context> ctx;
     // the original cold-expert producer (one per allocation epoch): it owns the host ring that replaces the
     // old ring_h; the launching thread (this one) still issues every H2D and owns the device ring
@@ -354,8 +552,41 @@ struct PrefillState {
     std::vector<int64_t> rh_distinct, rh_maxcnt, rh_rows, rh_groups;
     int64_t rh_buckets[12] = {};
     int64_t rh_layers = 0;
-    // one-shot single-layer capture (diagnostic; STRATA_QWEN35_LAYER_CAPTURE=<dir>)
-    bool cap_done = false;
+    // per-call routing dump (diagnostic; STRATA_QWEN35_ROUTE_DUMP=<dir>; host only, one append per call)
+    std::ofstream rd_fp;
+    int64_t rd_calls = 0;
+    int64_t rd_rows = 0;
+    const char* rd_dir = nullptr;
+    // chunk1 -> chunk2 cold-expert prefetch (STRATA_QWEN35_PREFETCH_V1=1; default off; allocated only when the
+    // gate was on at alloc time).  v2: a DEDICATED second stager instance whose pinned ring buffers ARE the
+    // side pool (no ring->pool drain at all); c1_bits holds chunk1's non-empty experts per layer; pf_slot marks
+    // this call's predicted members (-1 none, -2 predicted/pending, >=0 the pf stager's job index).
+    std::unique_ptr<strata::prefill::ColdStager> pf_stager;   ///< the side pool (pinned ring, ring <= 192MiB/stride)
+    size_t pf_stride = 0;               ///< per-slot stride: the largest layer blob (the pf stager's blob size)
+    int64_t pf_slots = 0;               ///< pf stager ring depth (the pool's slot count)
+    cudaEvent_t pf_ev = nullptr;        ///< marks the last side-pool H2D enqueue (cross-layer reuse guard)
+    bool pf_ev_used = false;
+    std::vector<uint32_t> c1_bits;      ///< 8 x n_layers: chunk1's non-empty experts per layer
+    std::vector<char> c1_set;           ///< per layer: the bitmap above was recorded
+    std::vector<int32_t> pf_slot;       ///< per expert: the call's prediction / side-pool slot
+    int64_t pf_layers = 0, pf_bytes = 0, pf_used_bytes = 0;
+    int64_t pf_skipped_pool = 0, pf_skipped_empty = 0, pf_member_fallbacks = 0, pf_peak_bytes = 0;
+    double pf_wait_ms = 0, pf_drain_ms = 0;
+    // chunk2 evidence (available in every arm when PREFILL_PHASES=1): the cold-copy wait of a layer's SECOND
+    // and later calls (the chunk2 pass), and the per-layer call counter that identifies them.
+    double ph_copyhost2_ms = 0;
+    int64_t ph_pass2 = 0;
+    uint8_t layer_pass[64] = {};
+    // Task 127 d2h split (diagnostic; gate on only; alloc_for clears): per-call sums and extremes of the two
+    // sequential host waits inside the existing d2h_sync window (prefix = graph prefix, tail = our pack/ids
+    // D2H).  ds_pre_missing counts gate-on calls without an event handle - never counted as a zero.
+    int64_t ds_calls = 0;
+    double ds_prefix_ms = 0, ds_tail_ms = 0;
+    double ds_prefix_min = 0, ds_prefix_max = 0, ds_tail_min = 0, ds_tail_max = 0;
+    int64_t ds_pre_missing = 0, ds_event_wait_failed = 0;
+    // one-shot layer capture (diagnostic; STRATA_QWEN35_LAYER_CAPTURE=<dir>; the optional layer list is task
+    // 122's diagnostic-only widening - unset keeps the original layer 16)
+    std::vector<char> cap_done_layers;
     bool cap_this_call = false;
     // optional group-gather counters (diagnostic; alloc_for clears them) and the byte-check pair registry
     int64_t gg_fast = 0, gg_fallback = 0, gg_kernels = 0, gg_used_recs = 0;
@@ -468,6 +699,11 @@ int row_bucket(int64_t c) {
 }
 
 void free_all(PrefillState& s) {
+    if (s.rd_fp.is_open()) s.rd_fp.close();
+    if (s.pf_ev != nullptr) { cudaEventDestroy(s.pf_ev); s.pf_ev = nullptr; }
+    s.pf_stager.reset();   // the side stager's pinned ring dies with its instance (copy stream already drained)
+    s.pf_slots = 0;
+    s.pf_ev_used = false;
     const bool borrowed = s.borrowed;
     void* ptrs[] = {s.xq, s.hq, s.gu, s.h, s.dm, s.grp_gu, s.grp_d};
     for (int i = 0; i < 7; ++i)
@@ -503,6 +739,13 @@ void free_all(PrefillState& s) {
         delete[] s.used;
         s.used = nullptr;
     }
+    // Task 74 ping-pong events (created only under the ON allocation; null otherwise)
+    for (int i = 0; i < 2; ++i) {
+        if (s.grp_ready[i]) { cudaEventDestroy(s.grp_ready[i]); s.grp_ready[i] = nullptr; }
+        if (s.grp_done[i]) { cudaEventDestroy(s.grp_done[i]); s.grp_done[i] = nullptr; }
+    }
+    s.grp_gu_alloc = s.grp_d_alloc = 0;
+    s.cdg_alloc = false;
     // The bounded GPU-event diagnostic's event objects (created only when the gate was on for this epoch); a
     // pending pair from a failed/early call is explicitly counted as dropped here - it is never queried after
     // destruction and it is never reported as a completed measurement.
@@ -567,7 +810,15 @@ bool alloc_for(ExpertDispatch& d, PrefillState& s, const strata::kernels::cpu::N
     s.fp_loan_hash = 0;
     s.fp_recs.clear();
     s.ph_calls = 0;
+    s.ph_copyhost2_ms = 0;
+    s.ph_pass2 = 0;
+    std::memset(s.layer_pass, 0, sizeof(s.layer_pass));
     s.ph_d2h_ms = s.ph_group_ms = s.ph_ringwait_ms = s.ph_copyhost_ms = s.ph_enqueue_ms = s.ph_combine_ms = 0;
+    // Task 127 d2h split (gate on only): the per-request accumulators reset with the other phase totals.
+    s.ds_calls = 0;
+    s.ds_prefix_ms = s.ds_tail_ms = 0;
+    s.ds_prefix_min = s.ds_prefix_max = s.ds_tail_min = s.ds_tail_max = 0;
+    s.ds_pre_missing = s.ds_event_wait_failed = 0;
     s.gg_fast = s.gg_fallback = s.gg_kernels = s.gg_used_recs = 0;
     s.chk_n = 0;
     s.chk_skipped = 0;
@@ -626,18 +877,34 @@ bool alloc_for(ExpertDispatch& d, PrefillState& s, const strata::kernels::cpu::N
     const auto& lay = strata::kernels::cpu::expert_layout();
     s.blob_cap = (size_t) lay.max_blob;
     s.ring = (int) std::min<int64_t>(kGroup, lay.n_expert);
+    // Task 84: producer host-ring depth gate.  Exact STRATA_QWEN35_STAGER_RING=<n> (an integer >= 2, clamped
+    // to 256 by the stager); unset or unparsable keeps the frozen 16.  Only the pinned HOST lookahead changes:
+    // the device ring, the loan plan and the workspace are untouched, and the reported ring bytes count both
+    // halves at their real sizes (device half = 0 on the direct path).
+    int stg_ring = s.ring;
+    if (const char* ring_env = std::getenv("STRATA_QWEN35_STAGER_RING"); ring_env != nullptr && ring_env[0] != '\0') {
+        char* rend = nullptr;
+        const long rv = std::strtol(ring_env, &rend, 10);
+        if (rend != nullptr && *rend == '\0' && rv >= 2) stg_ring = (int) std::min<long>(rv, 256);
+    }
     const size_t bounds_bytes = (size_t) (n + 1) * sizeof(int32_t);
     const size_t rel_bytes = (size_t) s.rel_cap * sizeof(int32_t);
     const size_t idx_bytes = (size_t) n * sizeof(int32_t);
     const size_t wdev_bytes = (size_t) n * sizeof(float);
     const size_t grp_gu_bytes = (size_t) kGroup * max_gu + kTail;
     const size_t grp_d_bytes = (size_t) kGroup * max_d + kTail;
-    const size_t ring_dev_bytes = (size_t) s.ring * s.blob_cap;
+    // Task 74: the direct-to-group shape replaces the device ring with a second ping-pong group set; both
+    // shapes are priced here, so the loan plan, the owned fallback and the reported ring/workspace bytes all
+    // describe what really exists.
+    const bool cdg_alloc_now = cold_direct_group_on();
+    const int grp_sets = cdg_alloc_now ? 2 : 1;
+    const size_t ring_dev_bytes = cdg_alloc_now ? 0 : (size_t) s.ring * s.blob_cap;
     s.workspace_bytes = xq_bytes + hq_bytes + bounds_bytes + rel_bytes + 3 * idx_bytes + gu_bytes + h_bytes +
-                        dm_bytes + wdev_bytes + grp_gu_bytes + grp_d_bytes;
-    // host+device accounting stays 2x (the old ring_h and the producer's ring are the same 16 x blob_cap
-    // pinned bytes); only the DEVICE half is lent/priced - the host ring is never part of the device loan.
-    s.ring_bytes = 2 * (uint64_t) s.ring * s.blob_cap;
+                        dm_bytes + wdev_bytes + grp_gu_bytes * (size_t) grp_sets +
+                        grp_d_bytes * (size_t) grp_sets;
+    // Device half (0 on the direct path) + the producer's pinned host half (the ring gate, default 16); only
+    // the DEVICE half is lent/priced below.
+    s.ring_bytes = (uint64_t) (cdg_alloc_now ? 0 : s.ring) * s.blob_cap + (uint64_t) stg_ring * s.blob_cap;
     // THE LOAN (same contract as generate.cpp's lent/host_res): with a cache, the tail slots are borrowed for
     // the workspace + device ring and their residents become misses until the return refills them; the region
     // is priced by the cache's REAL slot offsets, so a variable-size cache is priced by what it really holds.
@@ -675,13 +942,19 @@ bool alloc_for(ExpertDispatch& d, PrefillState& s, const strata::kernels::cpu::N
     dc((void**) &s.gu, gu_bytes);
     dc((void**) &s.h, h_bytes);
     dc((void**) &s.dm, dm_bytes);
-    dc((void**) &s.grp_gu, grp_gu_bytes);
-    dc((void**) &s.grp_d, grp_d_bytes);
+    dc((void**) &s.grp_gu, grp_gu_bytes * (size_t) grp_sets);
+    dc((void**) &s.grp_d, grp_d_bytes * (size_t) grp_sets);
+    s.grp_gu_alloc = grp_gu_bytes;
+    s.grp_d_alloc = grp_d_bytes;
+    s.cdg_alloc = cdg_alloc_now;
     dc((void**) &s.weights_dev, (size_t) n * sizeof(float));
     s.ring_d = new uint8_t*[s.ring]();
     s.copied = new cudaEvent_t[s.ring]();
     s.used = new cudaEvent_t[s.ring]();
-    if (s.borrowed) {
+    if (cdg_alloc_now) {
+        // Task 74: no device ring on the direct path (the placeholder views stay null).
+        s.ring_block = nullptr;
+    } else if (s.borrowed) {
         s.ring_block = (uint8_t*) take(ring_dev_bytes);
         ok = ok && s.ring_block != nullptr;
     } else {
@@ -696,10 +969,66 @@ bool alloc_for(ExpertDispatch& d, PrefillState& s, const strata::kernels::cpu::N
     ok = ok && cudaHostAlloc((void**) &s.src_h, (size_t) n * sizeof(int32_t), cudaHostAllocDefault) == cudaSuccess;
     ok = ok && cudaHostAlloc((void**) &s.weights_h, (size_t) n * sizeof(float), cudaHostAllocDefault) == cudaSuccess;
     ok = ok && cudaHostAlloc((void**) &s.entry_h, (size_t) n * sizeof(int32_t), cudaHostAllocDefault) == cudaSuccess;
-    for (int i = 0; i < s.ring && ok; ++i) {
-        ok = cudaEventCreateWithFlags(&s.copied[i], cudaEventDisableTiming) == cudaSuccess;
-        ok = ok && cudaEventCreateWithFlags(&s.used[i], cudaEventDisableTiming) == cudaSuccess;
-        ok = ok && cudaEventRecord(s.used[i], (cudaStream_t) 0) == cudaSuccess;
+    if (prefetch_v1_enabled()) {
+        // Prefetch v2 (default off): a dedicated second stager instance whose pinned ring buffers ARE the side
+        // pool (ring = floor(192 MiB / largest layer blob), strict pinned, same sleep/propagate policy as the
+        // main stager).  No ring->pool drain exists in v2: the group loop reads the pf ring buffer directly.
+        // A failed pin/event disables the prefetch with one note (the plain path is unchanged).
+        const auto& pf_lay = strata::kernels::cpu::expert_layout();
+        size_t max_blob = 0;
+        for (size_t l = 0; l < pf_lay.fmt.size(); ++l) max_blob = std::max(max_blob, (size_t) pf_lay.blob_bytes((int64_t) l));
+        s.pf_stride = max_blob;
+        if (s.pf_stager == nullptr && max_blob > 0) {
+            const int pf_ring = (int) std::min<int64_t>(256, (int64_t) ((192ull << 20) / max_blob));
+            s.pf_stager = std::make_unique<strata::prefill::ColdStager>();
+            strata::prefill::ColdStagerPolicy pol;
+            pol.ring = pf_ring;
+            pol.sleep = 1;              // same as the main stager
+            pol.strict_pinned = true;   // pinned or fail
+            pol.propagate_error = true; // wait() -> nullptr, no abort
+            pol.perf_counters = false;  // the pf instance's scopes are not printed; no atomics
+            pol.write_combined = false;
+            s.pf_stager->batch = 1;     // same claim granularity as the main stager
+            if (pf_ring < 2 || !s.pf_stager->init(s.pf_stride, 4, pol)) {
+                s.pf_stager.reset();
+                std::fprintf(stderr, "strata qwen35: prefetch v2: the side stager could not be initialised "
+                                     "(pinned ring); the prefetch is disabled for this workspace\n");
+            } else {
+                s.pf_slots = s.pf_stager->kRing;
+            }
+        }
+        if (s.pf_ev == nullptr) {
+            if (cudaEventCreateWithFlags(&s.pf_ev, cudaEventDisableTiming) != cudaSuccess) {
+                s.pf_ev = nullptr;
+                std::fprintf(stderr, "strata qwen35: prefetch v2: the reuse-guard event could not be created; the "
+                                     "prefetch is disabled for this workspace\n");
+            }
+        }
+        if (s.c1_bits.empty()) {
+            s.c1_bits.assign(pf_lay.fmt.size() * 8, 0);
+            s.c1_set.assign(pf_lay.fmt.size(), 0);
+        }
+        std::fill(s.c1_set.begin(), s.c1_set.end(), 0);   // a new workspace is a new request: no stale bitmap
+        if (s.pf_slot.empty()) s.pf_slot.assign((size_t) pf_lay.n_expert, -1);
+        s.pf_layers = s.pf_bytes = s.pf_used_bytes = 0;
+        s.pf_skipped_pool = s.pf_skipped_empty = s.pf_member_fallbacks = s.pf_peak_bytes = 0;
+        s.pf_wait_ms = s.pf_drain_ms = 0;
+    }
+    if (cdg_alloc_now) {
+        // Task 74 ping-pong events: grp_done (copy reuse gate) and grp_ready (compute read gate), both
+        // pre-completed on stream 0 so the first groups' waits are valid without a special case.
+        for (int i = 0; i < 2 && ok; ++i) {
+            ok = cudaEventCreateWithFlags(&s.grp_ready[i], cudaEventDisableTiming) == cudaSuccess;
+            ok = ok && cudaEventCreateWithFlags(&s.grp_done[i], cudaEventDisableTiming) == cudaSuccess;
+            ok = ok && cudaEventRecord(s.grp_done[i], (cudaStream_t) 0) == cudaSuccess;
+            ok = ok && cudaEventRecord(s.grp_ready[i], (cudaStream_t) 0) == cudaSuccess;
+        }
+    } else {
+        for (int i = 0; i < s.ring && ok; ++i) {
+            ok = cudaEventCreateWithFlags(&s.copied[i], cudaEventDisableTiming) == cudaSuccess;
+            ok = ok && cudaEventCreateWithFlags(&s.used[i], cudaEventDisableTiming) == cudaSuccess;
+            ok = ok && cudaEventRecord(s.used[i], (cudaStream_t) 0) == cudaSuccess;
+        }
     }
     ok = ok && cudaStreamCreateWithFlags(&s.copy, cudaStreamNonBlocking) == cudaSuccess;
     // The ORIGINAL ColdStager producer (no Qwen-specific stager): one pinned 16-buffer ring, one worker that
@@ -714,7 +1043,7 @@ bool alloc_for(ExpertDispatch& d, PrefillState& s, const strata::kernels::cpu::N
     s.stager = std::make_unique<strata::prefill::ColdStager>();
     {
         strata::prefill::ColdStagerPolicy pol;
-        pol.ring = s.ring;          // 16: the same host ring the old ring_h held (2x accounting unchanged)
+        pol.ring = stg_ring;        // task 84 gate above: producer host lookahead (default 16)
         pol.sleep = 1;              // sleeping issued waits + BlockingSync dma_done events
         pol.strict_pinned = true;   // pinned or fail (no pageable fallback on the GPU prompt path)
         pol.propagate_error = true; // latch failures, wait() -> nullptr, no abort
@@ -723,11 +1052,16 @@ bool alloc_for(ExpertDispatch& d, PrefillState& s, const strata::kernels::cpu::N
         // verifies the real cudaHostAllocWriteCombined flags and never falls back to a cached/pageable ring;
         // the WC + STAGER_CHECK combination is refused before the stager is created.
         pol.write_combined = stager_wc_requested();
-        // Exact-value opt-in: "2" or "3" select that many producers; unset or any other value keeps the frozen
-        // single-producer default (no clamp grid, no default change; 4/5 are not accepted).
+        // Producer count (task 88 default, whitelist extended by task 89): the exact values
+        // "1"/"2"/"3"/"4"/"5" select that many producers; unset or any other value keeps the confirmed
+        // default 4 (task 87/88 product-condition medians >= 1000 with producer=4).  N=5's stager invariants
+        // were statically audited in task 89 (per-job buffer double protection, single-writer ready, join,
+        // no new multi-writer pair, no new wait cycle) before being accepted here.
         const char* stg_env = std::getenv("STRATA_QWEN35_STAGER_THREADS");
-        s.stager_threads = (stg_env != nullptr && std::strcmp(stg_env, "2") == 0) ? 2
-                         : (stg_env != nullptr && std::strcmp(stg_env, "3") == 0) ? 3 : 1;
+        s.stager_threads = (stg_env != nullptr && std::strcmp(stg_env, "1") == 0) ? 1
+                         : (stg_env != nullptr && std::strcmp(stg_env, "2") == 0) ? 2
+                         : (stg_env != nullptr && std::strcmp(stg_env, "3") == 0) ? 3
+                         : (stg_env != nullptr && std::strcmp(stg_env, "5") == 0) ? 5 : 4;
         ok = ok && s.stager->init(s.blob_cap, s.stager_threads, pol);
     }
     {
@@ -759,21 +1093,62 @@ bool alloc_for(ExpertDispatch& d, PrefillState& s, const strata::kernels::cpu::N
     return true;
 }
 
+// Task 69: the same combine, able to read the weights through the ORIGINAL tensor's byte strides instead of
+// the host-repacked contiguous copy (w_raw == nullptr keeps the original indexing exactly).  The host
+// validates that the raw base and both strides are float-aligned before the raw form is ever used.
 __global__ void combine_scatter_kernel(const float* __restrict__ dm, const float* __restrict__ w,
                                        const int32_t* __restrict__ entry_of_tok, float* __restrict__ out,
-                                       int64_t N, int K) {
+                                       int64_t N, int K, const char* __restrict__ w_raw, int64_t w_nb1,
+                                       int64_t w_nb2) {
     const int64_t t = blockIdx.x;
     for (int64_t j = threadIdx.x; j < N; j += blockDim.x) {
         float acc = 0.0f;
         for (int r = 0; r < K; ++r) {
             const int32_t e = entry_of_tok[t * K + r];
-            acc += w[t * K + r] * dm[(int64_t) e * N + j];
+            const float wv = w_raw != nullptr
+                                 ? *(const float*) (w_raw + (size_t) t * (size_t) w_nb2 + (size_t) r * (size_t) w_nb1)
+                                 : w[t * K + r];
+            acc += wv * dm[(int64_t) e * N + j];
         }
         out[t * N + j] = acc;
     }
 }
 
+// Task 69 check helper: pack the raw strided weights of the first `rows` tokens into a small contiguous
+// [rows, K] scratch (the same addresses the host unpack used to read).
+__global__ void pack_weights_raw_kernel(const char* __restrict__ w_raw, int64_t w_nb1, int64_t w_nb2,
+                                        float* __restrict__ dst, int K) {
+    const int64_t t = blockIdx.x;
+    for (int r = threadIdx.x; r < K; r += blockDim.x) {
+        std::memcpy(&dst[t * K + r], w_raw + (size_t) t * (size_t) w_nb2 + (size_t) r * (size_t) w_nb1,
+                    sizeof(float));
+    }
+}
+
+// Task 72: pack the router ids from llama's strided argsort view into a contiguous [T, K] int32 scratch.
+// i covers exactly T*K elements; the rank index inside a token uses the contiguous int32 stride, matching the
+// host reader's original rank stride.
+__global__ void pack_router_ids_kernel(const char* __restrict__ ids_dev, int64_t ids_nb1, int K,
+                                       int32_t* __restrict__ out, int64_t total) {
+    const int64_t i = (int64_t) blockIdx.x * blockDim.x + threadIdx.x;
+    if (i >= total) return;
+    const int64_t t = i / K;
+    const int64_t r = i % K;
+    std::memcpy(&out[i], ids_dev + (size_t) t * (size_t) ids_nb1 + (size_t) r * sizeof(int32_t),
+                sizeof(int32_t));
+}
+
 }  // namespace
+
+/// Task 127 (diagnostic, exact STRATA_QWEN35_D2H_SPLIT=1, default off): the bridge queries the gate and, when
+/// it is on, hands over the current prompt call's `pre` event handle just before invoking the prompt path.
+/// Both functions are fully inert when the gate is unset: the accessor returns false and the bridge then makes
+/// no setter call at all (no CUDA call, no output, no timing change on the default path).
+bool qwen_prefill_d2h_split_on() { return d2h_split_enabled(); }
+void qwen_prefill_d2h_split_set_pre(void* ev) {
+    if (!d2h_split_enabled()) return;
+    g_d2h_split_pre = (cudaEvent_t) ev;
+}
 
 bool qwen_prefill_mmq_available() { return strata::prefill::mmq::built(); }
 
@@ -799,6 +1174,23 @@ bool qwen_prefill_experts(ExpertDispatch& d, int64_t layer, int64_t T, const voi
     const int64_t k = d.native_k;
     if (T < 1 || T > 4096) { err = "the prompt expert path's token count is out of range"; return false; }
     const int64_t n = T * k;
+    // Task 69 stays-device gate (span check revised by task 72): validate the raw router weights view before
+    // anything runs.  The base must be float-aligned, both strides positive float multiples, and the full
+    // address span must pass the CHECKED arithmetic below (no last*stride multiply may overflow, and the base
+    // plus span may not wrap).  A single outer/inner element is NOT rejected just because a stride is larger
+    // than the span.
+    const bool rw_device = router_weights_device_on();
+    if (rw_device) {
+        const uintptr_t w_base = (uintptr_t) weights_dev;
+        size_t w_span = 0;
+        if (w_base == 0 || (w_base % sizeof(float)) != 0 || w_nb1 <= 0 || w_nb2 <= 0 ||
+            (w_nb1 % (int64_t) sizeof(float)) != 0 || (w_nb2 % (int64_t) sizeof(float)) != 0 ||
+            !checked_span(w_base, (size_t) w_nb2, (size_t) (T - 1), (size_t) w_nb1, (size_t) (k - 1),
+                          sizeof(float), w_span)) {
+            err = "the prompt expert path's router weights view has an unsupported alignment, stride or size";
+            return false;
+        }
+    }
     PrefillState* s = state(d);
     if (s == nullptr) {
         s = new PrefillState();
@@ -812,17 +1204,62 @@ bool qwen_prefill_experts(ExpertDispatch& d, int64_t layer, int64_t T, const voi
         d.failed = true;
         return false;
     }
+    if (prefetch_v1_enabled() && stager_wc_requested()) {
+        // Prefetch v2 uses a second strict-pinned stager whose ring is never write-combined; the combination
+        // with the main stager's WC ring is refused anyway to keep the verified surface small (first version).
+        err = "STRATA_QWEN35_PREFETCH_V1 and STRATA_QWEN35_STAGER_WC cannot be combined (first version)";
+        d.failed = true;
+        return false;
+    }
+    if (prefetch_v1_enabled() && cold_direct_group_on()) {
+        err = "STRATA_QWEN35_PREFETCH_V1 cannot be combined with STRATA_QWEN35_COLD_DIRECT_GROUP (first version)";
+        d.failed = true;
+        return false;
+    }
     if (s->T_cap < T || s->N != f.n_embd || s->FF != f.n_ff || s->K != k || s->loan_returned) {
         if (!alloc_for(d, *s, f, T)) { err = "the prompt expert workspace could not be allocated"; return false; }
     }
     // Per-layer strides (the buffers are sized for the largest format).
     s->gu_group = strata::prefill::mmq::matrix_bytes(f.gu_type, 2 * f.n_ff, f.n_embd);
     s->d_group = strata::prefill::mmq::matrix_bytes(f.d_type, f.n_embd, f.n_ff);
+    // Task 72 packed ids path, validated before any submission: the ids view must be int32-aligned with a
+    // positive int32-multiple row stride that covers its K ranks, the full strided span must pass the checked
+    // arithmetic, and both the temporary pack target (s->src, sized for T_cap*K int32 and free until the
+    // row-map upload overwrites it on this same stream) and the D2H staging (ids_raw) must hold T*K int32.
+    // Unsupported parameters fail the call explicitly: no blind fallback, no error clearing.
+    const bool pid = packed_ids_on();
+    const size_t packed_bytes = (size_t) n * sizeof(int32_t);
+    if (pid) {
+        const uintptr_t i_base = (uintptr_t) ids_dev;
+        size_t i_span = 0;
+        const size_t pid_cap = (size_t) s->T_cap * (size_t) k * sizeof(int32_t);
+        if (i_base == 0 || (i_base % sizeof(int32_t)) != 0 || ids_nb1 <= 0 ||
+            (ids_nb1 % (int64_t) sizeof(int32_t)) != 0 ||
+            ids_nb1 < (int64_t) k * (int64_t) sizeof(int32_t) ||
+            !checked_span(i_base, (size_t) ids_nb1, (size_t) (T - 1), sizeof(int32_t), (size_t) (k - 1),
+                          sizeof(int32_t), i_span) ||
+            s->ids_raw == nullptr || (size_t) s->ids_raw_bytes < packed_bytes || pid_cap < packed_bytes) {
+            err = "the prompt expert path's packed router ids view has an unsupported alignment, stride or size";
+            return false;
+        }
+    }
+    const bool pid_chk = pid && packed_ids_check_on();
+    bool pid_check_this = false;
+    std::vector<int32_t> pid_ref;
+    if (pid_chk && g_pid_seen_n < 2) {
+        bool seen = false;
+        for (int i = 0; i < g_pid_seen_n; ++i)
+            if (g_pid_seen_T[i] == T) { seen = true; break; }
+        pid_check_this = !seen;
+    }
     const bool trace = std::getenv("STRATA_QWEN35_TRACE") != nullptr;
     if (trace) std::fprintf(stderr, "qwen prefill trace: layer %lld T %lld x_nb1 %lld enter (ring %d, blob %zu)\n", (long long) layer, (long long) T, (long long) x_nb1, s->ring, s->blob_cap);
     const auto t0 = std::chrono::steady_clock::now();
     cudaStream_t cs = (cudaStream_t) stream;
     const bool ph = prefill_phases_enabled();
+    // The layer's first call is chunk1's; every later call of the same layer is the chunk2 pass (the prefetch's
+    // target).  Fixed 64-entry table: no allocation, no behavior change when nothing reads it.
+    const bool pass2 = (size_t) layer < sizeof(s->layer_pass) && s->layer_pass[(size_t) layer]++ > 0;
     const bool gg_stats = gather_stats_enabled();
     const bool gg_chk = gather_check_enabled();
     const bool stg_chk = stager_check_enabled();
@@ -866,19 +1303,80 @@ bool qwen_prefill_experts(ExpertDispatch& d, int64_t layer, int64_t T, const voi
         }
         s->weights_raw_bytes = (int64_t) weights_raw_bytes;
     }
+    // ---- Prefetch v2 (exact STRATA_QWEN35_PREFETCH_V1=1; default off): a chunk2 call starts the dedicated
+    // side stager on this layer's PREDICTED cold set (chunk1's non-empty experts of the same layer, minus the
+    // ones the frozen cache holds) AFTER the ids D2H below, so the side producers' copies overlap the grouping
+    // and the formal generation instead of competing with the pack/D2H host path (task 102 measured that
+    // competition as a real +245 ms).  Its pinned ring buffers ARE the side pool: no ring->pool drain exists.
+    // Everything here is gated: unset, this block does not run and nothing is allocated or touched.
+    const bool pf_on = prefetch_v1_enabled() && s->pf_stager != nullptr && s->pf_ev != nullptr &&
+                       d.cache != nullptr && (size_t) layer < s->c1_set.size() &&
+                       s->c1_set[(size_t) layer] != 0;
+    int64_t pf_n = 0;
+    size_t pf_blob = 0;
+    std::vector<int32_t> pf_experts;
+    // The prefetch generation, if started, is always finished before this call returns (its own stager
+    // instance; an early error return finishes it here).
+    struct PfGenDone {
+        strata::prefill::ColdStager* st = nullptr;
+        ~PfGenDone() { if (st != nullptr) st->finish(); }
+    } pf_gen_done;
     // ONE work-stream sync covers BOTH original strided D2H copies (ids first, then weights): the ids wait that
     // used to sit between them was redundant - both copies ride `cs`, whose `pre` ordering (recorded by the
     // bridge) already gates the upstream graph.  Strides, pinned capacities and failure handling are the
     // originals; no cudaDeviceSynchronize and no other stream's data is read early.
     {
         PhaseScope ph_d2h(ph, &s->ph_d2h_ms);
-        if (cudaMemcpyAsync(s->ids_raw, ids_dev, ids_raw_bytes, cudaMemcpyDeviceToHost, cs) != cudaSuccess) {
-            err = "the prompt expert path's router ids did not transfer";
-            return false;
+        // Task 127 (gate on only): the split's window start is the same boundary as the PhaseScope above, so
+        // prefix_wait + ids_tail fills the existing d2h_sync window by construction.  Off: nothing reads this.
+        const bool ds = d2h_split_enabled();
+        const auto ds_t0 = ds ? std::chrono::steady_clock::now() : std::chrono::steady_clock::time_point{};
+        if (pid) {
+            // Pack the real strided ids into the temporary s->src region on this work stream (the row-map H2D
+            // below overwrites it on the same stream, after this read), then move only T*K*4 bytes to the host.
+            const int64_t total = n;
+            const unsigned blocks = (unsigned) ((total + kThreads - 1) / kThreads);
+            pack_router_ids_kernel<<<dim3(blocks), kThreads, 0, cs>>>((const char*) ids_dev, ids_nb1, (int) k,
+                                                                      s->src, total);
+            if (cudaGetLastError() != cudaSuccess) {
+                err = "the prompt expert path's router ids pack launch failed";
+                d.failed = true;
+                return false;
+            }
+            if (cudaMemcpyAsync(s->ids_raw, s->src, packed_bytes, cudaMemcpyDeviceToHost, cs) != cudaSuccess) {
+                err = "the prompt expert path's packed router ids did not transfer";
+                d.failed = true;
+                return false;
+            }
+            g_pid_packed_d2h_bytes += (long long) packed_bytes;
+            if (pid_check_this) {
+                // B-only reference: the same tokens' ids straight from the strided view, row by row, into a
+                // host scratch; compared after the sync.  Bytes are counted separately and are never part of
+                // the normal path's totals.
+                pid_ref.assign((size_t) n, 0);
+                if (cudaMemcpy2DAsync(pid_ref.data(), (size_t) k * sizeof(int32_t), ids_dev, (size_t) ids_nb1,
+                                      (size_t) k * sizeof(int32_t), (size_t) T, cudaMemcpyDeviceToHost,
+                                      cs) != cudaSuccess) {
+                    err = "the packed ids check's raw reference copy failed";
+                    d.failed = true;
+                    return false;
+                }
+                g_pid_diag_d2h_bytes += (long long) packed_bytes;
+            }
+        } else {
+            if (cudaMemcpyAsync(s->ids_raw, ids_dev, ids_raw_bytes, cudaMemcpyDeviceToHost, cs) != cudaSuccess) {
+                err = "the prompt expert path's router ids did not transfer";
+                return false;
+            }
+            g_pid_raw_d2h_bytes += (long long) ids_raw_bytes;
         }
-        if (cudaMemcpyAsync(s->weights_raw, weights_dev, weights_raw_bytes, cudaMemcpyDeviceToHost, cs) != cudaSuccess) {
-            err = "the prompt expert path's router weights did not transfer";
-            return false;
+        if (!rw_device) {
+            if (cudaMemcpyAsync(s->weights_raw, weights_dev, weights_raw_bytes, cudaMemcpyDeviceToHost, cs) !=
+                cudaSuccess) {
+                err = "the prompt expert path's router weights did not transfer";
+                return false;
+            }
+            g_rwd_weights_d2h_bytes += (long long) weights_raw_bytes;
         }
         // Route probe A/C (default off): the expert input is read on the work stream at the same sync as the
         // router ids/weights - valid because `pre` orders the graph prefix before both.  Only the H valid f32 of
@@ -894,8 +1392,104 @@ bool qwen_prefill_experts(ExpertDispatch& d, int64_t layer, int64_t T, const voi
                 return false;
             }
         }
+        // Task 127 (gate on only): wait for the call's `pre` graph-prefix boundary first, then for the work
+        // stream.  The waits are sequential; the work stream already ordered itself behind `pre` (the bridge's
+        // cudaStreamWaitEvent), so the host total equals the original single sync's max(pre, pack+D2H) - the
+        // split only re-attributes the one existing d2h_sync window.  A failed prefix wait is counted (never a
+        // zero); the stream sync below still provides the original total ordering.  Off: the original sync.
+        bool ds_waited = false;
+        double ds_prefix = 0.0;
+        if (ds) {
+            if (g_d2h_split_pre != nullptr) {
+                if (cudaEventSynchronize(g_d2h_split_pre) == cudaSuccess) {
+                    ds_prefix = ms_since(ds_t0);
+                    ds_waited = true;
+                } else {
+                    ++s->ds_event_wait_failed;
+                }
+            } else {
+                ++s->ds_pre_missing;
+            }
+        }
         if (cudaStreamSynchronize(cs) != cudaSuccess) {
             err = "the prompt expert path's router ids/weights did not complete";
+            return false;
+        }
+        if (ds_waited) {
+            const double ds_tail = ms_since(ds_t0) - ds_prefix;
+            s->ds_prefix_ms += ds_prefix;
+            s->ds_tail_ms += ds_tail;
+            if (s->ds_calls == 0) {
+                s->ds_prefix_min = s->ds_prefix_max = ds_prefix;
+                s->ds_tail_min = s->ds_tail_max = ds_tail;
+            } else {
+                if (ds_prefix < s->ds_prefix_min) s->ds_prefix_min = ds_prefix;
+                if (ds_prefix > s->ds_prefix_max) s->ds_prefix_max = ds_prefix;
+                if (ds_tail < s->ds_tail_min) s->ds_tail_min = ds_tail;
+                if (ds_tail > s->ds_tail_max) s->ds_tail_max = ds_tail;
+            }
+            ++s->ds_calls;
+        }
+    }
+    // Prefetch v2 start (default off; after the ids D2H, before the grouping): the side stager's pinned ring
+    // buffers are the pool.  The previous layer's side H2Ds must have completed before their buffers are
+    // overwritten (pf_ev is recorded after every side H2D enqueue; the first prefetch layer skips the guard).
+    if (pf_on) {
+        if (s->pf_ev_used && cudaEventSynchronize(s->pf_ev) != cudaSuccess) {
+            err = "the prefetch side ring's previous H2D did not complete";
+            d.failed = true;
+            return false;
+        }
+        pf_blob = (size_t) lay.blob_bytes(layer);
+        std::fill(s->pf_slot.begin(), s->pf_slot.end(), (int32_t) -1);
+        const uint32_t* bits = s->c1_bits.data() + (size_t) layer * 8;
+        std::vector<strata::prefill::ColdStager::Job> pf_jobs;
+        for (int64_t e = 0; e < d.n_expert; ++e) {
+            if ((bits[(size_t) e >> 5] & (1u << ((size_t) e & 31u))) == 0) continue;
+            const int32_t slot = d.cache->slot_of(layer, (int32_t) e);
+            if (slot >= 0) continue;   // resident: nothing to preheat
+            if (d.src->transient(layer, (int32_t) e)) {
+                pf_jobs.push_back({nullptr, pf_blob, d.src, (int32_t) layer, (int32_t) e});
+            } else {
+                const uint8_t* b = d.src->blob_stable(layer, (int32_t) e);
+                if (b == nullptr) { err = "the expert source has no stable blob"; d.failed = true; return false; }
+                pf_jobs.push_back({b, pf_blob, nullptr, (int32_t) layer, (int32_t) e});
+            }
+            pf_experts.push_back((int32_t) e);
+        }
+        pf_n = (int64_t) pf_jobs.size();
+        if (pf_n == 0) {
+            ++s->pf_skipped_empty;   // nothing predicted: the whole layer uses the plain path
+        } else if (pf_n > s->pf_slots) {
+            ++s->pf_skipped_pool;    // the predicted set does not fit the side ring: give the layer up, counted
+        } else {
+            s->pf_stager->start(std::move(pf_jobs));
+            pf_gen_done.st = s->pf_stager.get();
+            // v2: no drain - the side stager's job index IS the slot (its ring buffer i holds pf_experts[i]);
+            // the formal generation skips these experts and the group loop waits the side stager directly.
+            for (size_t i = 0; i < pf_experts.size(); ++i)
+                s->pf_slot[(size_t) pf_experts[i]] = (int32_t) i;
+            ++s->pf_layers;
+            s->pf_bytes += pf_n * (int64_t) pf_blob;
+            s->pf_peak_bytes = std::max(s->pf_peak_bytes, pf_n * (int64_t) pf_blob);
+        }
+    }
+    if (pid_check_this) {
+        // B-only exact comparison: the contiguous packed staging vs the raw strided reference copied in the
+        // same call.  Any difference (or a failed copy above) fails the call explicitly - the check is never a
+        // pass-by-counting path, and its bytes are separate from the normal path's totals.
+        const int32_t* packed = (const int32_t*) (const void*) s->ids_raw;
+        int64_t bad = 0;
+        for (size_t i = 0; i < pid_ref.size(); ++i)
+            if (pid_ref[i] != packed[i]) ++bad;
+        g_pid_check_shapes += 1;
+        g_pid_check_elems += (long long) n;
+        g_pid_check_fail += bad;
+        if (g_pid_check_nb1 < 0) g_pid_check_nb1 = (long long) ids_nb1;
+        g_pid_seen_T[g_pid_seen_n++] = T;
+        if (bad != 0) {
+            err = "the packed router ids check found different ids";
+            d.failed = true;
             return false;
         }
     }
@@ -906,24 +1500,35 @@ bool qwen_prefill_experts(ExpertDispatch& d, int64_t layer, int64_t T, const voi
     if (gpu_ev && s->evt_pairs > 0) ev_collect(*s);
     // Row histogram (default off): host counts only, accumulated per layer and printed once at close.
     const bool rowhist = rowhist_enabled();
-    // One-shot layer capture (default off): first T==2048 call of layer 16 only.
+    // One-shot layer capture (default off): the first T==2048 call of each selected layer (default: layer 16).
     const char* cap_dir = layer_capture_dir();
-    s->cap_this_call = cap_dir != nullptr && (int64_t) layer == 16 && T == 2048 && !s->cap_done;
+    s->cap_this_call = false;
+    if (cap_dir != nullptr && (size_t) layer < (size_t) lay.fmt.size()) {
+        if (s->cap_done_layers.size() != (size_t) lay.fmt.size())
+            s->cap_done_layers.assign((size_t) lay.fmt.size(), 0);
+        s->cap_this_call = T == 2048 && capture_layer_selected((int64_t) layer) &&
+                           !s->cap_done_layers[(size_t) layer];
+    }
     auto id_at = [&](int64_t t, int64_t r) {
         int32_t v;
-        std::memcpy(&v, s->ids_raw + (size_t) t * (size_t) ids_nb1 + (size_t) r * sizeof(int32_t), sizeof(v));
+        const size_t off = pid ? (size_t) (t * k + r) * sizeof(int32_t)
+                               : (size_t) t * (size_t) ids_nb1 + (size_t) r * sizeof(int32_t);
+        std::memcpy(&v, s->ids_raw + off, sizeof(v));
         return v;
     };
     const std::chrono::steady_clock::time_point ph_group0 =
         ph ? std::chrono::steady_clock::now() : std::chrono::steady_clock::time_point{};
-    for (int64_t t = 0; t < T; ++t)
-        for (int64_t r = 0; r < k; ++r)
-            std::memcpy(&s->weights_h[(size_t) (t * k + r)],
-                        s->weights_raw + (size_t) t * (size_t) w_nb2 + (size_t) r * (size_t) w_nb1, sizeof(float));
-    if (cudaMemcpyAsync(s->weights_dev, s->weights_h, (size_t) n * sizeof(float), cudaMemcpyHostToDevice, cs) !=
-        cudaSuccess) {
-        err = "the prompt expert path's router weights did not upload";
-        return false;
+    if (!rw_device) {
+        for (int64_t t = 0; t < T; ++t)
+            for (int64_t r = 0; r < k; ++r)
+                std::memcpy(&s->weights_h[(size_t) (t * k + r)],
+                            s->weights_raw + (size_t) t * (size_t) w_nb2 + (size_t) r * (size_t) w_nb1, sizeof(float));
+        if (cudaMemcpyAsync(s->weights_dev, s->weights_h, (size_t) n * sizeof(float), cudaMemcpyHostToDevice, cs) !=
+            cudaSuccess) {
+            err = "the prompt expert path's router weights did not upload";
+            return false;
+        }
+        g_rwd_weights_h2d_bytes += (long long) n * (long long) sizeof(float);
     }
     if (trace) std::fprintf(stderr, "qwen prefill trace: ids back\n");
     // Group the entries by expert (ascending), building the expert-sorted row maps.
@@ -990,6 +1595,52 @@ bool qwen_prefill_experts(ExpertDispatch& d, int64_t layer, int64_t T, const voi
         s->rh_groups[(size_t) layer] = ((int64_t) s->order.size() + kGroup - 1) / kGroup;
         ++s->rh_layers;
     }
+    // Per-call routing dump (diagnostic, default off; exact non-empty STRATA_QWEN35_ROUTE_DUMP=<dir>): one
+    // header line + one line per non-empty expert, appended to <dir>/route-dump.jsonl at the rowhist point
+    // (cnt/order/slot_of all final).  Host only: no CUDA call, no event, no sync, no launch-order change.  A
+    // write failure is a real failure - it reports and returns through the existing error path.
+    if (const char* rd_dir = route_dump_dir()) {
+        if (s->rd_dir == nullptr) s->rd_dir = rd_dir;
+        if (!s->rd_fp.is_open()) {
+            std::string rd_path = rd_dir;
+            if (!rd_path.empty() && rd_path.back() != '/' && rd_path.back() != '\\') rd_path += '/';
+            rd_path += "route-dump.jsonl";
+            s->rd_fp.open(rd_path, std::ios::app);
+            if (!s->rd_fp.is_open()) {
+                err = "the route dump could not be opened: " + rd_path;
+                d.failed = true;
+                return false;
+            }
+        }
+        int64_t n_cold = 0;
+        for (int32_t e : s->order)
+            if ((d.cache != nullptr ? d.cache->slot_of(layer, e) : (int32_t) -1) < 0) ++n_cold;
+        s->rd_fp << "{\"call\":" << (long long) s->rd_calls << ",\"layer\":" << (long long) layer
+                 << ",\"T\":" << (long long) T << ",\"n_experts\":" << (long long) s->order.size()
+                 << ",\"n_cold\":" << (long long) n_cold << "}\n";
+        for (int64_t e = 0; e < d.n_expert; ++e) {
+            const int64_t c = s->cnt[(size_t) e];
+            if (c <= 0) continue;
+            const int32_t slot = d.cache != nullptr ? d.cache->slot_of(layer, (int32_t) e) : (int32_t) -1;
+            s->rd_fp << "{\"expert\":" << (long long) e << ",\"count\":" << (long long) c
+                     << ",\"resident\":" << (slot >= 0 ? 1 : 0) << "}\n";
+        }
+        ++s->rd_calls;
+        s->rd_rows += (int64_t) s->order.size();
+        s->rd_fp.flush();
+        if (!s->rd_fp.good()) {
+            err = "the route dump could not be written";
+            d.failed = true;
+            return false;
+        }
+    }
+    // Prefetch v1 predictor source (default off): chunk1's non-empty experts per layer, as a 256-bit bitmap.
+    // Recorded on the FIRST call of the layer only (chunk2's call sees it set and prefetches instead).
+    if (prefetch_v1_enabled() && (size_t) layer < s->c1_set.size() && s->c1_set[(size_t) layer] == 0) {
+        uint32_t* bits = s->c1_bits.data() + (size_t) layer * 8;
+        for (int32_t e : s->order) bits[(size_t) e >> 5] |= (1u << ((size_t) e & 31u));
+        s->c1_set[(size_t) layer] = 1;
+    }
     if (route_fp_enabled()) {
         RouteFpRec rec;
         rec.call = s->fp_calls++;
@@ -1005,6 +1656,20 @@ bool qwen_prefill_experts(ExpertDispatch& d, int64_t layer, int64_t T, const voi
         uint64_t ih = kFnvSeed;
         for (int64_t t = 0; t < T; ++t)
             for (int64_t r = 0; r < k; ++r) { const int32_t v = id_at(t, r); ih = fnv_bytes(ih, &v, sizeof(v)); }
+        if (rw_device) {
+            // The ON path keeps no host weights: the fingerprint is a diagnostic, so it pays for its own
+            // explicit copy (counted separately, never presented as the normal path's bytes).
+            if (cudaMemcpyAsync(s->weights_raw, weights_dev, weights_raw_bytes, cudaMemcpyDeviceToHost, cs) !=
+                cudaSuccess) {
+                err = "the route fp diagnostic's weights copy failed";
+                return false;
+            }
+            if (cudaStreamSynchronize(cs) != cudaSuccess) {
+                err = "the route fp diagnostic's weights copy did not complete";
+                return false;
+            }
+            g_rwd_diag_d2h_bytes += (long long) weights_raw_bytes;
+        }
         uint64_t wh = kFnvSeed;
         for (int64_t t = 0; t < T; ++t)
             for (int64_t r = 0; r < k; ++r) {
@@ -1062,6 +1727,9 @@ bool qwen_prefill_experts(ExpertDispatch& d, int64_t layer, int64_t T, const voi
         const int32_t e = s->order[(size_t) j];
         const int32_t slot = d.cache != nullptr ? d.cache->slot_of(layer, e) : (int32_t) -1;
         if (slot >= 0) continue;
+        // Prefetch v2: a predicted member is served by the side stager (its ring buffer is the pool) - it gets
+        // no main-stager job and the group loop takes it from the side ring.  Anything else takes the plain path.
+        if (pf_on && (size_t) e < s->pf_slot.size() && s->pf_slot[(size_t) e] >= 0) continue;
         s->job_of[(size_t) j] = (int32_t) s->jobs.size();
         if (d.src->transient(layer, e)) {   // the source assembles the blob (a GGUF read in place)
             s->jobs.push_back({nullptr, (size_t) lay.blob_bytes(layer), d.src, (int32_t) layer, e});
@@ -1101,6 +1769,8 @@ bool qwen_prefill_experts(ExpertDispatch& d, int64_t layer, int64_t T, const voi
         s->ch_pairs += ch_n;
         s->ch_bytes += ch_bytes;
     }
+    // Prefetch v2: no drain exists.  The side stager's ring buffers stay the pool; the group loop waits its
+    // jobs directly (side arm below) and the generation is finished by the PfGenDone guard at scope exit.
     const bool stager_on = !s->jobs.empty();
     if (stager_on) s->stager->start(std::move(s->jobs));
     struct LayerStagerDone {
@@ -1108,9 +1778,56 @@ bool qwen_prefill_experts(ExpertDispatch& d, int64_t layer, int64_t T, const voi
         ~LayerStagerDone() { if (st != nullptr) st->finish(); }
     } layer_stager_done{stager_on ? s->stager.get() : nullptr};
     std::vector<int32_t> bh, rel;
+    // Task 74 direct-to-group: per-layer layout proof (before any launch) and combination gates.  mode 0 =
+    // two copies (the source GU region is contiguous: up_off == gu_group/2 and down lies after it); mode 1 =
+    // three slices (gate/up/down in range); anything outside the blob is unsupported and fails the call
+    // explicitly - no blind fallback.  The write-combined ring and the gather byte check are refused up front
+    // (the direct path host-reads the pinned blob and bypasses the group gather).
+    const bool cdg_on = cold_direct_group_on();
+    int cdg_mode = -1;
+    const size_t cdg_half = s->gu_group / 2;
+    if (cdg_on) {
+        if (stager_wc_requested() || gg_chk) {
+            err = "STRATA_QWEN35_COLD_DIRECT_GROUP cannot be combined with the write-combined ring or the "
+                  "group gather byte check";
+            d.failed = true;
+            return false;
+        }
+        if (!s->cdg_alloc) {
+            err = "the cold direct-group path needs its ON allocation (the env must be set before the workspace)";
+            d.failed = true;
+            return false;
+        }
+        const size_t bb = (size_t) lay.blob_bytes(layer);
+        const bool offs_ok = f.up_off >= 0 && f.down_off >= 0 &&
+                             ((size_t) f.up_off + cdg_half <= bb) && ((size_t) f.down_off + s->d_group <= bb);
+        if (offs_ok && (size_t) f.up_off == cdg_half && (size_t) f.down_off >= s->gu_group) {
+            cdg_mode = 0;
+        } else if (offs_ok) {
+            cdg_mode = 1;
+        }
+        if (cdg_mode < 0) {
+            err = "the cold direct-group layout cannot be proven for this layer's blob";
+            d.failed = true;
+            return false;
+        }
+    }
+    const bool cdg_chk = cdg_on && cold_direct_check_on();
     for (int64_t j0 = 0; j0 < n_experts; j0 += kGroup) {
         const int64_t j1 = std::min<int64_t>(n_experts, j0 + kGroup);
         const int ngx = (int) (j1 - j0);
+        // Task 74: this group's ping-pong set; the copy stream may only reuse it after the previous compute
+        // that read it (grp_done), and the work stream only reads it after its copies (grp_ready).
+        const int cdg_set = cdg_on ? (int) ((j0 / kGroup) & 1) : 0;
+        uint8_t* cdg_gu = s->grp_gu + (size_t) cdg_set * s->grp_gu_alloc;
+        uint8_t* cdg_d = s->grp_d + (size_t) cdg_set * s->grp_d_alloc;
+        if (cdg_on) {
+            ++g_cdg_pingpong_copy_waits;
+            if (cudaStreamWaitEvent(s->copy, s->grp_done[cdg_set], 0) != cudaSuccess) {
+                err = "the prompt direct-group set's reuse wait failed";
+                return false;
+            }
+        }
         int cold_slots[16];
         int n_cold = 0;
         int64_t max_cnt = 0;
@@ -1119,6 +1836,7 @@ bool qwen_prefill_experts(ExpertDispatch& d, int64_t layer, int64_t T, const voi
             max_cnt = std::max<int64_t>(max_cnt, s->cnt[(size_t) e]);
             const int32_t slot = d.cache != nullptr ? d.cache->slot_of(layer, e) : (int32_t) -1;
             if (slot >= 0) continue;
+            if (cdg_on) { ++n_cold; continue; }   // no device ring slot on the direct path
             const int rslot = s->ring_next++ % s->ring;
             // Only the DEVICE slot's reuse waits on the copy stream; the host ring belongs to the producer and
             // is protected by its own dma_done/issued protocol, so the old host-side guard on `used` went away
@@ -1135,83 +1853,205 @@ bool qwen_prefill_experts(ExpertDispatch& d, int64_t layer, int64_t T, const voi
         int cold_seen = 0;
         const uint8_t* mem_bd[kGroup];
         int mem_rslot[kGroup];
+        bool mem_cold[kGroup] = {};   // task 74: member was written directly (masked-gather skip)
+        int cdg_chk_q = -1;           // task 74 B check: this group's pending member (-1 none)
+        int32_t cdg_chk_e = -1;
+        std::vector<uint8_t> cdg_exp_gu, cdg_exp_d;
         for (int64_t j = j0; j < j1; ++j) {
             const int32_t e = s->order[(size_t) j];
             const int32_t slot = d.cache != nullptr ? d.cache->slot_of(layer, e) : (int32_t) -1;
             const uint8_t* bd = slot >= 0 ? d.cache->device_slot(slot) : nullptr;
             int rslot = -1;
             if (bd == nullptr) {
+                if (cdg_on) {
+                    // Task 74: the producer's pinned blob goes straight into this group's set slots (gate at
+                    // +0, up at +half, down at the d slot) - the same in-slot layout the gather writes.
+                    const int q = (int) (j - j0);
+                    const int32_t job = s->job_of[(size_t) j];
+                    if (job < 0) { err = "the prompt staging job map is inconsistent"; d.failed = true; return false; }
+                    const uint8_t* hb;
+                    {
+                        PhaseScope ph_wait(ph, &s->ph_copyhost_ms);
+                        hb = s->stager->wait(job);
+                    }
+                    if (hb == nullptr) {
+                        err = std::string("the expert producer failed: ") + s->stager->fail_text();
+                        d.failed = true;
+                        return false;
+                    }
+                    // B check: the expected slices are copied from the pinned buffer BEFORE issued_one (the
+                    // producer may overwrite it once its DMA completes); compared after this group's products.
+                    if (cdg_chk && cdg_chk_q < 0 && g_cdg_chk_n < 4) {
+                        bool known = false;
+                        for (int i2 = 0; i2 < g_cdg_chk_n; ++i2)
+                            if (g_cdg_chk_gu[i2] == (int32_t) f.gu_type &&
+                                g_cdg_chk_d[i2] == (int32_t) f.d_type) { known = true; break; }
+                        if (!known) {
+                            cdg_chk_q = q;
+                            cdg_chk_e = (int32_t) e;
+                            cdg_exp_gu.resize(s->gu_group);
+                            cdg_exp_d.resize(s->d_group);
+                            std::memcpy(cdg_exp_gu.data(), hb, cdg_half);                        // gate
+                            std::memcpy(cdg_exp_gu.data() + cdg_half, hb + f.up_off, cdg_half);  // up
+                            std::memcpy(cdg_exp_d.data(), hb + f.down_off, s->d_group);          // down
+                        }
+                    }
+                    uint8_t* dst_gu = cdg_gu + (size_t) q * s->gu_group;
+                    uint8_t* dst_d = cdg_d + (size_t) q * s->d_group;
+                    bool cok;
+                    if (cdg_mode == 0) {
+                        cok = cudaMemcpyAsync(dst_gu, hb, s->gu_group, cudaMemcpyHostToDevice, s->copy) ==
+                                  cudaSuccess &&
+                              cudaMemcpyAsync(dst_d, hb + f.down_off, s->d_group, cudaMemcpyHostToDevice,
+                                              s->copy) == cudaSuccess;
+                    } else {
+                        cok = cudaMemcpyAsync(dst_gu, hb, cdg_half, cudaMemcpyHostToDevice, s->copy) == cudaSuccess &&
+                              cudaMemcpyAsync(dst_gu + cdg_half, hb + f.up_off, cdg_half, cudaMemcpyHostToDevice,
+                                              s->copy) == cudaSuccess &&
+                              cudaMemcpyAsync(dst_d, hb + f.down_off, s->d_group, cudaMemcpyHostToDevice,
+                                              s->copy) == cudaSuccess;
+                    }
+                    if (!cok) {
+                        s->stager->cancel("a cold expert's direct H2D enqueue failed");
+                        err = "a cold expert's direct copy failed";
+                        d.failed = true;
+                        return false;
+                    }
+                    if (!s->stager->issued_one(job, s->copy)) {
+                        err = std::string("the expert producer could not record a DMA: ") + s->stager->fail_text();
+                        d.failed = true;
+                        return false;
+                    }
+                    mem_bd[q] = nullptr;   // no gather source: the direct slots are already written
+                    mem_rslot[q] = -1;
+                    mem_cold[q] = true;
+                    ++g_cdg_cold_direct;
+                    g_cdg_direct_bytes += (long long) (s->gu_group + s->d_group);
+                    continue;
+                }
                 rslot = cold_slots[cold_seen++];
-                const int32_t job = s->job_of[(size_t) j];
-                if (job < 0) { err = "the prompt staging job map is inconsistent"; d.failed = true; return false; }
-                const uint8_t* hb;
-                {
-                    // The issuer waits for the producer's ready buffer - the phase that used to be the
-                    // synchronous copy_blobs host wall; it is a different measurement now, not comparable.
-                    PhaseScope ph_wait(ph, &s->ph_copyhost_ms);
-                    hb = s->stager->wait(job);
+                const uint8_t* hb = nullptr;
+                const int32_t pfs = (pf_on && (size_t) e < s->pf_slot.size()) ? s->pf_slot[(size_t) e] : (int32_t) -1;
+                const bool pf_member = pfs >= 0;   // prefetch v2: the side stager's ring buffer is the pool
+                int32_t job = -1;
+                if (pf_member) {
+                    // v2: no drain - the side ring buffer is the H2D source; its copy may still be running
+                    // (the side producers started after this call's D2H), so wait for readiness here.
+                    const auto w0 = std::chrono::steady_clock::now();
+                    hb = s->pf_stager->wait(pfs);
+                    s->pf_wait_ms += std::chrono::duration<double, std::milli>(std::chrono::steady_clock::now() - w0).count();
+                    if (hb == nullptr) {
+                        err = std::string("the prefetch producer failed: ") + s->pf_stager->fail_text();
+                        d.failed = true;
+                        return false;
+                    }
+                    s->pf_used_bytes += (int64_t) (size_t) lay.blob_bytes(layer);
+                } else {
+                    job = s->job_of[(size_t) j];
+                    if (job < 0) { err = "the prompt staging job map is inconsistent"; d.failed = true; return false; }
+                    {
+                        // The issuer waits for the producer's ready buffer - the phase that used to be the
+                        // synchronous copy_blobs host wall; it is a different measurement now, not comparable.
+                        // The chunk2 pass's share is timed separately (same clock, no extra wait).
+                        const bool ph2 = ph || pass2;
+                        std::chrono::steady_clock::time_point cw0;
+                        if (ph2) cw0 = std::chrono::steady_clock::now();
+                        hb = s->stager->wait(job);
+                        if (ph2) {
+                            const double dt = ms_since(cw0);
+                            if (ph) s->ph_copyhost_ms += dt;
+                            if (pass2) { s->ph_copyhost2_ms += dt; ++s->ph_pass2; }
+                        }
+                    }
+                    if (hb == nullptr) {
+                        err = std::string("the expert producer failed: ") + s->stager->fail_text();
+                        d.failed = true;
+                        return false;
+                    }
                 }
-                if (hb == nullptr) {
-                    err = std::string("the expert producer failed: ") + s->stager->fail_text();
-                    d.failed = true;
-                    return false;
-                }
-                if (stg_chk && s->stg_chk_n < kStagerChkMax) {
+                if (stg_chk) {
                     // Bounded producer byte check (diagnostic, default off): one host blob per distinct
-                    // (gu_type, d_type), compared against a synchronous copy_blobs reference after the wait;
-                    // the pair registers only after an equal compare.  A mismatch is a real failure.
+                    // (gu_type, d_type), compared against a synchronous reference copy after the wait; the pair
+                    // registers only after an equal compare.  A mismatch is a real failure.  The reference goes
+                    // through copy_blobs_mapped: with the cold direct-read opt-in on, the producer wrote the blob
+                    // with direct file reads, so the check must compare against the mapped path (task 97).
+                    // Prefetch v1: the FIRST prestaged member of a registered type gets one additional check
+                    // (bounded, one per type), so the side pool's bytes are verified too.
                     const int32_t gu_t = (int32_t) f.gu_type;
                     const int32_t d_t = (int32_t) f.d_type;
-                    bool known = false;
+                    StagerChkPair* known_rec = nullptr;
                     for (int i = 0; i < s->stg_chk_n; ++i)
-                        if (s->stg_chk_pairs[i].gu_type == gu_t && s->stg_chk_pairs[i].d_type == d_t) { known = true; break; }
-                    if (!known) {
+                        if (s->stg_chk_pairs[i].gu_type == gu_t && s->stg_chk_pairs[i].d_type == d_t) { known_rec = &s->stg_chk_pairs[i]; break; }
+                    const bool do_register = known_rec == nullptr && s->stg_chk_n < kStagerChkMax;
+                    const bool do_pf_check = known_rec != nullptr && pf_member && known_rec->pf_checked == 0;
+                    if (do_register || do_pf_check) {
                         const size_t bb = (size_t) lay.blob_bytes(layer);
                         std::vector<uint8_t> ref(bb);
                         int32_t l32 = (int32_t) layer, e32 = e;
                         uint8_t* ref_dst[1] = {ref.data()};
-                        if (!d.src->copy_blobs(&l32, &e32, ref_dst, 1)) {
+                        if (!d.src->copy_blobs_mapped(&l32, &e32, ref_dst, 1)) {
                             err = "the producer check's reference copy failed";
                             s->stg_chk_failed = true;
                             d.failed = true;
                             return false;
                         }
                         if (std::memcmp(hb, ref.data(), bb) != 0) {
-                            std::fprintf(stderr, "strata qwen35: stager check MISMATCH gu_type %d d_type %d layer "
+                            std::fprintf(stderr, "strata qwen35: %s MISMATCH gu_type %d d_type %d layer "
                                                  "%lld expert %d bytes %zu\n",
+                                         do_pf_check ? "stager prefetch check" : "stager check",
                                          gu_t, d_t, (long long) layer, e, bb);
                             err = "the producer check's byte compare failed";
                             s->stg_chk_failed = true;
                             d.failed = true;
                             return false;
                         }
-                        StagerChkPair& rec = s->stg_chk_pairs[s->stg_chk_n++];
-                        rec.gu_type = gu_t;
-                        rec.d_type = d_t;
-                        rec.layer = layer;
-                        rec.expert = e;
-                        rec.bytes = bb;
-                        std::fprintf(stderr, "strata qwen35: stager check equal gu_type %d d_type %d layer %lld "
-                                             "expert %d bytes %zu\n",
-                                     gu_t, d_t, (long long) layer, e, bb);
+                        if (do_register) {
+                            StagerChkPair& rec = s->stg_chk_pairs[s->stg_chk_n++];
+                            rec.gu_type = gu_t;
+                            rec.d_type = d_t;
+                            rec.layer = layer;
+                            rec.expert = e;
+                            rec.bytes = bb;
+                            rec.pf_checked = pf_member ? 1 : 0;
+                            std::fprintf(stderr, "strata qwen35: stager check equal gu_type %d d_type %d layer %lld "
+                                                 "expert %d bytes %zu\n",
+                                         gu_t, d_t, (long long) layer, e, bb);
+                        } else {
+                            known_rec->pf_checked = 1;
+                            std::fprintf(stderr, "strata qwen35: stager prefetch check equal gu_type %d d_type %d layer "
+                                                 "%lld expert %d bytes %zu\n",
+                                         gu_t, d_t, (long long) layer, e, bb);
+                        }
                     }
                 }
                 if (cudaMemcpyAsync(s->ring_d[rslot], hb, (size_t) lay.blob_bytes(layer),
                                     cudaMemcpyHostToDevice, s->copy) != cudaSuccess) {
                     // Qwen's H2D failure has a callable entry: latch the producer, stop its writes, wake its
-                    // waiters; the layer guard finishes it, the close path drains the stream.
-                    s->stager->cancel("a cold expert's H2D enqueue failed");
+                    // waiters; the layer guard finishes it, the close path drains the stream.  A side-pool
+                    // source has no producer generation to latch (the layer guard's finish() is enough).
+                    if (!pf_member) s->stager->cancel("a cold expert's H2D enqueue failed");
                     err = "a cold expert's copy failed";
                     d.failed = true;
                     return false;
                 }
-                if (!s->stager->issued_one(job, s->copy)) {
-                    err = std::string("the expert producer could not record a DMA: ") + s->stager->fail_text();
-                    d.failed = true;
-                    return false;
+                if (!pf_member) {
+                    if (!s->stager->issued_one(job, s->copy)) {
+                        err = std::string("the expert producer could not record a DMA: ") + s->stager->fail_text();
+                        d.failed = true;
+                        return false;
+                    }
+                } else {
+                    // the reuse guard for the side pool: the LAST record position covers every side-pool H2D
+                    // enqueued before it, so the next layer's drain can safely overwrite the slots
+                    if (cudaEventRecord(s->pf_ev, s->copy) != cudaSuccess) {
+                        err = "the prefetch side pool's reuse guard could not be recorded";
+                        d.failed = true;
+                        return false;
+                    }
+                    s->pf_ev_used = true;
                 }
                 if (cudaEventRecord(s->copied[rslot], s->copy) != cudaSuccess) {
-                    s->stager->cancel("a cold expert's copied-event record failed");
+                    if (!pf_member) s->stager->cancel("a cold expert's copied-event record failed");
                     err = "a cold expert's copy failed";
                     d.failed = true;
                     return false;
@@ -1221,7 +2061,19 @@ bool qwen_prefill_experts(ExpertDispatch& d, int64_t layer, int64_t T, const voi
             mem_bd[j - j0] = bd;
             mem_rslot[j - j0] = rslot;
         }
-        if (n_cold > 0 && cudaStreamWaitEvent(cs, s->copied[cold_slots[n_cold - 1]], 0) != cudaSuccess) {
+        if (cdg_on) {
+            // Task 74: this set's cold copies are complete once they pass the ready event; the work stream
+            // waits it before the product reads (the ready record follows every cold H2D enqueue above).
+            if (cudaEventRecord(s->grp_ready[cdg_set], s->copy) != cudaSuccess) {
+                err = "the prompt direct-group set's ready record failed";
+                return false;
+            }
+            ++g_cdg_pingpong_cs_waits;
+            if (cudaStreamWaitEvent(cs, s->grp_ready[cdg_set], 0) != cudaSuccess) {
+                err = "the prompt direct-group set's ready wait failed";
+                return false;
+            }
+        } else if (n_cold > 0 && cudaStreamWaitEvent(cs, s->copied[cold_slots[n_cold - 1]], 0) != cudaSuccess) {
             err = "the prompt expert path's copy wait failed";
             return false;
         }
@@ -1230,22 +2082,34 @@ bool qwen_prefill_experts(ExpertDispatch& d, int64_t layer, int64_t T, const voi
         // gather).  Any 16-byte misalignment returns false BEFORE launching anything (moe_mmq.cu checks the
         // alignment first), and the original per-expert gather_native loop runs instead.  The release events
         // stay per-slot: each cold slot's own `used` is recorded after the group's reads are enqueued, so a
-        // slot can only be overwritten once its gather completed.
+        // slot can only be overwritten once its gather completed.  Task 74: on the direct path the masked
+        // gather skips exactly the members whose slots were filled directly, into this group's ping-pong set.
         mmq::GatherGroup gg;
         const bool ev_gather = gpu_ev && ev_pair_begin(*s, cs, EV_GATHER);
         gg.first = 0;
         gg.n = (int) ngx;
         for (int q = 0; q < (int) ngx; ++q) gg.blob[q] = mem_bd[q];
-        const bool grp_fast = mmq::gather_native_group(gg, f.up_off, s->gu_group / 2, f.down_off, s->d_group,
-                                                       s->grp_gu, s->gu_group, s->grp_d, s->d_group, cs);
+        uint32_t cdg_skip = 0;
+        if (cdg_on)
+            for (int q = 0; q < (int) ngx; ++q)
+                if (mem_cold[q]) cdg_skip |= (1u << q);
+        void* const dst_gu = cdg_on ? (void*) cdg_gu : (void*) s->grp_gu;
+        void* const dst_d = cdg_on ? (void*) cdg_d : (void*) s->grp_d;
+        const bool grp_fast = cdg_on
+            ? mmq::gather_native_group_masked(gg, cdg_skip, f.up_off, s->gu_group / 2, f.down_off, s->d_group,
+                                              dst_gu, s->gu_group, dst_d, s->d_group, cs)
+            : mmq::gather_native_group(gg, f.up_off, s->gu_group / 2, f.down_off, s->d_group, dst_gu,
+                                       s->gu_group, dst_d, s->d_group, cs);
         if (grp_fast) {
             if (gg_stats) { ++s->gg_fast; ++s->gg_kernels; }
         } else {
             if (gg_stats) { ++s->gg_fallback; s->gg_kernels += ngx; }
-            for (int q = 0; q < (int) ngx; ++q)
+            for (int q = 0; q < (int) ngx; ++q) {
+                if (cdg_on && mem_cold[q]) continue;   // direct-filled: never overwritten by the fallback
                 mmq::gather_native(mem_bd[q], mem_bd[q] + f.up_off, s->gu_group / 2, mem_bd[q] + f.down_off,
-                                   s->d_group, s->grp_gu + (size_t) q * s->gu_group,
-                                   s->grp_d + (size_t) q * s->d_group, cs);
+                                   s->d_group, (uint8_t*) dst_gu + (size_t) q * s->gu_group,
+                                   (uint8_t*) dst_d + (size_t) q * s->d_group, cs);
+            }
         }
         if (gpu_ev) s->ev_launch[EV_GATHER] += grp_fast ? 1 : ngx;
         if (ev_gather) ev_pair_end(*s, cs);
@@ -1258,8 +2122,13 @@ bool qwen_prefill_experts(ExpertDispatch& d, int64_t layer, int64_t T, const voi
                 if (gg_stats) ++s->gg_used_recs;
                 ++s->streamed;
                 s->stream_bytes += lay.blob_bytes(layer);
+            } else if (cdg_on && mem_cold[q]) {
+                ++s->streamed;                              // streamed, but straight into the group set
+                s->stream_bytes += lay.blob_bytes(layer);
+                ++g_cdg_gather_skipped;
             } else {
                 ++s->resident;
+                if (cdg_on) ++g_cdg_resident_gathered;
             }
         }
         if (gg_chk && grp_fast) {
@@ -1372,13 +2241,13 @@ bool qwen_prefill_experts(ExpertDispatch& d, int64_t layer, int64_t T, const voi
             err = "the prompt group bounds did not upload";
             return false;
         }
-        if (cudaMemsetAsync(s->grp_gu + (size_t) ngx * s->gu_group, 0, kTail, cs) != cudaSuccess ||
-            cudaMemsetAsync(s->grp_d + (size_t) ngx * s->d_group, 0, kTail, cs) != cudaSuccess) {
+        if (cudaMemsetAsync((uint8_t*) dst_gu + (size_t) ngx * s->gu_group, 0, kTail, cs) != cudaSuccess ||
+            cudaMemsetAsync((uint8_t*) dst_d + (size_t) ngx * s->d_group, 0, kTail, cs) != cudaSuccess) {
             err = "the prompt group's tail memset failed";
             return false;
         }
         mmq::Product gu;
-        gu.w = s->grp_gu; gu.type = f.gu_type; gu.w_rows = 2 * f.n_ff; gu.w_cols = f.n_embd;
+        gu.w = (uint8_t*) dst_gu; gu.type = f.gu_type; gu.w_rows = 2 * f.n_ff; gu.w_cols = f.n_embd;
         gu.expert_bytes = s->gu_group; gu.n = ngx; gu.xq = s->xq; gu.bounds = s->bounds + j0; gu.ids = s->ident;
         gu.total_rows = n; gu.max_rows = max_cnt; gu.dst = s->gu; gu.ld_dst = 2 * f.n_ff;
         if (trace) std::fprintf(stderr, "qwen prefill trace: group %lld gu product (n %d r0 %lld nr %lld)\n", (long long) j0, ngx, (long long) r0, (long long) nr);
@@ -1396,7 +2265,7 @@ bool qwen_prefill_experts(ExpertDispatch& d, int64_t layer, int64_t T, const voi
         mmq::quantize(s->h + (size_t) r0 * f.n_ff, nullptr, s->hq, f.d_type, f.n_ff, f.n_ff, nr, cs);
         if (ev_act) ev_pair_end(*s, cs);
         mmq::Product dn;
-        dn.w = s->grp_d; dn.type = f.d_type; dn.w_rows = f.n_embd; dn.w_cols = f.n_ff;
+        dn.w = (uint8_t*) dst_d; dn.type = f.d_type; dn.w_rows = f.n_embd; dn.w_cols = f.n_ff;
         dn.expert_bytes = s->d_group; dn.n = ngx; dn.xq = s->hq; dn.bounds = s->rel; dn.ids = s->ident;
         dn.total_rows = nr; dn.max_rows = max_cnt; dn.dst = s->dm + (size_t) r0 * f.n_embd; dn.ld_dst = f.n_embd;
         const bool ev_dn = gpu_ev && ev_pair_begin(*s, cs, EV_DN);
@@ -1407,14 +2276,58 @@ bool qwen_prefill_experts(ExpertDispatch& d, int64_t layer, int64_t T, const voi
             std::fprintf(stderr, "qwen prefill trace: DOWN PRODUCT FAULT\n");
         if (trace) std::fprintf(stderr, "qwen prefill trace: group %lld down done\n", (long long) j0);
         ++s->product_calls;
+        // Task 74 B check: after this group's products (the ready event ordered the copies before them), the
+        // actual set slots are read back and compared byte for byte with the expected slices captured from the
+        // producer's pinned blob - valid extents only, no unwritten padding gaps.  One checked sync per combo
+        // (at most 4); any difference fails the call explicitly.
+        if (cdg_on && cdg_chk_q >= 0) {
+            std::vector<uint8_t> got_gu(s->gu_group), got_d(s->d_group);
+            bool rok = cudaMemcpyAsync(got_gu.data(), cdg_gu + (size_t) cdg_chk_q * s->gu_group, s->gu_group,
+                                       cudaMemcpyDeviceToHost, cs) == cudaSuccess &&
+                       cudaMemcpyAsync(got_d.data(), cdg_d + (size_t) cdg_chk_q * s->d_group, s->d_group,
+                                       cudaMemcpyDeviceToHost, cs) == cudaSuccess &&
+                       cudaStreamSynchronize(cs) == cudaSuccess;
+            int64_t bad = 1;
+            if (rok) {
+                bad = 0;
+                for (size_t i = 0; i < got_gu.size(); ++i) if (got_gu[i] != cdg_exp_gu[i]) ++bad;
+                for (size_t i = 0; i < got_d.size(); ++i) if (got_d[i] != cdg_exp_d[i]) ++bad;
+            }
+            g_cdg_chk_gu[g_cdg_chk_n] = (int32_t) f.gu_type;
+            g_cdg_chk_d[g_cdg_chk_n] = (int32_t) f.d_type;
+            ++g_cdg_chk_n;
+            ++g_cdg_check_combos;
+            g_cdg_check_bytes += (long long) (s->gu_group + s->d_group);
+            g_cdg_check_fail += bad;
+            if (!rok || bad != 0) {
+                std::fprintf(stderr, "strata qwen35: cold direct check FAILED gu_type %d d_type %d layer %lld "
+                                     "expert %d bad %lld\n",
+                             (int) f.gu_type, (int) f.d_type, (long long) layer, cdg_chk_e, (long long) bad);
+                err = "the cold direct-group byte check failed";
+                d.failed = true;
+                return false;
+            }
+            std::fprintf(stderr, "strata qwen35: cold direct check equal gu_type %d d_type %d layer %lld expert %d "
+                                 "gu_bytes %zu d_bytes %zu\n",
+                         (int) f.gu_type, (int) f.d_type, (long long) layer, cdg_chk_e, s->gu_group, s->d_group);
+        }
+        if (cdg_on) {
+            if (cudaEventRecord(s->grp_done[cdg_set], cs) != cudaSuccess) {
+                err = "the prompt direct-group set's done record failed";
+                return false;
+            }
+        }
     }
     {
     PhaseScope ph_combine(ph, &s->ph_combine_ms);
     const bool ev_combine = gpu_ev && ev_pair_begin(*s, cs, EV_COMBINE);
     if (gpu_ev) ++s->ev_launch[EV_COMBINE];
     if (trace) std::fprintf(stderr, "qwen prefill trace: combine launch\n");
+    // Task 69: the raw form reads the original tensor through its byte strides (validated above); the OFF
+    // path passes nullptr and keeps the contiguous copy exactly as before.
     combine_scatter_kernel<<<dim3((unsigned) T), kThreads, 0, cs>>>(
-        s->dm, s->weights_dev, s->entry_of_tok, (float*) out_dev, f.n_embd, (int) k);
+        s->dm, s->weights_dev, s->entry_of_tok, (float*) out_dev, f.n_embd, (int) k,
+        rw_device ? (const char*) weights_dev : nullptr, w_nb1, w_nb2);
     if (ev_combine) ev_pair_end(*s, cs);
     if (trace) {
         cudaStreamSynchronize(cs);
@@ -1434,7 +2347,15 @@ bool qwen_prefill_experts(ExpertDispatch& d, int64_t layer, int64_t T, const voi
         }
         cudaMemcpy(h1, s->dm, sizeof(h1), cudaMemcpyDeviceToHost);
         cudaMemcpy(h2, s->gu, sizeof(h2), cudaMemcpyDeviceToHost);
-        cudaMemcpy(h3, s->weights_dev, sizeof(h3), cudaMemcpyDeviceToHost);
+        if (rw_device) {
+            // Task 69: the ON path has no contiguous host copy; the trace prints the raw first-token ranks
+            // (0..3) straight from the original tensor instead of a stale repacked buffer.
+            for (int r = 0; r < 4; ++r)
+                cudaMemcpy(&h3[r], (const uint8_t*) weights_dev + (size_t) r * (size_t) w_nb1, sizeof(float),
+                           cudaMemcpyDeviceToHost);
+        } else {
+            cudaMemcpy(h3, s->weights_dev, sizeof(h3), cudaMemcpyDeviceToHost);
+        }
         cudaMemcpy(h4, out_dev, sizeof(h4), cudaMemcpyDeviceToHost);
         cudaMemcpy(e4, s->entry_of_tok, sizeof(e4), cudaMemcpyDeviceToHost);
         std::fprintf(stderr, "qwen prefill trace: dm %g %g %g %g | gu %g %g %g %g | w %g %g %g %g | out %g %g %g %g"
@@ -1443,6 +2364,61 @@ bool qwen_prefill_experts(ExpertDispatch& d, int64_t layer, int64_t T, const voi
                      e4[4], e4[5], e4[6], e4[7]);
     }
     if (cudaGetLastError() != cudaSuccess) { err = "the prompt expert combine launch failed"; return false; }
+    }
+    // Task 69 per-call evidence counters (printed once at close): exactly one of the two paths runs.
+    if (rw_device) ++g_rwd_device_calls; else ++g_rwd_legacy_calls;
+    // Task 72 per-call evidence counters: exactly one ids staging path runs.
+    if (pid) ++g_pid_packed_calls; else ++g_pid_raw_calls;
+    // Task 69 one-shot index check (exact STRATA_QWEN35_ROUTER_WEIGHTS_CHECK=1 with the ON path; FIRST actual
+    // prompt call only): pack the first min(T,4) tokens' raw strided weights into a tiny contiguous scratch,
+    // then run the SAME combine kernel twice on the call's real dm/entry - once on the packed copy (legacy
+    // indexing) and once on the original tensor through its byte strides - and compare the two outputs bit for
+    // bit.  This validates the stride indexing on real data and real dm; it is a diagnostic, never a speed
+    // configuration, and it does not touch the 63/65 strict MMQ records or any tolerance.
+    if (rw_device && router_weights_check_on() && !g_rwd_check_done) {
+        g_rwd_check_done = true;
+        ++g_rwd_check_runs;
+        g_rwd_check_nb1 = (long long) w_nb1;
+        g_rwd_check_nb2 = (long long) w_nb2;
+        const int64_t sm = std::min<int64_t>(T, 4);
+        const size_t woo = (size_t) sm * (size_t) k * sizeof(float);
+        const size_t ooo = (size_t) sm * (size_t) f.n_embd * sizeof(float);
+        float* cw = nullptr; float* cl = nullptr; float* cr = nullptr;
+        if (cudaMalloc(&cw, woo) != cudaSuccess || cudaMalloc(&cl, ooo) != cudaSuccess ||
+            cudaMalloc(&cr, ooo) != cudaSuccess) {
+            ++g_rwd_check_alloc_failed;
+            if (cw) cudaFree(cw);
+            if (cl) cudaFree(cl);
+            if (cr) cudaFree(cr);
+        } else {
+            pack_weights_raw_kernel<<<dim3((unsigned) sm), 64, 0, cs>>>((const char*) weights_dev, w_nb1, w_nb2,
+                                                                         cw, (int) k);
+            combine_scatter_kernel<<<dim3((unsigned) sm), kThreads, 0, cs>>>(
+                s->dm, cw, s->entry_of_tok, cl, f.n_embd, (int) k, nullptr, 0, 0);
+            combine_scatter_kernel<<<dim3((unsigned) sm), kThreads, 0, cs>>>(
+                s->dm, nullptr, s->entry_of_tok, cr, f.n_embd, (int) k, (const char*) weights_dev, w_nb1, w_nb2);
+            const cudaError_t lerr = cudaGetLastError();
+            const bool sok = lerr == cudaSuccess && cudaStreamSynchronize(cs) == cudaSuccess;
+            bool dok = false;
+            std::vector<float> hl((size_t) sm * (size_t) f.n_embd), hr((size_t) sm * (size_t) f.n_embd);
+            if (sok) {
+                dok = cudaMemcpy(hl.data(), cl, ooo, cudaMemcpyDeviceToHost) == cudaSuccess &&
+                      cudaMemcpy(hr.data(), cr, ooo, cudaMemcpyDeviceToHost) == cudaSuccess;
+            }
+            if (!dok) {
+                ++g_rwd_check_fail;
+            } else {
+                for (size_t i = 0; i < hl.size(); ++i) {
+                    ++g_rwd_check_elems;
+                    const bool eq = std::isfinite(hl[i]) && std::isfinite(hr[i]) &&
+                                    std::memcmp(&hl[i], &hr[i], sizeof(float)) == 0;
+                    if (eq) ++g_rwd_check_eq; else ++g_rwd_check_fail;
+                }
+            }
+            cudaFree(cw);
+            cudaFree(cl);
+            cudaFree(cr);
+        }
     }
     // One-shot single-layer capture (STRATA_QWEN35_LAYER_CAPTURE=<dir>, default off): the first T==2048 call
     // of layer 16 copies the call's real x/ids/weights, the reference combine output and the after-loan
@@ -1489,17 +2465,20 @@ bool qwen_prefill_experts(ExpertDispatch& d, int64_t layer, int64_t T, const voi
         const uint64_t whe = fnv_bytes(kFnvSeed, ch_w.data(), ch_w.size() * sizeof(float));
         const uint64_t oh = fnv_bytes(kFnvSeed, ch_o.data(), ch_o.size() * sizeof(float));
         const char* exe_sha = std::getenv("STRATA_QWEN35_CAPTURE_EXE_SHA");
-        auto wfile = [&](const char* name, const void* p, size_t bytes) -> bool {
+        const std::string cap_sfx = capture_layer_list().empty()
+                                        ? std::string()
+                                        : ("-L" + std::to_string((long long) layer));
+        auto wfile = [&](const std::string& name, const void* p, size_t bytes) -> bool {
             std::string path = std::string(cap_dir) + "/" + name;
             std::ofstream out(path, std::ios::binary | std::ios::trunc);
             return out && out.write((const char*) p, (std::streamsize) bytes);
         };
-        bool wok = wfile("x.f32", ch_x.data(), ch_x.size() * sizeof(float)) &&
-                   wfile("ids.i32", ch_id.data(), ch_id.size() * sizeof(int32_t)) &&
-                   wfile("weights.f32", ch_w.data(), ch_w.size() * sizeof(float)) &&
-                   wfile("out.f32", ch_o.data(), ch_o.size() * sizeof(float)) &&
-                   wfile("mask.i32", ch_mask.data(), ch_mask.size() * sizeof(int32_t));
-        std::ofstream meta(std::string(cap_dir) + "/meta.txt", std::ios::trunc);
+        bool wok = wfile("x" + cap_sfx + ".f32", ch_x.data(), ch_x.size() * sizeof(float)) &&
+                   wfile("ids" + cap_sfx + ".i32", ch_id.data(), ch_id.size() * sizeof(int32_t)) &&
+                   wfile("weights" + cap_sfx + ".f32", ch_w.data(), ch_w.size() * sizeof(float)) &&
+                   wfile("out" + cap_sfx + ".f32", ch_o.data(), ch_o.size() * sizeof(float)) &&
+                   wfile("mask" + cap_sfx + ".i32", ch_mask.data(), ch_mask.size() * sizeof(int32_t));
+        std::ofstream meta(std::string(cap_dir) + "/meta" + cap_sfx + ".txt", std::ios::trunc);
         wok = wok && (bool) meta;
         if (wok) {
             meta << "layer " << (long long) layer << "\n"
@@ -1528,7 +2507,7 @@ bool qwen_prefill_experts(ExpertDispatch& d, int64_t layer, int64_t T, const voi
             wok = (bool) meta;
         }
         if (!wok) { err = "the layer capture could not write its files"; d.failed = true; return false; }
-        s->cap_done = true;
+        if ((size_t) layer < s->cap_done_layers.size()) s->cap_done_layers[(size_t) layer] = 1;
         s->cap_this_call = false;
         std::fprintf(stderr, "strata qwen35: layer capture (STRATA_QWEN35_LAYER_CAPTURE): layer %lld T %lld K %lld "
                              "H %lld mask_resident %lld x_nf %lld w_nf %lld out_nf %lld ids_bad %lld dir %s\n",
@@ -1664,6 +2643,41 @@ void qwen_prefill_close(ExpertDispatch& d) {
                          (long long) r.streamed, (unsigned long long) r.ids_hash,
                          (unsigned long long) r.weights_hash);
     }
+    if (router_weights_device_on() && (g_rwd_device_calls > 0 || g_rwd_legacy_calls > 0 || g_rwd_check_runs > 0)) {
+        // Task 69 stays-device evidence (one line, only when the exact env was on).  The normal ON path must
+        // show weights_d2h_bytes 0 and weights_h2d_bytes 0; the check/diagnostic copies are listed separately.
+        std::fprintf(stderr,
+                     "strata qwen35: router weights device (STRATA_QWEN35_ROUTER_WEIGHTS_DEVICE=1): device_calls "
+                     "%lld legacy_calls %lld weights_d2h_bytes %lld weights_h2d_bytes %lld diag_d2h_bytes %lld "
+                     "check_runs %lld check_elems %lld check_eq %lld check_fail %lld check_nb1 %lld check_nb2 "
+                     "%lld check_alloc_failed %lld\n",
+                     g_rwd_device_calls, g_rwd_legacy_calls, g_rwd_weights_d2h_bytes, g_rwd_weights_h2d_bytes,
+                     g_rwd_diag_d2h_bytes, g_rwd_check_runs, g_rwd_check_elems, g_rwd_check_eq, g_rwd_check_fail,
+                     g_rwd_check_nb1, g_rwd_check_nb2, g_rwd_check_alloc_failed);
+    }
+    if (packed_ids_on() && (g_pid_packed_calls > 0 || g_pid_raw_calls > 0)) {
+        // Task 72 packed-ids evidence (one line, only when the exact env was on).  The formal packed path must
+        // show raw_d2h_bytes 0; diag_d2h_bytes covers only the B check's explicit raw reference.
+        std::fprintf(stderr,
+                     "strata qwen35: packed router ids (STRATA_QWEN35_PACKED_IDS=1): packed_calls %lld "
+                     "raw_calls %lld packed_d2h_bytes %lld raw_d2h_bytes %lld diag_d2h_bytes %lld "
+                     "check_shapes %lld check_elems %lld check_fail %lld check_nb1 %lld\n",
+                     g_pid_packed_calls, g_pid_raw_calls, g_pid_packed_d2h_bytes, g_pid_raw_d2h_bytes,
+                     g_pid_diag_d2h_bytes, g_pid_check_shapes, g_pid_check_elems, g_pid_check_fail,
+                     g_pid_check_nb1);
+    }
+    if (cold_direct_group_on() && (g_cdg_cold_direct > 0 || g_cdg_resident_gathered > 0)) {
+        // Task 74 direct-to-group evidence (one line, only when the exact env was on).  The byte check's
+        // amounts are its own diagnostic work, never the formal path's speed data.
+        std::fprintf(stderr,
+                     "strata qwen35: cold direct group (STRATA_QWEN35_COLD_DIRECT_GROUP=1): cold_direct %lld "
+                     "direct_h2d_bytes %lld cold_gather_skipped %lld resident_gathered %lld pingpong_copy_waits "
+                     "%lld pingpong_cs_waits %lld check_combos %lld check_bytes %lld check_fail %lld "
+                     "check_unsupported %lld\n",
+                     g_cdg_cold_direct, g_cdg_direct_bytes, g_cdg_gather_skipped, g_cdg_resident_gathered,
+                     g_cdg_pingpong_copy_waits, g_cdg_pingpong_cs_waits, g_cdg_check_combos, g_cdg_check_bytes,
+                     g_cdg_check_fail, g_cdg_check_unsupported);
+    }
     if (prefill_phases_enabled() && s->ph_calls > 0) {
         // Per-call host wall sums at EXISTING boundaries (no new CUDA events/syncs).  Definitions: d2h_sync =
         // the two original strided D2H enqueues + the one work-stream sync (the wait includes the upstream
@@ -1683,6 +2697,32 @@ void qwen_prefill_close(ExpertDispatch& d) {
                      s->ph_combine_ms);
         std::fprintf(stderr, "strata qwen35: prefill phases note: d2h_sync includes upstream readiness (not pure "
                              "copy); enqueue is host launch API time (not kernel time).\n");
+        if (s->ph_pass2 > 0) {
+            // chunk2 evidence (all arms): the cold-copy wait of a layer's second call (the chunk2 pass); chunk1
+            // is the first call, so a prefetch's effect on the supply wait shows up in this number.
+            std::fprintf(stderr, "strata qwen35: prefill phases pass2: copyhost2_ms %.2f entries %lld\n",
+                         s->ph_copyhost2_ms, (long long) s->ph_pass2);
+        }
+    }
+    if (d2h_split_enabled() && (s->ds_calls > 0 || s->ds_pre_missing > 0 || s->ds_event_wait_failed > 0)) {
+        // Task 127: the split of the existing d2h_sync window (gates above stay independent).  Both parts are
+        // host walls at the same phase boundary as ph_d2h_ms; the waits are sequential, so prefix+tail fills the
+        // existing d2h_sync window by construction (the sum-vs-d2h check re-states it).  prefix_wait = the `pre`
+        // graph-prefix boundary completing (attention/GDN/router/norm on the backend stream plus this call's
+        // enqueue cost); ids_tail = our pack/packed-ids work-stream sync returning.  Diagnostic only: elapsed
+        // walls at existing boundaries, not busy time, not a critical path and not a gain.
+        const double both = s->ds_prefix_ms + s->ds_tail_ms;
+        std::fprintf(stderr,
+                     "strata qwen35: d2h split (STRATA_QWEN35_D2H_SPLIT=1): calls %lld prefix_wait_ms %.2f "
+                     "ids_tail_ms %.2f sum_ms %.2f | per_call prefix %.3f tail %.3f | prefix min %.3f max %.3f | "
+                     "tail min %.3f max %.3f | d2h_sync_ms %.2f sum-vs-d2h %+.2f%% | pre_missing %lld "
+                     "event_wait_failed %lld\n",
+                     (long long) s->ds_calls, s->ds_prefix_ms, s->ds_tail_ms, both,
+                     s->ds_calls > 0 ? s->ds_prefix_ms / (double) s->ds_calls : 0.0,
+                     s->ds_calls > 0 ? s->ds_tail_ms / (double) s->ds_calls : 0.0,
+                     s->ds_prefix_min, s->ds_prefix_max, s->ds_tail_min, s->ds_tail_max, s->ph_d2h_ms,
+                     s->ph_d2h_ms > 0 ? (both - s->ph_d2h_ms) / s->ph_d2h_ms * 100.0 : 0.0,
+                     (long long) s->ds_pre_missing, (long long) s->ds_event_wait_failed);
     }
     if (gather_stats_enabled() && (s->gg_fast > 0 || s->gg_fallback > 0)) {
         // Definitions (this build): groups_fast = groups whose gate/up/down moved in ONE gather_native_group
@@ -1755,7 +2795,7 @@ void qwen_prefill_close(ExpertDispatch& d) {
                      (unsigned long long) s->stager->stat_fails.load(std::memory_order_relaxed),
                      s->stager->active_now(), s->stager->kRing, s->stager->batch, s->stager->sleep_mode ? 1 : 0,
                      s->stager->strict_pin ? 1 : 0, s->stager->opt ? 1 : 0, s->stager->host_pinned_bytes());
-        // The actual chosen producer count (1 default; 2/3 only via STRATA_QWEN35_STAGER_THREADS="2"/"3").
+        // The actual chosen producer count (task 84 default 3; exact "1"/"2"/"3" select explicitly).
         std::fprintf(stderr, "strata qwen35: stager workers (STRATA_QWEN35_STAGER_STATS=1): chosen %d\n",
                      s->stager_threads);
         if (s->stager->failed())
@@ -1878,6 +2918,24 @@ void qwen_prefill_close(ExpertDispatch& d) {
                          (long long) s->rh_distinct[il], (long long) s->rh_maxcnt[il],
                          (long long) s->rh_rows[il], (long long) s->rh_groups[il]);
         }
+    }
+    if (route_dump_dir() != nullptr && s->rd_calls > 0) {
+        std::fprintf(stderr, "strata qwen35: route dump (STRATA_QWEN35_ROUTE_DUMP): calls %lld rows %lld dir %s\n",
+                     (long long) s->rd_calls, (long long) s->rd_rows,
+                     s->rd_dir != nullptr ? s->rd_dir : route_dump_dir());
+    }
+    if (prefetch_v1_enabled()) {
+        const int64_t waste = s->pf_bytes - s->pf_used_bytes;
+        const double wshare = s->pf_bytes > 0 ? 100.0 * (double) waste / (double) s->pf_bytes : 0.0;
+        std::fprintf(stderr, "strata qwen35: prefetch v2 (STRATA_QWEN35_PREFETCH_V1=1): layers %lld prefetched_bytes "
+                             "%lld used_bytes %lld waste_bytes %lld (%.1f%%) pool_slots %lld pool_peak_mib %.1f "
+                             "fallbacks %lld (pool_full %lld empty %lld member %lld) wait_ms %.1f drain_ms %.1f "
+                             "extra_h2d_bytes 0\n",
+                     (long long) s->pf_layers, (long long) s->pf_bytes, (long long) s->pf_used_bytes,
+                     (long long) waste, wshare, (long long) s->pf_slots,
+                     (double) s->pf_peak_bytes / 1048576.0, (long long) s->pf_member_fallbacks,
+                     (long long) s->pf_skipped_pool, (long long) s->pf_skipped_empty,
+                     (long long) s->pf_member_fallbacks, s->pf_wait_ms, s->pf_drain_ms);
     }
     // The producer's host writes are already stopped (every layer's guard ran finish() and waited active==0);
     // the copy stream must now be CHECKED idle before free_all releases the pinned ring and destroys the

@@ -952,6 +952,12 @@ void FileExpertSource::close() {
         maps_.clear();
         base_ = nullptr;   // one of the views above
     }
+#if defined(_WIN32)
+    for (auto& pool : pread_pool_)
+        for (void* h : pool) CloseHandle((HANDLE) h);
+#endif
+    pread_pool_.clear();
+    cold_pread_ = false;
     role_ptr_.clear();
     role_bytes_.clear();
     role_file_.clear();
@@ -1019,6 +1025,10 @@ bool ExpertSource::copy_blobs(const int32_t* layers, const int32_t* experts, uin
     return true;
 }
 
+bool ExpertSource::copy_blobs_mapped(const int32_t* layers, const int32_t* experts, uint8_t* const* dst, size_t n) {
+    return copy_blobs(layers, experts, dst, n);   // sources without a direct-read fast path: the same call
+}
+
 // ================================ CS-T: THE GGUF SHARDS IN PLACE ================================
 //
 // A native pack without experts.bin: every file native_experts.txt names is mapped (MapViewOfFile / mmap, no
@@ -1026,6 +1036,18 @@ bool ExpertSource::copy_blobs(const int32_t* layers, const int32_t* experts, uin
 // is three slices of three tensors, possibly in two shards (UD-Q4_K_XL's layer 11).  Nothing is read at open; a
 // blob is assembled when it is asked for (`blob`, into a small pool of buffers) or copied where it is needed
 // (`copy_blob`: the RAM copy, the prompt path's pinned stager buffers).
+// The exact-value cold direct-read opt-in (STRATA_QWEN35_COLD_PREAD=1, default off).  It replaces the transient
+// producer copies' mapped memcpys with explicit file reads into the caller's pinned buffer: the page-fault storm
+// of a first touch of every cold expert's pages (measured ~2.86M faults / ~407 ns each) is not paid at all.
+// Unset, unparsable or "0" keeps the original mapped path, byte for byte.
+bool cold_pread_enabled() {
+    static const bool on = [] {
+        const char* v = std::getenv("STRATA_QWEN35_COLD_PREAD");
+        return v != nullptr && std::strcmp(v, "1") == 0;
+    }();
+    return on;
+}
+
 bool FileExpertSource::open_gguf(std::string& err) {
     const auto& lay = strata::kernels::cpu::expert_layout();
     if (!check_experts_gguf(gguf_, lay, err)) { err = "FileExpertSource: " + err; return false; }
@@ -1101,6 +1123,35 @@ bool FileExpertSource::open_gguf(std::string& err) {
     base_ = maps_.front().base;       // "opened"; mapped_blob answers nullptr in this mode
     warm_stamp_.reset(new std::atomic<uint32_t>[(size_t) (n_layers_ * n_expert_)]());
     for (uint64_t b : layer_blob_bytes_) stage_blob_ = std::max(stage_blob_, b);
+    // The exact-value cold direct-read opt-in (default off): validate that every mapped shard can be opened for
+    // the reads, and keep a pool of plain handles per shard (grown on demand).  A shard that cannot be opened
+    // keeps the whole opt-in off (the default path), with one bounded note.
+    if (cold_pread_enabled()) {
+#if defined(_WIN32)
+        pread_pool_.assign(maps_.size(), {});
+        bool all = true;
+        for (size_t i = 0; i < paths_.size() && all; ++i) {
+            const int wide = MultiByteToWideChar(CP_UTF8, 0, paths_[i].c_str(), -1, nullptr, 0);
+            std::vector<wchar_t> wpath((size_t) (wide > 0 ? wide : 1));
+            if (wide > 0) MultiByteToWideChar(CP_UTF8, 0, paths_[i].c_str(), -1, wpath.data(), wide);
+            HANDLE h = CreateFileW(wpath.data(), GENERIC_READ, FILE_SHARE_READ, nullptr, OPEN_EXISTING,
+                                   FILE_ATTRIBUTE_NORMAL, nullptr);
+            if (h == INVALID_HANDLE_VALUE) { all = false; break; }
+            pread_pool_[i].push_back((void*) h);
+        }
+        if (!all) {
+            for (auto& pool : pread_pool_)
+                for (void* h : pool) CloseHandle((HANDLE) h);
+            pread_pool_.clear();
+        }
+        cold_pread_ = all && !pread_pool_.empty();
+        std::fprintf(stderr, cold_pread_ ? "FileExpertSource: the cold direct-read path is on (STRATA_QWEN35_COLD_PREAD=1, ReadFile)\n"
+                                         : "FileExpertSource: the cold direct-read path is off (a handle could not be opened)\n");
+#else
+        cold_pread_ = true;
+        std::fprintf(stderr, "FileExpertSource: the cold direct-read path is on (STRATA_QWEN35_COLD_PREAD=1, pread)\n");
+#endif
+    }
     return true;
 }
 
@@ -2105,6 +2156,10 @@ double FileExpertSource::cached_share(int64_t samples) const {
 }
 
 bool FileExpertSource::copy_blob(int64_t layer, int64_t expert, uint8_t* dst) {
+    return copy_blob_impl(layer, expert, dst, /*allow_direct=*/true);
+}
+
+bool FileExpertSource::copy_blob_impl(int64_t layer, int64_t expert, uint8_t* dst, bool allow_direct) {
     if (base_ == nullptr || dst == nullptr || layer < 0 || expert < 0 || layer >= n_layers_ || expert >= n_expert_)
         return false;
     const size_t index = (size_t) layer * (size_t) n_expert_ + (size_t) expert;
@@ -2119,10 +2174,110 @@ bool FileExpertSource::copy_blob(int64_t layer, int64_t expert, uint8_t* dst) {
         }
     }
     const auto t0 = std::chrono::steady_clock::now();
-    if (!copy_from_files(layer, expert, dst)) return false;
+    // The cold direct-read opt-in (default off): the transient (file-tier) blobs are read straight from the GGUF
+    // shards into `dst` instead of memcpy'ing the mapped pages.  A failed read is a failure (no fallback).
+    if (allow_direct && cold_pread_ && direct_.empty() && !role_ptr_.empty()) {
+        if (!copy_blob_direct(layer, expert, dst)) return false;
+    } else if (!copy_from_files(layer, expert, dst)) {
+        return false;
+    }
     file_us_.fetch_add((uint64_t) std::chrono::duration<double, std::micro>(std::chrono::steady_clock::now() - t0).count(),
                        std::memory_order_relaxed);
     file_read_bytes_.fetch_add(bytes, std::memory_order_relaxed);
+    return true;
+}
+
+// The three role slices read from their files, at the same offsets and lengths the mapped path copies (role_ptr_ is
+// base + offset, so role_ptr_[i] - maps_[fi].base is the slice's file offset).  Byte equality is the contract; with
+// the STAGER_CHECK diagnostic the producer's writes are compared against `copy_blobs_mapped`'s output.
+bool FileExpertSource::copy_blob_direct(int64_t layer, int64_t expert, uint8_t* dst) {
+    uint64_t at = 0;
+    for (int r = 0; r < 3; ++r) {
+        const size_t i = (size_t) (3 * layer + r);
+        if (i >= role_ptr_.size() || role_ptr_[i] == nullptr) return false;
+        const int fi = role_file_[i];
+        if (fi < 0 || (size_t) fi >= maps_.size()) return false;
+        const uint64_t per = role_bytes_[i];
+        if (per == 0) return false;
+        const uint64_t off = (uint64_t) (role_ptr_[i] - maps_[(size_t) fi].base) + (uint64_t) expert * per;
+        void* h = nullptr;
+#if defined(_WIN32)
+        h = pread_acquire(fi);
+        if (h == nullptr) return false;
+#endif
+        const bool ok = read_slice_direct(fi, h, dst + at, per, off);
+#if defined(_WIN32)
+        pread_release(fi, h);
+#endif
+        if (!ok) return false;
+        at += per;
+    }
+    return true;
+}
+
+void* FileExpertSource::pread_acquire(int fi) {
+    std::lock_guard<std::mutex> lk(pread_mu_);
+    if (fi < 0 || (size_t) fi >= pread_pool_.size()) return nullptr;
+    std::vector<void*>& pool = pread_pool_[(size_t) fi];
+    if (!pool.empty()) {
+        void* h = pool.back();
+        pool.pop_back();
+        return h;
+    }
+    const int wide = MultiByteToWideChar(CP_UTF8, 0, paths_[(size_t) fi].c_str(), -1, nullptr, 0);
+    std::vector<wchar_t> wpath((size_t) (wide > 0 ? wide : 1));
+    if (wide > 0) MultiByteToWideChar(CP_UTF8, 0, paths_[(size_t) fi].c_str(), -1, wpath.data(), wide);
+    HANDLE h = CreateFileW(wpath.data(), GENERIC_READ, FILE_SHARE_READ, nullptr, OPEN_EXISTING,
+                           FILE_ATTRIBUTE_NORMAL, nullptr);
+    return h == INVALID_HANDLE_VALUE ? nullptr : (void*) h;
+}
+
+void FileExpertSource::pread_release(int fi, void* h) {
+    if (h == nullptr) return;
+    std::lock_guard<std::mutex> lk(pread_mu_);
+    if (fi >= 0 && (size_t) fi < pread_pool_.size()) pread_pool_[(size_t) fi].push_back(h);
+#if defined(_WIN32)
+    else CloseHandle((HANDLE) h);
+#else
+    (void) h;
+#endif
+}
+
+bool FileExpertSource::read_slice_direct(int fi, void* h, uint8_t* dst, uint64_t n, uint64_t off) const {
+#if defined(_WIN32)
+    // A plain (non-overlapped) handle held exclusively by this thread for the run: the same pattern task 96's
+    // 14.775 GB/s readfile arm used (SetFilePointerEx + ReadFile, no overlapped completion state).
+    if (h == nullptr) return false;
+    LARGE_INTEGER li;
+    li.QuadPart = (LONGLONG) off;
+    if (!SetFilePointerEx((HANDLE) h, li, nullptr, FILE_BEGIN)) {
+        std::fprintf(stderr, "FileExpertSource: cold direct read: SetFilePointerEx failed (file %d, off %llu, err %lu)\n",
+                     fi, (unsigned long long) off, GetLastError());
+        return false;
+    }
+    uint64_t done = 0;
+    while (done < n) {
+        const DWORD want = (DWORD) std::min<uint64_t>(n - done, 0x40000000ull);
+        DWORD got = 0;
+        if (!ReadFile((HANDLE) h, dst + done, want, &got, nullptr) || got == 0) {
+            std::fprintf(stderr, "FileExpertSource: cold direct read failed (file %d, off %llu, n %llu, got %lu, err %lu)\n",
+                         fi, (unsigned long long) (off + done), (unsigned long long) (n - done), (unsigned long) got,
+                         GetLastError());
+            return false;
+        }
+        done += got;
+    }
+    return true;
+#else
+    return pread_full(maps_[(size_t) fi].fd, dst, n, off);
+#endif
+}
+
+bool FileExpertSource::copy_blobs_mapped(const int32_t* layers, const int32_t* experts, uint8_t* const* dst, size_t n) {
+    // The reference copy for the byte check: the same wrappers as copy_blob one by one, with the direct-read
+    // opt-in forced off.  With the opt-in unset this is byte-for-byte the old reference (ExpertSource::copy_blobs).
+    for (size_t i = 0; i < n; ++i)
+        if (!copy_blob_impl(layers[i], experts[i], dst[i], /*allow_direct=*/false)) return false;
     return true;
 }
 

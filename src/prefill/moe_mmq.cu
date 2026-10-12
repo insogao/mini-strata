@@ -33,10 +33,12 @@ __global__ void copy16_kernel(const uint4* __restrict__ a, int64_t na, const uin
 struct GroupArgs {
     const uint8_t* blob[kGatherGroupMax];
     int64_t up_off, down_off, gu_stride, d_stride;   // in uint4
+    uint32_t skip_mask;                              // task 74: bit q set = member q is not copied
 };
 __global__ void copy16_group_kernel(GroupArgs ga, int first, int64_t na, int64_t nc, uint4* __restrict__ gu_dst,
                                     uint4* __restrict__ d_dst) {
     const int q = first + (int) blockIdx.y;
+    if (ga.skip_mask & (1u << (unsigned) q)) return;   // task 74: direct-filled member
     const uint4* src = (const uint4*) ga.blob[q];
     uint4* ab = gu_dst + (int64_t) q * ga.gu_stride;
     uint4* cd = d_dst + (int64_t) q * ga.d_stride;
@@ -247,9 +249,21 @@ void gather_native(const void* gate, const void* up, size_t gu_half_bytes, const
 
 bool gather_native_group(const GatherGroup& g, size_t up_off, size_t gu_half_bytes, size_t down_off, size_t d_bytes,
                          void* gu_dst, size_t gu_stride, void* d_dst, size_t d_stride, void* stream) {
+    return gather_native_group_masked(g, 0, up_off, gu_half_bytes, down_off, d_bytes, gu_dst, gu_stride, d_dst,
+                                      d_stride, stream);
+}
+
+bool gather_native_group_masked(const GatherGroup& g, uint32_t skip_mask, size_t up_off, size_t gu_half_bytes,
+                                size_t down_off, size_t d_bytes, void* gu_dst, size_t gu_stride, void* d_dst,
+                                size_t d_stride, void* stream) {
     if (g.first < 0 || g.n <= g.first || g.n > kGatherGroupMax) return false;
     uintptr_t a = (uintptr_t) gu_dst | (uintptr_t) d_dst | up_off | gu_half_bytes | down_off | d_bytes | gu_stride | d_stride;
-    for (int q = g.first; q < g.n; ++q) a |= (uintptr_t) g.blob[q];
+    for (int q = g.first; q < g.n; ++q) {
+        // Task 74: members that were filled directly are not read, so their pointers are not part of the
+        // alignment precheck (the check covers exactly the members this launch copies).
+        if (skip_mask & (1u << (unsigned) q)) continue;
+        a |= (uintptr_t) g.blob[q];
+    }
     if (a % 16 != 0) return false;
     GroupArgs ga{};
     for (int q = g.first; q < g.n; ++q) ga.blob[q] = g.blob[q];
@@ -257,10 +271,11 @@ bool gather_native_group(const GatherGroup& g, size_t up_off, size_t gu_half_byt
     ga.down_off = (int64_t) down_off / 16;
     ga.gu_stride = (int64_t) gu_stride / 16;
     ga.d_stride = (int64_t) d_stride / 16;
+    ga.skip_mask = (skip_mask >> (unsigned) g.first) << (unsigned) g.first;   // keep the caller's bit numbering
     const int64_t na = (int64_t) gu_half_bytes / 16, nc = (int64_t) d_bytes / 16;
     copy16_group_kernel<<<dim3(blocks(2 * na + nc), (unsigned) (g.n - g.first)), 256, 0, (cudaStream_t) stream>>>(
         ga, g.first, na, nc, (uint4*) gu_dst, (uint4*) d_dst);
-    ck(cudaGetLastError(), "gather_native_group");
+    ck(cudaGetLastError(), "gather_native_group_masked");
     return true;
 }
 

@@ -75,6 +75,14 @@ struct GatherGroup {
 };
 bool gather_native_group(const GatherGroup& g, size_t up_off, size_t gu_half_bytes, size_t down_off, size_t d_bytes,
                          void* gu_dst, size_t gu_stride, void* d_dst, size_t d_stride, void* stream);
+
+// Task 74: the same group gather, but members whose bit is set in skip_mask are not copied (their destination
+// slots were filled directly by the cold direct-to-group H2D).  The 16-byte alignment precheck then covers only
+// the copied members; gu_dst/d_dst and the per-member strides are the same.  skip_mask 0 is identical to
+// gather_native_group.
+bool gather_native_group_masked(const GatherGroup& g, uint32_t skip_mask, size_t up_off, size_t gu_half_bytes,
+                                size_t down_off, size_t d_bytes, void* gu_dst, size_t gu_stride, void* d_dst,
+                                size_t d_stride, void* stream);
 /// A Strata-pack Q2_0 expert blob (codes and fp16 scales in separate planes, gate/up rows interleaved) into GGUF
 /// Q2_0 blocks: gate/up [1280, 2560] at `gu_dst` (rows stay interleaved), down [2560, 640] at `d_dst`.  Same values.
 void gather_strata_q2(const uint8_t* blob, void* gu_dst, void* d_dst, void* stream);
