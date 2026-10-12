@@ -4294,7 +4294,7 @@ static int ggml_cuda_try_fuse(ggml_backend_cuda_context * cuda_ctx, ggml_cgraph 
         return env != nullptr && std::atoi(env) == 1;
     }();
     if (fuse_add_rms_norm && i + 2 < cgraph->n_nodes &&
-        ggml_cuda_can_fuse(cgraph, i, { GGML_OP_ADD, GGML_OP_RMS_NORM, GGML_OP_MUL }, {}) &&
+        ggml_can_fuse(cgraph, i, { GGML_OP_ADD, GGML_OP_RMS_NORM, GGML_OP_MUL }) &&
         ggml_cuda_should_fuse_add_rms_norm(node, cgraph->nodes[i + 1], cgraph->nodes[i + 2])) {
         const int out_node = i + 2;
         if (ggml_cuda_check_fusion_memory_ranges(cgraph, i, 3, &out_node, 1)) {

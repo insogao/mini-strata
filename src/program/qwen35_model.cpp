@@ -180,6 +180,80 @@ bool gdn_events_enabled() {
     return on;
 }
 
+// Task 153 M0 observation (both gates default off; host logs only - no GPU event, no extra synchronize, no
+// sampler/router/math/KV-state change, and the default-off JSON/behaviour is byte-identical):
+//  - STRATA_QWEN35_DECODE_TIMESTAMPS=1: per visible token a token_timing line with host steady_clock instants
+//    (ready = the sampler returned the token, emit = its token line was written and flushed) as seconds from
+//    the request boundary (the prefill start, the same boundary TTFT uses), plus one decode_observation line
+//    with the request-start anchor, E2E, ITL arrays/p50/p95/p99, first-4/steady splits and (n-1)/(last-first)
+//    DecodeTPS (null when n < 2).
+//  - STRATA_QWEN35_STOP_EOG=1: a real autoregressive run (no teacher prefix) stops at the first vocab EOG
+//    token; the EOG is not a visible output, is never fed back and never printed (it is reported in the stop
+//    record).  A teacher-forced replay is not autoregressive and never stops on EOG - it keeps its max-new
+//    budget and is labelled teacher_replay=true in the stop record.
+bool decode_timestamps_enabled() {
+    static const bool on = [] {
+        const char* v = std::getenv("STRATA_QWEN35_DECODE_TIMESTAMPS");
+        return v != nullptr && std::strcmp(v, "1") == 0;
+    }();
+    return on;
+}
+
+bool stop_eog_enabled() {
+    static const bool on = [] {
+        const char* v = std::getenv("STRATA_QWEN35_STOP_EOG");
+        return v != nullptr && std::strcmp(v, "1") == 0;
+    }();
+    return on;
+}
+
+// Nearest-rank percentile (p in [0,1]): sorted copy, rank = ceil(p*n) clamped to [1,n]; the caller gates on
+// a non-empty array.  Deterministic by construction and pinned in decode-benchmark-spec.md.
+double percentile_nearest_rank(std::vector<double> values, double p) {
+    std::sort(values.begin(), values.end());
+    size_t rank = (size_t) std::ceil(p * (double) values.size());
+    if (rank < 1) rank = 1;
+    if (rank > values.size()) rank = values.size();
+    return values[rank - 1];
+}
+
+// Task 153 M0 (TIMESTAMPS gate only): tracks the visible output pieces as raw bytes and reports the first
+// moment the emitted stream closes a top-level JSON object/array (depth back to 0, strings respected).
+// Structural JSON characters are ASCII, so a split UTF-8 sequence (bytes >= 0x80) can never be one; the
+// detector is host-only, allocates nothing and stops feeding once closed/failed.  Outputs that never start
+// with '{'/'[' (e.g. the long-form text channel) report failed and the JSON-close time stays null.
+struct JsonClosureDetector {
+    bool started = false;
+    bool failed = false;
+    bool closed = false;
+    bool in_string = false;
+    bool escape = false;
+    int depth = 0;
+    bool feed(const char* data, int size) {
+        if (closed || failed) return false;
+        for (int i = 0; i < size; ++i) {
+            const char c = data[i];
+            if (in_string) {
+                if (escape) escape = false;
+                else if (c == '\\') escape = true;
+                else if (c == '"') in_string = false;
+                continue;
+            }
+            if (c == '"') { in_string = true; }
+            else if (c == '{' || c == '[') { started = true; ++depth; }
+            else if (c == '}' || c == ']') {
+                if (started) {
+                    --depth;
+                    if (depth <= 0) { closed = true; return true; }
+                }
+            } else if (c != ' ' && c != '\n' && c != '\r' && c != '\t') {
+                if (!started) { failed = true; return false; }
+            }
+        }
+        return false;
+    }
+};
+
 // Runs the (idempotent) GDN flush on every return path of qwen35_run, so a failed run still reports its
 // partial counts.  The run declares it after the llama context, so it fires before context destruction.
 struct GdnEventsFlushGuard {
@@ -560,6 +634,7 @@ int qwen35_run(const Qwen35RunOptions& o) {
         }
     }
     const auto prefill_begin = Clock::now();
+    const double request_start_since_process_start = elapsed(process_start);   // task 153 M0 request anchor
     core::qwen35_a_split_mark(0);   // task 134 diagnostic (no-op unless the gate is on)
     // Additive prompt-phase split: prefill_process_seconds is the sum of the llama_process spans (the
     // submit calls below) and prefill_finish_seconds the finish_prompt span; the existing prefill_seconds
@@ -622,6 +697,27 @@ int qwen35_run(const Qwen35RunOptions& o) {
     std::vector<llama_token> generated;
     double decode_seconds = 0;
     int decode_evaluations = 0;
+    // Task 153 M0 observation state (default off; reads the same loop, changes no loop decision when off).
+    const bool decode_timestamps_on = decode_timestamps_enabled();
+    const bool stop_eog_on = stop_eog_enabled();
+    std::vector<double> decode_token_ready_s;   // visible tokens only, seconds from the request anchor
+    std::vector<double> decode_token_emit_s;
+    const char* decode_stop_reason = "max_new";   // eog | nan | decode_process_error keep their own value
+    long long decode_eog_id = -1;
+    const bool decode_entered = (rc == 0);
+    // Task 153 M0 statistics split (TIMESTAMPS gate only, host read-only): the last prompt crop already ran
+    // one T1 seam (the prompt tail), so the raw cumulative bridge counters include a base; the decode-only
+    // values reported below are (after loop - this snapshot), taken with the run's own counters.
+    core::Qwen35BridgeStats decode_base{};
+    bool decode_base_ok = false;
+    if (decode_timestamps_on) {
+        core::qwen35_bridge_stats(decode_base);
+        decode_base_ok = true;
+    }
+    double eos_sample_s = -1.0;          // EOG sampling instant (seconds from the request anchor)
+    bool json_closed = false;            // first visible-pieces JSON closure (TIMESTAMPS gate only)
+    double json_close_emit_s = -1.0;
+    JsonClosureDetector json_detector;
     // Additive decode timing (observation only - no new synchronize, no ordering change):
     //  - decode_eval_seconds: sum over completed evals of [just before llama_process -> return of the next
     //    llama_get_logits_ith], so a span holds its process, the next round's VRAM sample, host gap and the
@@ -712,6 +808,7 @@ int qwen35_run(const Qwen35RunOptions& o) {
             decode_scan_seconds += elapsed(scan_begin);
             ++decode_scan_rounds;
             if (scan_found_nan) {
+                decode_stop_reason = "nan";
                 decode_observe_seconds += elapsed(observe_begin);
                 ++decode_observe_rounds;
                 std::fprintf(stderr, "strata generate: NaN in the logits at output %lld; stopping\n",
@@ -723,6 +820,18 @@ int qwen35_run(const Qwen35RunOptions& o) {
             const llama_token token = llama_sampler_sample(sampler.get(), ctx.get(), -1);
             decode_sampler_seconds += elapsed(sampler_begin);
             ++decode_sampler_rounds;
+            // Task 153 M0 (STRATA_QWEN35_STOP_EOG=1 only): a true autoregressive run stops before the EOG
+            // becomes an output - it is not pushed, not printed and not fed back.  A teacher replay is not
+            // autoregressive and is exempt (max-new budget kept, labelled in the observation record).
+            if (stop_eog_on && teacher.empty() && llama_vocab_is_eog(vocab, token)) {
+                decode_stop_reason = "eog";
+                decode_eog_id = (long long) token;
+                eos_sample_s = elapsed(prefill_begin);
+                std::printf("{\"event\":\"eog_stop\",\"index\":%lld,\"id\":%d}\n", (long long) i, token);
+                std::fflush(stdout);
+                break;
+            }
+            const double ready_s = decode_timestamps_on ? elapsed(prefill_begin) : -1.0;   // task 153 M0
             if (topk_stream.is_open()) {
                 const auto topk_begin = Clock::now();
                 if (logits != nullptr) {
@@ -786,6 +895,21 @@ int qwen35_run(const Qwen35RunOptions& o) {
             ++decode_flush_rounds;
             decode_piece_json_flush_seconds += elapsed(piece_begin);
             ++decode_piece_json_flush_rounds;
+            if (decode_timestamps_on) {
+                // Emit instant = the token event above was written and flushed (the consumer can read it).
+                // ready_s/emit_s are host steady_clock instants from the request anchor; this line performs
+                // no synchronization and is the only new write on the ON path.
+                const double emit_s = elapsed(prefill_begin);
+                if (!json_closed && json_detector.feed(piece, size > 0 ? size : 0)) {
+                    json_closed = true;
+                    json_close_emit_s = emit_s;
+                }
+                decode_token_ready_s.push_back(ready_s);
+                decode_token_emit_s.push_back(emit_s);
+                std::printf("{\"event\":\"token_timing\",\"index\":%lld,\"ready_s\":%.9g,\"emit_s\":%.9g}\n",
+                            (long long) i, ready_s, emit_s);
+                std::fflush(stdout);
+            }
             decode_observe_seconds += elapsed(observe_begin);
             ++decode_observe_rounds;
             // Graph observation boundary (default off): one record per generated output; perf is read only
@@ -797,6 +921,7 @@ int qwen35_run(const Qwen35RunOptions& o) {
                 eval_span_begin = Clock::now();
                 const int process_rc = llama_process(ctx.get(), LLAMA_PROCESS_TYPE_DECODE, batch.get());
                 if (process_rc != 0) {
+                    decode_stop_reason = "decode_process_error";
                     std::fprintf(stderr, "strata generate: decode failed at %lld\n", (long long) i);
                     rc = 1;
                     break;
@@ -1011,6 +1136,183 @@ int qwen35_run(const Qwen35RunOptions& o) {
             decode_token_write_seconds, (long long) decode_token_write_rounds,
             decode_flush_seconds, (long long) decode_flush_rounds);
     std::fflush(stdout);
+    // Task 153 M0 observation (printed only when one of the two gates above is ON; with both OFF the stdout
+    // ends at the summary exactly as before).  The stop record is emitted for either gate; the timing block
+    // is filled only by TIMESTAMPS.  Everything is derived from the loop's own host instants: no new
+    // synchronization, no change to any earlier number, and the raw per-token instants are the
+    // token_timing lines on stdout.
+    if (decode_timestamps_on || stop_eog_on) {
+        const char* stop_reason = decode_stop_reason;
+        if (!decode_entered) stop_reason = loan_returned ? "prefill_failed" : "loan_failed";
+        const size_t n_visible = generated.size();
+        // Timing values exist only when TIMESTAMPS=1 filled exactly one record per visible token; every
+        // .front()/.back() access below is guarded by timing_ok (STOP_EOG alone leaves the arrays empty).
+        const bool timing_ok = decode_timestamps_on && !decode_token_emit_s.empty() &&
+                               decode_token_emit_s.size() == n_visible &&
+                               decode_token_ready_s.size() == n_visible;
+        std::vector<double> itl_emit_ms, itl_ready_ms;
+        if (timing_ok) {
+            for (size_t k = 1; k < n_visible; ++k) {
+                itl_emit_ms.push_back((decode_token_emit_s[k] - decode_token_emit_s[k - 1]) * 1000.0);
+                itl_ready_ms.push_back((decode_token_ready_s[k] - decode_token_ready_s[k - 1]) * 1000.0);
+            }
+        }
+        std::vector<double> itl_steady_emit_ms, itl_steady_ready_ms;   // steady = deltas after the first 4
+        for (size_t k = 4; k < itl_emit_ms.size(); ++k) {
+            itl_steady_emit_ms.push_back(itl_emit_ms[k]);
+            itl_steady_ready_ms.push_back(itl_ready_ms[k]);
+        }
+        const std::vector<double> itl_first4_emit_ms(
+            itl_emit_ms.begin(), itl_emit_ms.begin() + std::min<size_t>(4, itl_emit_ms.size()));
+        const auto arrays_json = [](const std::vector<double>& v) {
+            std::string s = "[";
+            for (size_t k = 0; k < v.size(); ++k) {
+                char buf[64];
+                std::snprintf(buf, sizeof(buf), "%s%.9g", k ? "," : "", v[k]);
+                s += buf;
+            }
+            return s + "]";
+        };
+        const auto pct_json = [](const std::vector<double>& v, double p) {
+            if (v.empty()) return std::string("null");
+            char buf[64];
+            std::snprintf(buf, sizeof(buf), "%.6g", percentile_nearest_rank(v, p));
+            return std::string(buf);
+        };
+        std::string tps_emit = "null", tps_ready = "null";
+        if (timing_ok && n_visible >= 2) {
+            char buf[64];
+            const double span_emit = decode_token_emit_s.back() - decode_token_emit_s.front();
+            if (span_emit > 0) {
+                std::snprintf(buf, sizeof(buf), "%.6g", (double) (n_visible - 1) / span_emit);
+                tps_emit = buf;
+            }
+            const double span_ready = decode_token_ready_s.back() - decode_token_ready_s.front();
+            if (span_ready > 0) {
+                std::snprintf(buf, sizeof(buf), "%.6g", (double) (n_visible - 1) / span_ready);
+                tps_ready = buf;
+            }
+        }
+        std::string first_id = "null", last_id = "null", eog_id = "null", e2e_last = "null";
+        std::string eos_sample = "null", json_close = "null";
+        {
+            char buf[64];
+            if (n_visible >= 1) {
+                std::snprintf(buf, sizeof(buf), "%d", (int) generated.front());
+                first_id = buf;
+                std::snprintf(buf, sizeof(buf), "%d", (int) generated.back());
+                last_id = buf;
+                if (timing_ok) {
+                    std::snprintf(buf, sizeof(buf), "%.9g", decode_token_emit_s.back());
+                    e2e_last = buf;
+                }
+            }
+            if (decode_eog_id >= 0) {
+                std::snprintf(buf, sizeof(buf), "%lld", decode_eog_id);
+                eog_id = buf;
+            }
+            if (eos_sample_s >= 0) {
+                std::snprintf(buf, sizeof(buf), "%.9g", eos_sample_s);
+                eos_sample = buf;
+            }
+            if (json_closed && json_close_emit_s >= 0) {
+                std::snprintf(buf, sizeof(buf), "%.9g", json_close_emit_s);
+                json_close = buf;
+            }
+        }
+        // Decode-only bridge counters (after loop - the pre-decode snapshot).  When the WARM_ROUND /
+        // MULTI_ROUND diagnostics ran, the snapshot is corrected exactly like the summary corrects `st`.
+        std::string base_json = "null", measured_json = "null";
+        if (decode_base_ok) {
+            core::Qwen35BridgeStats base = decode_base;
+            if (warm_discard_ok) {
+                base.jobs -= warm_after.jobs;
+                base.expert_seconds -= warm_after.expert_seconds;
+                base.decode_layers -= warm_after.decode_layers;
+                base.decode_hits -= warm_after.decode_hits;
+                base.decode_misses -= warm_after.decode_misses;
+            }
+            if (multi_round_ok) {
+                base.jobs -= multi_after.jobs;
+                base.expert_seconds -= multi_after.expert_seconds;
+                base.decode_layers -= multi_after.decode_layers;
+                base.decode_hits -= multi_after.decode_hits;
+                base.decode_misses -= multi_after.decode_misses;
+                base.ms_ids -= multi_after.ms_ids;
+                base.ms_launch -= multi_after.ms_launch;
+                base.ms_misses -= multi_after.ms_misses;
+                base.ms_combine -= multi_after.ms_combine;
+                base.ms_queue -= multi_after.ms_queue;
+            }
+            core::Qwen35BridgeStats measured{};
+            measured.decode_layers = st.decode_layers - base.decode_layers;
+            measured.decode_hits = st.decode_hits - base.decode_hits;
+            measured.decode_misses = st.decode_misses - base.decode_misses;
+            measured.jobs = st.jobs - base.jobs;
+            measured.expert_seconds = st.expert_seconds - base.expert_seconds;
+            measured.ms_ids = st.ms_ids - base.ms_ids;
+            measured.ms_launch = st.ms_launch - base.ms_launch;
+            measured.ms_misses = st.ms_misses - base.ms_misses;
+            measured.ms_combine = st.ms_combine - base.ms_combine;
+            measured.ms_queue = st.ms_queue - base.ms_queue;
+            const auto stats_json = [](const core::Qwen35BridgeStats& s) {
+                char buf[512];
+                std::snprintf(buf, sizeof(buf),
+                              "{\"layers\":%lld,\"hits\":%lld,\"misses\":%lld,\"jobs\":%lld,"
+                              "\"expert_seconds\":%.6g,\"tier_ms\":{\"ids\":%.1f,\"launch\":%.1f,"
+                              "\"misses\":%.1f,\"combine\":%.1f,\"admit\":%.1f}}",
+                              (long long) s.decode_layers, (long long) s.decode_hits,
+                              (long long) s.decode_misses, (long long) s.jobs, s.expert_seconds,
+                              s.ms_ids, s.ms_launch, s.ms_misses, s.ms_combine, s.ms_queue);
+                return std::string(buf);
+            };
+            base_json = stats_json(base);
+            measured_json = stats_json(measured);
+        }
+        const double e2e_observation_s = elapsed(prefill_begin);
+        if (decode_timestamps_on) {
+            std::printf("{\"event\":\"decode_observation\",\"timestamps\":true,\"stop_eog\":%s,"
+                        "\"teacher_replay\":%s,\"request_boundary\":\"prefill_start\","
+                        "\"request_start_since_process_start_seconds\":%.9g,"
+                        "\"stop\":{\"reason\":\"%s\",\"eog_id\":%s,\"eos_sample_s\":%s,"
+                        "\"visible_output_tokens\":%zu,\"decode_evaluations\":%d,"
+                        "\"first_token_id\":%s,\"last_token_id\":%s},"
+                        "\"decode_timing\":{\"timing_complete\":%s,\"e2e_last_visible_token_seconds\":%s,"
+                        "\"e2e_observation_seconds\":%.9g,\"json_close_emit_s\":%s,"
+                        "\"decode_tps_emit\":%s,\"decode_tps_ready\":%s,"
+                        "\"itl_emit_ms_p50\":%s,\"itl_emit_ms_p95\":%s,\"itl_emit_ms_p99\":%s,"
+                        "\"itl_ready_ms_p50\":%s,\"itl_ready_ms_p95\":%s,\"itl_ready_ms_p99\":%s,"
+                        "\"itl_steady_emit_ms_p50\":%s,\"itl_steady_emit_ms_p95\":%s,\"itl_steady_emit_ms_p99\":%s,"
+                        "\"itl_steady_ready_ms_p50\":%s,\"itl_steady_ready_ms_p95\":%s,\"itl_steady_ready_ms_p99\":%s,"
+                        "\"itl_first4_emit_ms\":%s,\"itl_emit_ms\":%s,\"itl_ready_ms\":%s},"
+                        "\"decode_base\":%s,\"decode_measured\":%s}\n",
+                        stop_eog_on ? "true" : "false", teacher.empty() ? "false" : "true",
+                        request_start_since_process_start, stop_reason, eog_id.c_str(), eos_sample.c_str(),
+                        n_visible, decode_evaluations, first_id.c_str(), last_id.c_str(),
+                        timing_ok ? "true" : "false", e2e_last.c_str(), e2e_observation_s,
+                        json_close.c_str(), tps_emit.c_str(), tps_ready.c_str(),
+                        pct_json(itl_emit_ms, 0.50).c_str(), pct_json(itl_emit_ms, 0.95).c_str(),
+                        pct_json(itl_emit_ms, 0.99).c_str(), pct_json(itl_ready_ms, 0.50).c_str(),
+                        pct_json(itl_ready_ms, 0.95).c_str(), pct_json(itl_ready_ms, 0.99).c_str(),
+                        pct_json(itl_steady_emit_ms, 0.50).c_str(), pct_json(itl_steady_emit_ms, 0.95).c_str(),
+                        pct_json(itl_steady_emit_ms, 0.99).c_str(), pct_json(itl_steady_ready_ms, 0.50).c_str(),
+                        pct_json(itl_steady_ready_ms, 0.95).c_str(), pct_json(itl_steady_ready_ms, 0.99).c_str(),
+                        arrays_json(itl_first4_emit_ms).c_str(), arrays_json(itl_emit_ms).c_str(),
+                        arrays_json(itl_ready_ms).c_str(), base_json.c_str(), measured_json.c_str());
+        } else {
+            std::printf("{\"event\":\"decode_observation\",\"timestamps\":false,\"stop_eog\":%s,"
+                        "\"teacher_replay\":%s,\"request_boundary\":\"prefill_start\","
+                        "\"request_start_since_process_start_seconds\":%.9g,"
+                        "\"stop\":{\"reason\":\"%s\",\"eog_id\":%s,\"eos_sample_s\":%s,"
+                        "\"visible_output_tokens\":%zu,\"decode_evaluations\":%d,"
+                        "\"first_token_id\":%s,\"last_token_id\":%s},"
+                        "\"decode_timing\":null,\"decode_base\":null,\"decode_measured\":null}\n",
+                        stop_eog_on ? "true" : "false", teacher.empty() ? "false" : "true",
+                        request_start_since_process_start, stop_reason, eog_id.c_str(), eos_sample.c_str(),
+                        n_visible, decode_evaluations, first_id.c_str(), last_id.c_str());
+        }
+        std::fflush(stdout);
+    }
     // Task 68 explicit one-time GDN flush: after prefill/TTFT and the short decode output are recorded,
     // before the context is destroyed.  Its completion waits never enter those numbers.  The guard above
     // covers the failure paths with the same (idempotent) call.
