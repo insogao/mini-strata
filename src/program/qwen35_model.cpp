@@ -217,6 +217,43 @@ double percentile_nearest_rank(std::vector<double> values, double p) {
     return values[rank - 1];
 }
 
+// Task 153 M0 (TIMESTAMPS gate only): tracks the visible output pieces as raw bytes and reports the first
+// moment the emitted stream closes a top-level JSON object/array (depth back to 0, strings respected).
+// Structural JSON characters are ASCII, so a split UTF-8 sequence (bytes >= 0x80) can never be one; the
+// detector is host-only, allocates nothing and stops feeding once closed/failed.  Outputs that never start
+// with '{'/'[' (e.g. the long-form text channel) report failed and the JSON-close time stays null.
+struct JsonClosureDetector {
+    bool started = false;
+    bool failed = false;
+    bool closed = false;
+    bool in_string = false;
+    bool escape = false;
+    int depth = 0;
+    bool feed(const char* data, int size) {
+        if (closed || failed) return false;
+        for (int i = 0; i < size; ++i) {
+            const char c = data[i];
+            if (in_string) {
+                if (escape) escape = false;
+                else if (c == '\\') escape = true;
+                else if (c == '"') in_string = false;
+                continue;
+            }
+            if (c == '"') { in_string = true; }
+            else if (c == '{' || c == '[') { started = true; ++depth; }
+            else if (c == '}' || c == ']') {
+                if (started) {
+                    --depth;
+                    if (depth <= 0) { closed = true; return true; }
+                }
+            } else if (c != ' ' && c != '\n' && c != '\r' && c != '\t') {
+                if (!started) { failed = true; return false; }
+            }
+        }
+        return false;
+    }
+};
+
 // Runs the (idempotent) GDN flush on every return path of qwen35_run, so a failed run still reports its
 // partial counts.  The run declares it after the llama context, so it fires before context destruction.
 struct GdnEventsFlushGuard {
@@ -668,6 +705,19 @@ int qwen35_run(const Qwen35RunOptions& o) {
     const char* decode_stop_reason = "max_new";   // eog | nan | decode_process_error keep their own value
     long long decode_eog_id = -1;
     const bool decode_entered = (rc == 0);
+    // Task 153 M0 statistics split (TIMESTAMPS gate only, host read-only): the last prompt crop already ran
+    // one T1 seam (the prompt tail), so the raw cumulative bridge counters include a base; the decode-only
+    // values reported below are (after loop - this snapshot), taken with the run's own counters.
+    core::Qwen35BridgeStats decode_base{};
+    bool decode_base_ok = false;
+    if (decode_timestamps_on) {
+        core::qwen35_bridge_stats(decode_base);
+        decode_base_ok = true;
+    }
+    double eos_sample_s = -1.0;          // EOG sampling instant (seconds from the request anchor)
+    bool json_closed = false;            // first visible-pieces JSON closure (TIMESTAMPS gate only)
+    double json_close_emit_s = -1.0;
+    JsonClosureDetector json_detector;
     // Additive decode timing (observation only - no new synchronize, no ordering change):
     //  - decode_eval_seconds: sum over completed evals of [just before llama_process -> return of the next
     //    llama_get_logits_ith], so a span holds its process, the next round's VRAM sample, host gap and the
@@ -776,6 +826,7 @@ int qwen35_run(const Qwen35RunOptions& o) {
             if (stop_eog_on && teacher.empty() && llama_vocab_is_eog(vocab, token)) {
                 decode_stop_reason = "eog";
                 decode_eog_id = (long long) token;
+                eos_sample_s = elapsed(prefill_begin);
                 std::printf("{\"event\":\"eog_stop\",\"index\":%lld,\"id\":%d}\n", (long long) i, token);
                 std::fflush(stdout);
                 break;
@@ -849,6 +900,10 @@ int qwen35_run(const Qwen35RunOptions& o) {
                 // ready_s/emit_s are host steady_clock instants from the request anchor; this line performs
                 // no synchronization and is the only new write on the ON path.
                 const double emit_s = elapsed(prefill_begin);
+                if (!json_closed && json_detector.feed(piece, size > 0 ? size : 0)) {
+                    json_closed = true;
+                    json_close_emit_s = emit_s;
+                }
                 decode_token_ready_s.push_back(ready_s);
                 decode_token_emit_s.push_back(emit_s);
                 std::printf("{\"event\":\"token_timing\",\"index\":%lld,\"ready_s\":%.9g,\"emit_s\":%.9g}\n",
@@ -1090,10 +1145,17 @@ int qwen35_run(const Qwen35RunOptions& o) {
         const char* stop_reason = decode_stop_reason;
         if (!decode_entered) stop_reason = loan_returned ? "prefill_failed" : "loan_failed";
         const size_t n_visible = generated.size();
+        // Timing values exist only when TIMESTAMPS=1 filled exactly one record per visible token; every
+        // .front()/.back() access below is guarded by timing_ok (STOP_EOG alone leaves the arrays empty).
+        const bool timing_ok = decode_timestamps_on && !decode_token_emit_s.empty() &&
+                               decode_token_emit_s.size() == n_visible &&
+                               decode_token_ready_s.size() == n_visible;
         std::vector<double> itl_emit_ms, itl_ready_ms;
-        for (size_t k = 1; k < decode_token_emit_s.size(); ++k) {
-            itl_emit_ms.push_back((decode_token_emit_s[k] - decode_token_emit_s[k - 1]) * 1000.0);
-            itl_ready_ms.push_back((decode_token_ready_s[k] - decode_token_ready_s[k - 1]) * 1000.0);
+        if (timing_ok) {
+            for (size_t k = 1; k < n_visible; ++k) {
+                itl_emit_ms.push_back((decode_token_emit_s[k] - decode_token_emit_s[k - 1]) * 1000.0);
+                itl_ready_ms.push_back((decode_token_ready_s[k] - decode_token_ready_s[k - 1]) * 1000.0);
+            }
         }
         std::vector<double> itl_steady_emit_ms, itl_steady_ready_ms;   // steady = deltas after the first 4
         for (size_t k = 4; k < itl_emit_ms.size(); ++k) {
@@ -1118,7 +1180,7 @@ int qwen35_run(const Qwen35RunOptions& o) {
             return std::string(buf);
         };
         std::string tps_emit = "null", tps_ready = "null";
-        if (n_visible >= 2) {
+        if (timing_ok && n_visible >= 2) {
             char buf[64];
             const double span_emit = decode_token_emit_s.back() - decode_token_emit_s.front();
             if (span_emit > 0) {
@@ -1132,6 +1194,7 @@ int qwen35_run(const Qwen35RunOptions& o) {
             }
         }
         std::string first_id = "null", last_id = "null", eog_id = "null", e2e_last = "null";
+        std::string eos_sample = "null", json_close = "null";
         {
             char buf[64];
             if (n_visible >= 1) {
@@ -1139,32 +1202,95 @@ int qwen35_run(const Qwen35RunOptions& o) {
                 first_id = buf;
                 std::snprintf(buf, sizeof(buf), "%d", (int) generated.back());
                 last_id = buf;
-                std::snprintf(buf, sizeof(buf), "%.9g", decode_token_emit_s.back());
-                e2e_last = buf;
+                if (timing_ok) {
+                    std::snprintf(buf, sizeof(buf), "%.9g", decode_token_emit_s.back());
+                    e2e_last = buf;
+                }
             }
             if (decode_eog_id >= 0) {
                 std::snprintf(buf, sizeof(buf), "%lld", decode_eog_id);
                 eog_id = buf;
             }
+            if (eos_sample_s >= 0) {
+                std::snprintf(buf, sizeof(buf), "%.9g", eos_sample_s);
+                eos_sample = buf;
+            }
+            if (json_closed && json_close_emit_s >= 0) {
+                std::snprintf(buf, sizeof(buf), "%.9g", json_close_emit_s);
+                json_close = buf;
+            }
+        }
+        // Decode-only bridge counters (after loop - the pre-decode snapshot).  When the WARM_ROUND /
+        // MULTI_ROUND diagnostics ran, the snapshot is corrected exactly like the summary corrects `st`.
+        std::string base_json = "null", measured_json = "null";
+        if (decode_base_ok) {
+            core::Qwen35BridgeStats base = decode_base;
+            if (warm_discard_ok) {
+                base.jobs -= warm_after.jobs;
+                base.expert_seconds -= warm_after.expert_seconds;
+                base.decode_layers -= warm_after.decode_layers;
+                base.decode_hits -= warm_after.decode_hits;
+                base.decode_misses -= warm_after.decode_misses;
+            }
+            if (multi_round_ok) {
+                base.jobs -= multi_after.jobs;
+                base.expert_seconds -= multi_after.expert_seconds;
+                base.decode_layers -= multi_after.decode_layers;
+                base.decode_hits -= multi_after.decode_hits;
+                base.decode_misses -= multi_after.decode_misses;
+                base.ms_ids -= multi_after.ms_ids;
+                base.ms_launch -= multi_after.ms_launch;
+                base.ms_misses -= multi_after.ms_misses;
+                base.ms_combine -= multi_after.ms_combine;
+                base.ms_queue -= multi_after.ms_queue;
+            }
+            core::Qwen35BridgeStats measured{};
+            measured.decode_layers = st.decode_layers - base.decode_layers;
+            measured.decode_hits = st.decode_hits - base.decode_hits;
+            measured.decode_misses = st.decode_misses - base.decode_misses;
+            measured.jobs = st.jobs - base.jobs;
+            measured.expert_seconds = st.expert_seconds - base.expert_seconds;
+            measured.ms_ids = st.ms_ids - base.ms_ids;
+            measured.ms_launch = st.ms_launch - base.ms_launch;
+            measured.ms_misses = st.ms_misses - base.ms_misses;
+            measured.ms_combine = st.ms_combine - base.ms_combine;
+            measured.ms_queue = st.ms_queue - base.ms_queue;
+            const auto stats_json = [](const core::Qwen35BridgeStats& s) {
+                char buf[512];
+                std::snprintf(buf, sizeof(buf),
+                              "{\"layers\":%lld,\"hits\":%lld,\"misses\":%lld,\"jobs\":%lld,"
+                              "\"expert_seconds\":%.6g,\"tier_ms\":{\"ids\":%.1f,\"launch\":%.1f,"
+                              "\"misses\":%.1f,\"combine\":%.1f,\"admit\":%.1f}}",
+                              (long long) s.decode_layers, (long long) s.decode_hits,
+                              (long long) s.decode_misses, (long long) s.jobs, s.expert_seconds,
+                              s.ms_ids, s.ms_launch, s.ms_misses, s.ms_combine, s.ms_queue);
+                return std::string(buf);
+            };
+            base_json = stats_json(base);
+            measured_json = stats_json(measured);
         }
         const double e2e_observation_s = elapsed(prefill_begin);
         if (decode_timestamps_on) {
             std::printf("{\"event\":\"decode_observation\",\"timestamps\":true,\"stop_eog\":%s,"
                         "\"teacher_replay\":%s,\"request_boundary\":\"prefill_start\","
                         "\"request_start_since_process_start_seconds\":%.9g,"
-                        "\"stop\":{\"reason\":\"%s\",\"eog_id\":%s,\"visible_output_tokens\":%zu,"
-                        "\"decode_evaluations\":%d,\"first_token_id\":%s,\"last_token_id\":%s},"
-                        "\"decode_timing\":{\"e2e_last_visible_token_seconds\":%s,"
-                        "\"e2e_observation_seconds\":%.9g,\"decode_tps_emit\":%s,\"decode_tps_ready\":%s,"
+                        "\"stop\":{\"reason\":\"%s\",\"eog_id\":%s,\"eos_sample_s\":%s,"
+                        "\"visible_output_tokens\":%zu,\"decode_evaluations\":%d,"
+                        "\"first_token_id\":%s,\"last_token_id\":%s},"
+                        "\"decode_timing\":{\"timing_complete\":%s,\"e2e_last_visible_token_seconds\":%s,"
+                        "\"e2e_observation_seconds\":%.9g,\"json_close_emit_s\":%s,"
+                        "\"decode_tps_emit\":%s,\"decode_tps_ready\":%s,"
                         "\"itl_emit_ms_p50\":%s,\"itl_emit_ms_p95\":%s,\"itl_emit_ms_p99\":%s,"
                         "\"itl_ready_ms_p50\":%s,\"itl_ready_ms_p95\":%s,\"itl_ready_ms_p99\":%s,"
                         "\"itl_steady_emit_ms_p50\":%s,\"itl_steady_emit_ms_p95\":%s,\"itl_steady_emit_ms_p99\":%s,"
                         "\"itl_steady_ready_ms_p50\":%s,\"itl_steady_ready_ms_p95\":%s,\"itl_steady_ready_ms_p99\":%s,"
-                        "\"itl_first4_emit_ms\":%s,\"itl_emit_ms\":%s,\"itl_ready_ms\":%s}}\n",
+                        "\"itl_first4_emit_ms\":%s,\"itl_emit_ms\":%s,\"itl_ready_ms\":%s},"
+                        "\"decode_base\":%s,\"decode_measured\":%s}\n",
                         stop_eog_on ? "true" : "false", teacher.empty() ? "false" : "true",
-                        request_start_since_process_start, stop_reason, eog_id.c_str(), n_visible,
-                        decode_evaluations, first_id.c_str(), last_id.c_str(), e2e_last.c_str(),
-                        e2e_observation_s, tps_emit.c_str(), tps_ready.c_str(),
+                        request_start_since_process_start, stop_reason, eog_id.c_str(), eos_sample.c_str(),
+                        n_visible, decode_evaluations, first_id.c_str(), last_id.c_str(),
+                        timing_ok ? "true" : "false", e2e_last.c_str(), e2e_observation_s,
+                        json_close.c_str(), tps_emit.c_str(), tps_ready.c_str(),
                         pct_json(itl_emit_ms, 0.50).c_str(), pct_json(itl_emit_ms, 0.95).c_str(),
                         pct_json(itl_emit_ms, 0.99).c_str(), pct_json(itl_ready_ms, 0.50).c_str(),
                         pct_json(itl_ready_ms, 0.95).c_str(), pct_json(itl_ready_ms, 0.99).c_str(),
@@ -1172,17 +1298,18 @@ int qwen35_run(const Qwen35RunOptions& o) {
                         pct_json(itl_steady_emit_ms, 0.99).c_str(), pct_json(itl_steady_ready_ms, 0.50).c_str(),
                         pct_json(itl_steady_ready_ms, 0.95).c_str(), pct_json(itl_steady_ready_ms, 0.99).c_str(),
                         arrays_json(itl_first4_emit_ms).c_str(), arrays_json(itl_emit_ms).c_str(),
-                        arrays_json(itl_ready_ms).c_str());
+                        arrays_json(itl_ready_ms).c_str(), base_json.c_str(), measured_json.c_str());
         } else {
             std::printf("{\"event\":\"decode_observation\",\"timestamps\":false,\"stop_eog\":%s,"
                         "\"teacher_replay\":%s,\"request_boundary\":\"prefill_start\","
                         "\"request_start_since_process_start_seconds\":%.9g,"
-                        "\"stop\":{\"reason\":\"%s\",\"eog_id\":%s,\"visible_output_tokens\":%zu,"
-                        "\"decode_evaluations\":%d,\"first_token_id\":%s,\"last_token_id\":%s},"
-                        "\"decode_timing\":null}\n",
+                        "\"stop\":{\"reason\":\"%s\",\"eog_id\":%s,\"eos_sample_s\":%s,"
+                        "\"visible_output_tokens\":%zu,\"decode_evaluations\":%d,"
+                        "\"first_token_id\":%s,\"last_token_id\":%s},"
+                        "\"decode_timing\":null,\"decode_base\":null,\"decode_measured\":null}\n",
                         stop_eog_on ? "true" : "false", teacher.empty() ? "false" : "true",
-                        request_start_since_process_start, stop_reason, eog_id.c_str(), n_visible,
-                        decode_evaluations, first_id.c_str(), last_id.c_str());
+                        request_start_since_process_start, stop_reason, eog_id.c_str(), eos_sample.c_str(),
+                        n_visible, decode_evaluations, first_id.c_str(), last_id.c_str());
         }
         std::fflush(stdout);
     }
