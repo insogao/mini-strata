@@ -1,5 +1,8 @@
 # mini-strata: Strata Qwen35 / IQ3_S adaptation
 
+最新：[Decode阶段报告](docs/phase2_decode/DECODE_STAGE_REPORT_20261012.md) · [外部代码审核入口](docs/phase2_decode/EXTERNAL_REVIEW_GUIDE.md)。新Decode候选仅在审核分支，尚无确认业务加速；main保留冻结Prefill源码。
+
+
 基于 [Niko1221/Strata](https://github.com/Niko1221/Strata) **v0.1.41** 的实验性 Qwen3.6-35B-A3B 适配。原始 Strata 提交和完整祖先历史保留；成熟 Qwen attention/GDN/shared expert/KV 来自固定 llama.cpp，routed experts 接入 Strata 原共享专家服务。
 
 当前发布的是 **2026-10-12 阶段已复核源码快照**（任务 69–150），对应本机 RTX4060 Laptop 8GiB 的固定 3–4k 中文字符内容审核实验。交付配置：物理微批 4096、cache 3200、冷专家 producer 4、count_desc 排序。**官方口径（单进程完整 prefill、大样本）han 风险/正常样本 1121.00 / 1114.01 token/s（1000+ 达成），chars 两样本 992.75 / 983.36（未达 1000）；长驻服务形态（n=30）四样本 1429.96 / 1428.43 / 1377.34 / 1362.17。** 不是质量或跨机器保证；口径与边界见阶段结论。
