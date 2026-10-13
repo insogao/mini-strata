@@ -74,6 +74,7 @@ option(STRATA_PREFILL_MMQ "Build the optional GGML MMQ prefill path for HIP" OFF
 # every kernel when it starts (CUDA_MODULE_LOADING=EAGER), so these took ~5 MB of VRAM - 1-3 expert slots - from every
 # model, and the UD-Q4_K_XL prompt is SSD-bound with or without them (docs/UNSLOTH_Q4.md)
 option(STRATA_MMQ_KQUANTS "Build the MMQ prompt kernels for Q4_K / Q5_K / Q5_1 / Q6_K: the CUDA experts of Unsloth's UD-Q4_K_XL, and on HIP the dense GGUF projections (STRATA_DENSE_MMQ)" OFF)
+option(STRATA_Q6K_EXPERTS "Opt-in: Q6_K routed-expert support (decode IQ kernels and, with STRATA_MMQ_KQUANTS, the prompt MMQ) for the experimental MTP model" OFF)
 # CUDA: Q6_K gate/up in the grouped expert kernels (Unsloth's UD-Q6_K_XL, docs/UNSLOTH_Q6.md).  Off by default: every
 # grouped-kernel instance is loaded when the engine starts (CUDA_MODULE_LOADING=EAGER), so one more costs VRAM that
 # every other model would lose as expert slots (PR #860 review)
@@ -353,6 +354,11 @@ if(STRATA_ENABLE_CUDA OR STRATA_ENABLE_HIP)
                           src/ngram/ple_reader.cpp
                           src/platform/direct_file.cpp)
   target_link_libraries(strata_kernels PUBLIC strata_core strata_artifact)
+  # Task 241: STRATA_Q6K_EXPERTS is an explicit option (default OFF); the candidate config turns it ON.
+  # Every use is #ifdef-guarded in iq_kernels.cu, so default builds are unchanged.
+  if(STRATA_Q6K_EXPERTS)
+    target_compile_definitions(strata_kernels PRIVATE STRATA_Q6K_EXPERTS=1)
+  endif()
   # perf-review D-1: the tensor-core prompt attention vs the FP32 kernel and FP64 (GPU, synthetic, no model); with
   # the tests, or alone with -DSTRATA_PARITY_PROMPT_ATTN=ON.  CUDA only: HIP compiles the tensor-core kernel out.
   if((STRATA_BUILD_TESTS OR STRATA_PARITY_PROMPT_ATTN) AND STRATA_ENABLE_CUDA)
@@ -1348,6 +1354,10 @@ if(STRATA_NATIVE_EXPERTS)
     endif()
     if(STRATA_MMQ_KQUANTS)
       target_compile_definitions(strata_mmq PRIVATE STRATA_MMQ_KQUANTS=1)
+      # Task 241: the Q6_K MMQ instance needs both switches (see moe_mmq.cu supported()).
+      if(STRATA_Q6K_EXPERTS)
+        target_compile_definitions(strata_mmq PRIVATE STRATA_Q6K_EXPERTS=1)
+      endif()
     endif()
     if(STRATA_ORCA_Q4KS_MMQ)
       target_compile_definitions(strata_mmq PRIVATE STRATA_ORCA_Q4KS_MMQ=1)
@@ -1502,10 +1512,10 @@ if(STRATA_QWEN35)
   # The bridge + runner.  `strata_qwen35` links the shared expert service (`strata_engine`, which carries
   # expert_source/expert_cache and the CPU pool) and the GPU expert kernels (`strata_kernels`); `llama` links
   # it so the patched graph hooks (LLAMA_STRATA_QWEN35) resolve, and the `strata` executable links both.
-  add_library(strata_qwen35 STATIC src/core/qwen35_bridge.cpp src/core/qwen35_prefill.cu src/program/qwen35_model.cpp)
+  add_library(strata_qwen35 STATIC src/core/qwen35_bridge.cpp src/core/qwen35_mtp.cpp src/core/qwen35_mtp_txn.cpp src/core/qwen35_prefill.cu src/program/qwen35_model.cpp)
   target_include_directories(strata_qwen35 PUBLIC ${CMAKE_CURRENT_SOURCE_DIR}/include
                                   PRIVATE ${_strata_gpu_include_directories} ${STRATA_GGML_DIR}/include
-                                          ${STRATA_GGML_DIR}/ggml/include ${STRATA_GGML_DIR}/ggml/src)
+                                          ${STRATA_GGML_DIR}/src ${STRATA_GGML_DIR}/ggml/include ${STRATA_GGML_DIR}/ggml/src)
   target_link_libraries(strata_qwen35 PUBLIC strata_engine strata_kernels strata_prefill ggml-base
                             ${_strata_gpu_runtime_target})
   target_compile_definitions(strata_qwen35 PRIVATE STRATA_QWEN35=1)

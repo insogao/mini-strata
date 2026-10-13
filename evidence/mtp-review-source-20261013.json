@@ -1,0 +1,101 @@
+{
+  "created_at": "2026-10-13T17:01:36.698799+08:00",
+  "review_base_commit": "ba975b0a1e1985623aac16ce55c99b0e2b3a8003",
+  "snapshot": "M268 actual ON paired runs; P271 unbuilt candidate excluded",
+  "tested_binary_sha256": "2678417b90851404083a3dbeeda7ce756699a5154194b6f40170ddf8fa1fd094",
+  "model_sha256": "ab639a7f330f96c47d3e6c2dd2d6445182e7b763e17e6048dc850a71bbc9f27f",
+  "source_worktree_HEAD": "9bb9b6a556376f003d563f3e07a5d1e6dc91757f",
+  "source_files": {
+    "CMakeLists.txt": {
+      "disk_sha256": "a187c707c8e19949d9726e7b96a7edc731bb572cfefebf4a9575ac62eea1f5ae",
+      "bytes": 110344,
+      "published_git_blob_sha256": "e9064137d7a3b17ccb35c56b248ba3062974cc18851ac40d600255d80f77981d"
+    },
+    "include/strata/core/expert_cache.hpp": {
+      "disk_sha256": "b7a416313cfbc409bfdfff0b0847a858bf373a6dea86cfe524ec776db1d48244",
+      "bytes": 19344,
+      "published_git_blob_sha256": "b7a416313cfbc409bfdfff0b0847a858bf373a6dea86cfe524ec776db1d48244"
+    },
+    "include/strata/core/expert_source.hpp": {
+      "disk_sha256": "52e949348eb4a35d21238cc510d897473e63c023607264bd31797c63b6223e9a",
+      "bytes": 76680,
+      "published_git_blob_sha256": "52e949348eb4a35d21238cc510d897473e63c023607264bd31797c63b6223e9a"
+    },
+    "include/strata/core/qwen35_bridge.hpp": {
+      "disk_sha256": "fc9404341d9227e64bd06b066631593e4d2ad55db9c4c9b671f393432473b815",
+      "bytes": 10668,
+      "published_git_blob_sha256": "fc9404341d9227e64bd06b066631593e4d2ad55db9c4c9b671f393432473b815"
+    },
+    "include/strata/core/qwen35_mtp.hpp": {
+      "disk_sha256": "9bd91740141013e436560f035ccc55f61299b228e6b2a5d7aabb1ca3c446427a",
+      "bytes": 3062,
+      "published_git_blob_sha256": "2f9581fe09d1baa53e8972367a5b3581bdf4fa62e673363cdf6f61ebf15ead78"
+    },
+    "include/strata/core/qwen35_mtp_txn.hpp": {
+      "disk_sha256": "4730e4c4da340830a4021a6827dcc8025194c500f44e370722bfbfcc71b1cf30",
+      "bytes": 7156,
+      "published_git_blob_sha256": "4730e4c4da340830a4021a6827dcc8025194c500f44e370722bfbfcc71b1cf30"
+    },
+    "include/strata/kernels/cpu/pool.hpp": {
+      "disk_sha256": "433895f91b221d1ef756577726fa78c6e6d836e54021c730ee3d201a3cefa617",
+      "bytes": 21778,
+      "published_git_blob_sha256": "433895f91b221d1ef756577726fa78c6e6d836e54021c730ee3d201a3cefa617"
+    },
+    "src/core/expert_cache.cpp": {
+      "disk_sha256": "76826b684eb300a525a111b74db319d5d1f59c17bee64ed4a14f47b48879e6c0",
+      "bytes": 35932,
+      "published_git_blob_sha256": "76826b684eb300a525a111b74db319d5d1f59c17bee64ed4a14f47b48879e6c0"
+    },
+    "src/core/expert_source.cpp": {
+      "disk_sha256": "44e6dc0416bbe18519743ea91c07f23192b974f31d29df0b9600ff2a00968b5a",
+      "bytes": 268783,
+      "published_git_blob_sha256": "44e6dc0416bbe18519743ea91c07f23192b974f31d29df0b9600ff2a00968b5a"
+    },
+    "src/core/qwen35_bridge.cpp": {
+      "disk_sha256": "0bcabda533af3f2e5eef84923be336ebae5ad8da129a33a616c34e372eb1f390",
+      "bytes": 78500,
+      "published_git_blob_sha256": "0bcabda533af3f2e5eef84923be336ebae5ad8da129a33a616c34e372eb1f390"
+    },
+    "src/core/qwen35_mtp.cpp": {
+      "disk_sha256": "8c520e44a6672bea5ee3d13530e964d635160067c8d911c176f1b80b86d01edf",
+      "bytes": 12791,
+      "published_git_blob_sha256": "d2817a12694bea42d5f8e837d6d262bb64c15d146882440078ac566b7cf75082"
+    },
+    "src/core/qwen35_mtp_txn.cpp": {
+      "disk_sha256": "1a8771f8a49ad6b4a37a60de961059562f60617adb2a1ac7e1481ec7ac69cda1",
+      "bytes": 26105,
+      "published_git_blob_sha256": "1a8771f8a49ad6b4a37a60de961059562f60617adb2a1ac7e1481ec7ac69cda1"
+    },
+    "src/kernels/cpu/pool.cpp": {
+      "disk_sha256": "1147ae9fda05530b137e059980d9ddfd5cf7edcf06d756509aed98fbd5baba36",
+      "bytes": 46265,
+      "published_git_blob_sha256": "1147ae9fda05530b137e059980d9ddfd5cf7edcf06d756509aed98fbd5baba36"
+    },
+    "src/kernels/cuda/iq_kernels.cu": {
+      "disk_sha256": "5f78ff2ff309a9ecf3616fe331941f217da807aa7382092d14e6902d279e3e9f",
+      "bytes": 193818,
+      "published_git_blob_sha256": "5f78ff2ff309a9ecf3616fe331941f217da807aa7382092d14e6902d279e3e9f"
+    },
+    "src/kernels/native_expert_parity.cpp": {
+      "disk_sha256": "d05a9b63d104f4837cc7bf8b00e26d10383bc32cd5007ac075d620846d1d8ea6",
+      "bytes": 35935,
+      "published_git_blob_sha256": "436f6b4ba4da56df4b844c9d47fb7d0041b51f62eb304f4d055d089c80a57580"
+    },
+    "src/program/qwen35_model.cpp": {
+      "disk_sha256": "1255f3967b0354a766f6a65cc3e6a40044e2a58afb099900c8b050cdf9417874",
+      "bytes": 158038,
+      "published_git_blob_sha256": "341e79ba4cbefc45b0d745a48ccbd5486f2377269babb1eaff8aabd0d0659015"
+    }
+  },
+  "dependency_changes": [],
+  "validation": "Windows/CUDA registered build and 4 benign requests; HIP/SYCL not tested; no quality/reject/long-output pass",
+  "dependency_file_comparison_count": 1760,
+  "supporting_tools": {
+    "tools/gpu-lock.py": "9382fb9f344b546286b157efce10f7ce4fd784d1fb11cecbaab4f0db1e792ee2"
+  },
+  "validation_notes": [
+    "M268 attempt1 launcher failed before compilation;attempt2 compiled and linked successfully",
+    "M268 static checker18 vs budget8 retained",
+    "Publication source copied;no new GPU/build or functional edits during upload"
+  ]
+}

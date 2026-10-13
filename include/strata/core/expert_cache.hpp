@@ -226,6 +226,11 @@ public:
     VmmRange* vmm_range() { return vmm_.get(); }
     /// Byte offset of slot `s` in the arena (s == slots(): the end).
     uint64_t slot_offset(int64_t s) const { return off_.empty() ? (uint64_t) s * (uint64_t) blob_ : off_[(size_t) s]; }
+    /// team255: the bytes slot `s` itself owns (0 for an invalid slot).  A sized (compact) slot may be smaller
+    /// than `blob_` (the pack's max), so every copy/verify must bound itself by THIS span, never by the max.
+    int64_t slot_span(int32_t s) const {
+        return s < 0 || s >= slots_ ? 0 : (int64_t) (slot_offset((int64_t) s + 1) - slot_offset(s));
+    }
 
 private:
 #if defined(STRATA_USE_HIP)

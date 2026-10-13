@@ -711,14 +711,43 @@ void ExpertPool::drain(int id, ExpertScratch& scratch, uint32_t epoch) {
     }
 }
 
-void ExpertPool::run_phase(int mode, int n_tasks) {
+void ExpertPool::run_phase(int mode, int n_tasks, SlicePhaseTiming* phase_timing) {
+    // Task 202 (default: phase_timing == nullptr): the five caller-side boundary instants are taken ONLY when
+    // an explicit timing sink is passed (request 2, evals 6..8, gates on); every other caller keeps the exact
+    // previous clock behaviour (no new steady_clock reads on the default path).
+    std::chrono::steady_clock::time_point t_a{}, t_b{}, t_c{}, t_d{}, t_e{}, t_f{};
+    if (phase_timing != nullptr) t_a = std::chrono::steady_clock::now();
     wait_parked("before a phase");
+    if (phase_timing != nullptr) t_b = std::chrono::steady_clock::now();
     mode_ = mode;
     njobs_ = n_tasks;
     const uint32_t e = begin_batch(n_tasks);
+    if (phase_timing != nullptr) t_c = std::chrono::steady_clock::now();
     if (host_works_) drain(-1, host_scratch_, e);
+    if (phase_timing != nullptr) t_d = std::chrono::steady_clock::now();
     wait_done(n_tasks);
+    if (phase_timing != nullptr) t_e = std::chrono::steady_clock::now();
     wait_parked("after a phase");
+    if (phase_timing != nullptr) {
+        t_f = std::chrono::steady_clock::now();
+        const auto ms = [](const std::chrono::steady_clock::time_point& x,
+                           const std::chrono::steady_clock::time_point& y) {
+            return std::chrono::duration<double, std::milli>(y - x).count();
+        };
+        if (mode == 8) {
+            phase_timing->gu_before_park_ms = ms(t_a, t_b);
+            phase_timing->gu_publish_ms = ms(t_b, t_c);
+            phase_timing->gu_host_drain_ms = ms(t_c, t_d);
+            phase_timing->gu_wait_done_ms = ms(t_d, t_e);
+            phase_timing->gu_after_park_ms = ms(t_e, t_f);
+        } else if (mode == 9) {
+            phase_timing->down_before_park_ms = ms(t_a, t_b);
+            phase_timing->down_publish_ms = ms(t_b, t_c);
+            phase_timing->down_host_drain_ms = ms(t_c, t_d);
+            phase_timing->down_wait_done_ms = ms(t_d, t_e);
+            phase_timing->down_after_park_ms = ms(t_e, t_f);
+        }
+    }
     hstate_.store(kIdle, std::memory_order_relaxed);
     hstate_ms_.store(now_ms(), std::memory_order_relaxed);
 }
@@ -813,7 +842,12 @@ void ExpertPool::run_split_multi_native(const NativeFmt& f, ExpertJobMulti* jobs
     ms_drain_ += std::chrono::duration<double, std::milli>(std::chrono::steady_clock::now() - t0).count();
 }
 
-void ExpertPool::run_native_slice_jobs(const NativeFmt& f, NativeSliceJob* jobs, int n) {
+void ExpertPool::run_native_slice_jobs(const NativeFmt& f, NativeSliceJob* jobs, int n, SlicePhaseTiming* timing) {
+    if (timing != nullptr) {
+        timing->available = false;
+        timing->reason = SlicePhaseTiming::kReasonSingleThreadInline;
+        timing->n_jobs = n;
+    }
     if (n <= 0) return;
     if (n_ == 1) {   // no workers: run inline, so a single-core machine still produces a token
         for (int i = 0; i < n; ++i) {
@@ -829,7 +863,7 @@ void ExpertPool::run_native_slice_jobs(const NativeFmt& f, NativeSliceJob* jobs,
                 native_down_rows(f, sj.blob, sj.hq, nt, sj.out, 0, (int) f.n_embd);
             }
         }
-        return;
+        return;   // the timing sink stays available=false with the inline reason (never a fabricated phase)
     }
     // ROW-SPLIT (the multi-token phases' protocol, run_split_multi_native's shape): phase 8 streams the
     // gate/up rows across ALL threads - with only a few missed experts a whole-expert task would leave every
@@ -842,7 +876,7 @@ void ExpertPool::run_native_slice_jobs(const NativeFmt& f, NativeSliceJob* jobs,
     mrows_ = (int64_t) n * f.n_ff;
     mtasks_ = phase_tasks(mrows_);
     const auto a = std::chrono::steady_clock::now();
-    run_phase(8, mtasks_);
+    run_phase(8, mtasks_, timing);
     const auto b = std::chrono::steady_clock::now();
     for (int e = 0; e < n; ++e)
         for (int t = 0; t < jobs[e].nt; ++t)
@@ -850,11 +884,25 @@ void ExpertPool::run_native_slice_jobs(const NativeFmt& f, NativeSliceJob* jobs,
     const auto c = std::chrono::steady_clock::now();
     mrows_ = (int64_t) n * f.n_embd;
     mtasks_ = phase_tasks(mrows_);
-    run_phase(9, mtasks_);
+    run_phase(9, mtasks_, timing);
     const auto d = std::chrono::steady_clock::now();
     ms_multi_gu += std::chrono::duration<double, std::milli>(b - a).count();
     ms_multi_q += std::chrono::duration<double, std::milli>(c - b).count();
     ms_multi_down += std::chrono::duration<double, std::milli>(d - c).count();
+    if (timing != nullptr) {
+        // Task 202: same-call inclusive/quant spans; the five per-phase boundaries were filled inside
+        // run_phase from the same steady_clock.  available is a real completion flag, never a zero-fill.
+        const auto ms = [](const std::chrono::steady_clock::time_point& x,
+                           const std::chrono::steady_clock::time_point& y) {
+            return std::chrono::duration<double, std::milli>(y - x).count();
+        };
+        timing->gu_inclusive_ms = ms(a, b);
+        timing->quant_ms = ms(b, c);
+        timing->down_inclusive_ms = ms(c, d);
+        timing->available = true;
+        timing->reason = SlicePhaseTiming::kReasonOk;
+        timing->n_jobs = n;
+    }
     mode_ = 0;
     ms_drain_ += std::chrono::duration<double, std::milli>(std::chrono::steady_clock::now() - t0).count();
 }

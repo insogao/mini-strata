@@ -693,7 +693,7 @@ const uint8_t* ExpertCache::device_slot(int32_t slot) const {
 }
 
 bool ExpertCache::fill_slot(int32_t slot, const uint8_t* host_blob, void* stream, std::string& err, int64_t bytes) {
-    const size_t n = (size_t) (bytes > 0 && bytes <= blob_ ? bytes : blob_);
+    const size_t n = (size_t) (bytes > 0 ? bytes : blob_);
     uint8_t* dst = device_slot(slot);
     if (dst == nullptr) {
         err = "ExpertCache::fill_slot: slot " + std::to_string(slot) + " is outside 0.." +
@@ -702,6 +702,13 @@ bool ExpertCache::fill_slot(int32_t slot, const uint8_t* host_blob, void* stream
     }
     if (host_blob == nullptr) {
         err = "ExpertCache::fill_slot: the host blob is null";
+        return false;
+    }
+    // team255 failclosed: never write past the slot's own span (the old `bytes <= blob_` clamp silently fell
+    // back to blob_ bytes, which would overrun a compact slot smaller than the pack's max).
+    if ((int64_t) n > slot_span(slot)) {
+        err = "ExpertCache::fill_slot: slot " + std::to_string(slot) + " spans " +
+              std::to_string(slot_span(slot)) + " B but " + std::to_string(n) + " B were requested";
         return false;
     }
     const cudaError_t e = cudaMemcpyAsync(dst, host_blob, n, cudaMemcpyHostToDevice,
@@ -715,7 +722,7 @@ bool ExpertCache::fill_slot(int32_t slot, const uint8_t* host_blob, void* stream
 }
 
 bool ExpertCache::fill_slot_blocking(int32_t slot, const uint8_t* host_blob, std::string& err, int64_t bytes) {
-    const size_t n = (size_t) (bytes > 0 && bytes <= blob_ ? bytes : blob_);
+    const size_t n = (size_t) (bytes > 0 ? bytes : blob_);
     uint8_t* dst = device_slot(slot);
     if (dst == nullptr) {
         err = "ExpertCache::fill_slot_blocking: slot outside the arena";
@@ -723,6 +730,12 @@ bool ExpertCache::fill_slot_blocking(int32_t slot, const uint8_t* host_blob, std
     }
     if (host_blob == nullptr) {
         err = "ExpertCache::fill_slot_blocking: the host blob is null";
+        return false;
+    }
+    // team255 failclosed: bound by the slot's own span (see fill_slot).
+    if ((int64_t) n > slot_span(slot)) {
+        err = "ExpertCache::fill_slot_blocking: slot " + std::to_string(slot) + " spans " +
+              std::to_string(slot_span(slot)) + " B but " + std::to_string(n) + " B were requested";
         return false;
     }
 #if defined(STRATA_USE_HIP)
@@ -746,11 +759,17 @@ bool ExpertCache::fill_slot_blocking(int32_t slot, const uint8_t* host_blob, std
 }
 
 bool ExpertCache::fill_slot_queued(int32_t slot, const uint8_t* host_blob, std::string& err, int64_t bytes) {
-    const size_t n = (size_t) (bytes > 0 && bytes <= blob_ ? bytes : blob_);
+    const size_t n = (size_t) (bytes > 0 ? bytes : blob_);
     uint8_t* dst = device_slot(slot);
     if (dst == nullptr || host_blob == nullptr) {
         err = dst == nullptr ? "ExpertCache::fill_slot_queued: slot outside the arena"
                              : "ExpertCache::fill_slot_queued: the host blob is null";
+        return false;
+    }
+    // team255 failclosed: the loan-return refill goes through here; bound by the slot's own span.
+    if ((int64_t) n > slot_span(slot)) {
+        err = "ExpertCache::fill_slot_queued: slot " + std::to_string(slot) + " spans " +
+              std::to_string(slot_span(slot)) + " B but " + std::to_string(n) + " B were requested";
         return false;
     }
     const cudaError_t e = cudaMemcpyAsync(dst, host_blob, n, cudaMemcpyHostToDevice, (cudaStream_t) 0);
@@ -772,10 +791,16 @@ bool ExpertCache::sync_queued(std::string& err) {
 }
 
 bool ExpertCache::verify_slot(int32_t slot, const uint8_t* host_blob, std::string& err, int64_t bytes) {
-    const int64_t nb = bytes > 0 && bytes <= blob_ ? bytes : blob_;
+    const int64_t nb = bytes > 0 ? bytes : blob_;
     const uint8_t* src = device_slot(slot);
     if (src == nullptr) {
         err = "ExpertCache::verify_slot: slot outside the arena";
+        return false;
+    }
+    // team255 failclosed: a read of `nb` bytes must stay inside the slot's own span.
+    if (nb > slot_span(slot)) {
+        err = "ExpertCache::verify_slot: slot " + std::to_string(slot) + " spans " +
+              std::to_string(slot_span(slot)) + " B but " + std::to_string(nb) + " B were requested";
         return false;
     }
     // `cudaMemcpy` and not `cudaMemcpyAsync`: this is a startup check, and a check that can be read before it
@@ -793,7 +818,7 @@ bool ExpertCache::verify_slot(int32_t slot, const uint8_t* host_blob, std::strin
         char buf[256];
         std::snprintf(buf, sizeof buf,
                       "ExpertCache::verify_slot: slot %d differs from the arena at byte %llu (of %lld)",
-                      (int) slot, (unsigned long long) first, (long long) blob_);
+                      (int) slot, (unsigned long long) first, (long long) nb);
         err = buf;
         return false;
     }

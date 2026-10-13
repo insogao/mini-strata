@@ -46,7 +46,7 @@ static double rel(const std::vector<float>& a, const std::vector<float>& b) {
 
 namespace {
 constexpr int NT = 3, E = 7;
-constexpr int64_t H = 2560, FF = 640;
+int64_t H = 2560, FF = 640;  // --geometry H FF sets the real shapes (Qwen3.6: 2048/512)
 
 // The three ways and the dequantizers for one expert blob; returns the number of failed checks.
 int check_blob(const cpu::NativeFmt& f, const std::vector<uint8_t>& blob, int seed, const std::string& label,
@@ -527,7 +527,9 @@ int check_bf16_embd(cudaStream_t s) {
 
 int main(int argc, char** argv) {
     setvbuf(stdout, nullptr, _IONBF, 0);   // keep the trail on a crash
-    if (argc < 2) {
+    int a0 = 1;
+    if (argc >= 4 && std::strcmp(argv[1], "--geometry") == 0) { H = std::atoll(argv[2]); FF = std::atoll(argv[3]); a0 = 4; }
+    if (argc - a0 < 1) {
         std::fprintf(stderr, "usage: native_expert_parity <shard.gguf> [layer ...]\n"
                              "       native_expert_parity --synthetic GU/DOWN ...   (ggml type names, e.g. q4_K/q5_1)\n"
                              "       native_expert_parity --q5_1-min\n"
@@ -545,13 +547,13 @@ int main(int argc, char** argv) {
     int failures = 0;
     cudaStream_t s;
     cudaStreamCreate(&s);
-    const std::string mode = argv[1];
+    const std::string mode = argv[a0];
     if (mode == "--q5_1-min") {
         failures += check_q5_1_min(s);
     } else if (mode == "--bf16-embd") {
         failures += check_bf16_embd(s);
     } else if (mode == "--synthetic") {
-        for (int i = 2; i < argc; ++i) {
+        for (int i = a0 + 1; i < argc; ++i) {
             const std::string arg = argv[i];
             const size_t slash = arg.find('/');
             const int gu = slash == std::string::npos ? -1 : type_of(arg.substr(0, slash));
@@ -569,7 +571,7 @@ int main(int argc, char** argv) {
     } else {
         const strata::GgufModel model(strata::gguf_split_paths(argv[1]));
         std::vector<int> layers;
-        for (int i = 2; i < argc; ++i) layers.push_back(std::atoi(argv[i]));
+        for (int i = a0 + 1; i < argc; ++i) layers.push_back(std::atoi(argv[i]));
         if (layers.empty()) layers = {0, 1, 2, 3, 20, 47};
         for (int l : layers) {
             const strata::TensorInfo* t[3] = {};
@@ -581,6 +583,18 @@ int main(int argc, char** argv) {
                 if (t[r]) data[r] = model.shard(at).tensor_data(*t[r]);
             }
             if (!t[0] || !t[1] || !t[2]) { std::printf("layer %d: no expert tensors\n", l); ++failures; continue; }
+            if (t[0]->shape.size() < 3 || t[1]->shape.size() < 3 || t[2]->shape.size() < 3 ||
+                t[0]->shape[0] % 256 != 0 || t[0]->shape[1] % 256 != 0 ||
+                t[1]->shape[0] != t[0]->shape[0] || t[1]->shape[1] != t[0]->shape[1] ||
+                t[2]->shape[0] != t[0]->shape[1] || t[2]->shape[1] != t[0]->shape[0] ||
+                t[0]->shape[2] <= (uint64_t) E || t[2]->shape[2] != t[0]->shape[2]) {
+                std::printf("layer %d: shapes disagree (gate %llux%llu up %llux%llu down %llux%llu)\n", l,
+                            (unsigned long long) t[0]->shape[0], (unsigned long long) t[0]->shape[1],
+                            (unsigned long long) t[1]->shape[0], (unsigned long long) t[1]->shape[1],
+                            (unsigned long long) t[2]->shape[0], (unsigned long long) t[2]->shape[1]);
+                ++failures; continue;
+            }
+            H = (int64_t) t[0]->shape[0]; FF = (int64_t) t[0]->shape[1];
             cpu::NativeFmt f;
             std::string err;
             if (!cpu::native_fmt((int) t[0]->type, (int) t[2]->type, H, FF, f, err)) {

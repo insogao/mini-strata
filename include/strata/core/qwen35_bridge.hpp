@@ -35,6 +35,8 @@ struct ggml_tensor;
 struct ggml_cgraph;
 struct ggml_backend_sched;
 
+namespace strata { namespace kernels { namespace cpu { struct SlicePhaseTiming; } } }
+
 namespace strata::core {
 
 /// Everything the bridge needs; the runner fills it from the model's own metadata.
@@ -89,6 +91,41 @@ struct Qwen35BridgeStats {
 bool qwen35_bridge_init(const Qwen35BridgeConfig& cfg, std::string& err);
 void qwen35_bridge_shutdown();
 void qwen35_bridge_stats(Qwen35BridgeStats& out);
+
+/// ---- Task 194: bounded default-OFF HOST timeline (exact STRATA_QWEN35_T1_HOST_TIMELINE=1) ----
+/// Collects ONLY request 2's ACTUAL decode evaluations 6..8 (120 layer records + 6 evaluation boundary
+/// marks) as host steady_clock instants at points that already exist in the seam: no new CUDA call,
+/// event, synchronize, query or math change anywhere; gate off = every call inert, nothing printed.
+/// Host stamps are chronological boundaries, never device-completion times.  `post_enq` is the host
+/// instant of the original cudaEventRecord(post) and `join` the host instant of the original
+/// ggml_backend_event_wait(backend, post) enqueue - still host submission timestamps, never GPU
+/// completion.  `service_return` is the explicitly named extra service-return instant.  The cold
+/// dispatch marks cover only the CPU dispatch window (the later miss-row H2D submission has its own
+/// `h2d_end` mark); nested phases must not be summed.
+enum Qwen35T1HField {
+    QWEN35_T1H_PRE0 = 0, QWEN35_T1H_PRE1, QWEN35_T1H_IDS_SUBMIT, QWEN35_T1H_IDS_WAIT_B, QWEN35_T1H_IDS_WAIT_E,
+    QWEN35_T1H_HOT_END, QWEN35_T1H_ACT_SUBMIT, QWEN35_T1H_ACT_WAIT_B, QWEN35_T1H_ACT_WAIT_E,
+    QWEN35_T1H_COLD_B, QWEN35_T1H_COLD_E, QWEN35_T1H_H2D_END, QWEN35_T1H_COMBINE_SUBMIT,
+    QWEN35_T1H_SERVICE_RETURN, QWEN35_T1H_POST_ENQ, QWEN35_T1H_JOIN, QWEN35_T1H_FIELDS
+};
+enum Qwen35T1HNote { QWEN35_T1H_NOTE_HITS = 0, QWEN35_T1H_NOTE_MISSES, QWEN35_T1H_NOTE_ACT_STATE /*0 absent, 2 measured*/ };
+bool qwen35_t1h_enabled();
+void qwen35_t1h_eval_begin(int request, int eval);   ///< boundary mark; activates the scope for eval 6..8
+void qwen35_t1h_eval_ready(int request, int eval);   ///< readiness mark; eval 8 deactivates the scope
+void qwen35_t1h_scope_reset(int request);            ///< error/EOS/reset safety: never carry records across requests
+void qwen35_t1h_stamp(int field);                    ///< one host instant into the pending layer record
+void qwen35_t1h_note(int note, long long value);     ///< bounded integer field of the pending record
+void qwen35_t1h_begin_layer(int layer, bool t1);     ///< bridge seam entry (opens the pending record)
+void qwen35_t1h_end_layer();                         ///< bridge seam service return (closes and counts it)
+void qwen35_t1h_emit_request_end(int request);       ///< ONE bounded JSON line, after the request's summary
+
+/// Task 202 (exact STRATA_QWEN35_T1_POOL_PHASE=1, default off; requires the HOST timeline gate + the
+/// two-request/STOP_EOG/DECODE_TIMESTAMPS combination and refuses the Nsight range): the optional pool-phase
+/// sink for the SAME request-2 evaluations 6..8 records.  `wanted()` is an inert cached check unless both
+/// gates are on AND a layer record is open; `pool_phase` copies the values into that record immediately and
+/// never retains the pointer.  Gate off: no clock, no allocation, no output change.
+bool qwen35_t1h_pool_phase_wanted();
+void qwen35_t1h_pool_phase(const strata::kernels::cpu::SlicePhaseTiming* timing);
 
 /// The prompt -> decode transition: returns the prompt path's loan (refills the lent cache slots and restores
 /// their residency) so the decode tier sees them again.  The runner calls it after the prompt loop and MUST

@@ -1,0 +1,189 @@
+{
+  "snapshot_binary_sha256": "2678417b90851404083a3dbeeda7ce756699a5154194b6f40170ddf8fa1fd094",
+  "configuration": {
+    "model": "Qwen3.6-35B-A3B-MTP-GGUF UD-IQ3_S",
+    "model_sha256": "ab639a7f330f96c47d3e6c2dd2d6445182e7b763e17e6048dc850a71bbc9f27f",
+    "input_tokens": 3896,
+    "threads": 8,
+    "context": 4096,
+    "ubatch": 4096,
+    "cache_slots": 2700,
+    "compact": 1,
+    "MTP": 1,
+    "K": 1,
+    "max_new": 32,
+    "internal_requests_per_process": 2
+  },
+  "arms": {
+    "serial0": {
+      "raw_sha": "dacc6d32324b6246f12394b3bd0c4c411f876816efe83013b8815b9225462576",
+      "requests": [
+        {
+          "event": "qwen35_mtp_txn_request_timing",
+          "request": 1,
+          "anchor": "prefill_begin",
+          "reset_seconds": -1,
+          "prefill_process_seconds": 10.0749061,
+          "prefill_finish_seconds": 0.1231977,
+          "prefill_seconds": 10.2017786,
+          "seed_sample_seconds": 10.2048683,
+          "engine_entry_seconds": 10.2055792,
+          "ttft_flush_request_seconds": 10.2144447,
+          "eos_complete_request_seconds": 11.165105,
+          "request_end_seconds": 11.1718904,
+          "json_closed": true,
+          "json_close_flush_request_seconds": 11.164661,
+          "engine_wall_seconds": 0.9595258,
+          "rounds": 8,
+          "emitted": 16,
+          "eos": 1,
+          "stop": "pending_eog",
+          "eog_id": 248046,
+          "TPS": 15.78587948870166
+        },
+        {
+          "event": "qwen35_mtp_txn_request_timing",
+          "request": 2,
+          "anchor": "request_reset",
+          "reset_seconds": 0.0013895,
+          "prefill_process_seconds": 2.8751399,
+          "prefill_finish_seconds": 0.1134235,
+          "prefill_seconds": 2.9920885,
+          "seed_sample_seconds": 2.9931546,
+          "engine_entry_seconds": 2.9937533,
+          "ttft_flush_request_seconds": 3.000668,
+          "eos_complete_request_seconds": 3.7272427,
+          "request_end_seconds": 3.7322975,
+          "json_closed": true,
+          "json_close_flush_request_seconds": 3.7270061,
+          "engine_wall_seconds": 0.7334894,
+          "rounds": 8,
+          "emitted": 16,
+          "eos": 1,
+          "stop": "pending_eog",
+          "eog_id": 248046,
+          "TPS": 20.651539551622033
+        }
+      ],
+      "peak_mib": 7586.7,
+      "decode_layers": 0,
+      "prefill_layers": 720,
+      "wall": 22.886,
+      "pre_run_sha": "96e41002daa1e75078d36ee881f1fd6913bd72a7dfb0703aa915e8598f6ad278"
+    },
+    "serial1": {
+      "raw_sha": "5a4c9e1a7e1043b24dc947087d74c34439e4e1a47f51e03b11bb2108f2a04fbb",
+      "requests": [
+        {
+          "event": "qwen35_mtp_txn_request_timing",
+          "request": 1,
+          "anchor": "prefill_begin",
+          "reset_seconds": -1,
+          "prefill_process_seconds": 4.5787275,
+          "prefill_finish_seconds": 0.0890665,
+          "prefill_seconds": 4.6698069,
+          "seed_sample_seconds": 4.6715101,
+          "engine_entry_seconds": 4.6722137,
+          "ttft_flush_request_seconds": 4.6799169,
+          "eos_complete_request_seconds": 5.3393308,
+          "request_end_seconds": 5.3441463,
+          "json_closed": true,
+          "json_close_flush_request_seconds": 5.338998,
+          "engine_wall_seconds": 0.6671171,
+          "rounds": 8,
+          "emitted": 16,
+          "eos": 1,
+          "stop": "pending_eog",
+          "eog_id": 248046,
+          "TPS": 22.75895940575447
+        },
+        {
+          "event": "qwen35_mtp_txn_request_timing",
+          "request": 2,
+          "anchor": "request_reset",
+          "reset_seconds": 0.0015948,
+          "prefill_process_seconds": 2.9074364,
+          "prefill_finish_seconds": 0.0897216,
+          "prefill_seconds": 3.000233,
+          "seed_sample_seconds": 3.0013457,
+          "engine_entry_seconds": 3.0020655,
+          "ttft_flush_request_seconds": 3.0092277,
+          "eos_complete_request_seconds": 3.6522,
+          "request_end_seconds": 3.657151,
+          "json_closed": true,
+          "json_close_flush_request_seconds": 3.6518666,
+          "engine_wall_seconds": 0.6501345,
+          "rounds": 8,
+          "emitted": 16,
+          "eos": 1,
+          "stop": "pending_eog",
+          "eog_id": 248046,
+          "TPS": 23.341257430883807
+        }
+      ],
+      "peak_mib": 7616.0,
+      "decode_layers": 1280,
+      "prefill_layers": 80,
+      "wall": 16.399,
+      "pre_run_sha": "c0cdfb5e7c6ab71a9c565f9fae652811dd60daef83d94c44273f675ddb3db413"
+    }
+  },
+  "normal_output": {
+    "risk": 0,
+    "violation": false,
+    "visible_tokens": 16,
+    "EOG": 248046,
+    "all_accept": true
+  },
+  "stable_speedup_proven": false,
+  "risk_reject_long_output_pass": false,
+  "latest_control267": {
+    "costsplit0": {
+      "raw_sha": "131e42118910434b84f7805e49221ce274d396313953deb92f395c6a4718de6b",
+      "result_sha": "11ee24e0ab80e4882949428a42c84dce934891cea7643b225f7450dac31f821a",
+      "requests": [
+        {
+          "P": 9.7221965,
+          "TTFT": 9.7358377,
+          "JSON": 10.5266008,
+          "EOS": 10.5269161,
+          "TPS": 18.969018660582385,
+          "engine": 0.8013152
+        },
+        {
+          "P": 2.9034,
+          "TTFT": 2.9116242,
+          "JSON": 3.5657588,
+          "EOS": 3.5660068,
+          "TPS": 22.931060365863544,
+          "engine": 0.6608116
+        }
+      ],
+      "wall": 21.519
+    },
+    "costsplit1": {
+      "raw_sha": "9ba7bf61466904c77dc04f341a1c58f7d7581db6b34b2f5221cd35a74bd212e3",
+      "result_sha": "971d6d57501a3cac7e0e90e625e771ebd0ac1a1147f3dc8507af388414ff23b2",
+      "requests": [
+        {
+          "P": 3.9268437,
+          "TTFT": 3.9372199,
+          "JSON": 4.6263101,
+          "EOS": 4.6286088,
+          "TPS": 21.767832426001696,
+          "engine": 0.6992175
+        },
+        {
+          "P": 2.9257279,
+          "TTFT": 2.9333575,
+          "JSON": 3.5947344,
+          "EOS": 3.59703,
+          "TPS": 22.679957524975546,
+          "engine": 0.669721
+        }
+      ],
+      "wall": 15.263
+    }
+  },
+  "privacy": "no business prompt/token arrays/raw logs/models/credentials included"
+}

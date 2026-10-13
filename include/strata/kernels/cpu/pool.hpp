@@ -148,6 +148,28 @@ struct ThreadAffinity {
 ThreadAffinity pin_current_thread(int core);
 void restore_thread_affinity(const ThreadAffinity& previous);
 
+/// Task 202/204: bounded, same-clock HOST subphase timing of one `run_native_slice_jobs` call (request 2,
+/// actual decode evaluations 6..8 only, driven by the caller).  Namespace scope (task 204 repair: it used to
+/// be nested in ExpertPool while the headers referenced it as strata::kernels::cpu::SlicePhaseTiming).  All
+/// values are millis within the current call; `available=false` with a reason code never fabricates a phase.
+/// The inclusive spans match the existing `ms_multi_*` semantics for this call; the five phase-8/9 boundaries
+/// are the caller's wait_parked(before) / publish / host_drain / wait_done / wait_parked(after) segments.
+/// `drain` includes host work, `wait_done` includes the workers' remaining compute, and the park checks are
+/// not necessarily wake-ups.
+struct SlicePhaseTiming {
+    static constexpr int kReasonOk = 0;
+    static constexpr int kReasonSingleThreadInline = 1;
+    bool requested = false;      ///< the caller asked for timing (gates + an open HOST record)
+    bool available = false;      ///< the pool filled the fields (false + reason otherwise)
+    int reason = kReasonSingleThreadInline;
+    int64_t n_jobs = 0;
+    double gu_inclusive_ms = -1, quant_ms = -1, down_inclusive_ms = -1;
+    double gu_before_park_ms = -1, gu_publish_ms = -1, gu_host_drain_ms = -1,
+           gu_wait_done_ms = -1, gu_after_park_ms = -1;
+    double down_before_park_ms = -1, down_publish_ms = -1, down_host_drain_ms = -1,
+           down_wait_done_ms = -1, down_after_park_ms = -1;
+};
+
 class ExpertPool {
 public:
     /// `n_workers <= 0` means "every physical core except the first".  Workers are pinned to physical cores
@@ -204,7 +226,10 @@ public:
     /// threads exactly like `run_split_multi_native`'s phases: gate/up rows, the host's intermediate
     /// quantization, down rows.  Each row still runs the whole-expert task's per-row kernel, so the output is
     /// bitwise the same; with only a few missed experts a whole-expert task would leave most cores idle.
-    void run_native_slice_jobs(const NativeFmt& f, NativeSliceJob* jobs, int n);
+    /// `timing` (task 202, default null) is an OPTIONAL explicit output: when non-null and `requested`, the
+    /// phases 8/9 caller-side host boundaries and the same-call inclusive/quant spans are filled; every other
+    /// caller keeps the exact previous behaviour (no clock, no allocation, no output).
+    void run_native_slice_jobs(const NativeFmt& f, NativeSliceJob* jobs, int n, SlicePhaseTiming* timing = nullptr);
     static constexpr int kMaxSplitMulti = 96;
     /// run_split_multi's phases, accumulated ms: gate/up rows, the intermediate quantization, down rows.
     double ms_multi_gu = 0, ms_multi_q = 0, ms_multi_down = 0;
@@ -245,7 +270,7 @@ private:
     int tasks_ = 0;
     void worker(int id);
     void drain(int id, ExpertScratch& scratch, uint32_t epoch);
-    void run_phase(int mode, int n_tasks);
+    void run_phase(int mode, int n_tasks, SlicePhaseTiming* phase_timing = nullptr);
     /// Claim the next job of batch `epoch`, or -1 (that batch is exhausted, or it is not the current one).
     int claim(uint32_t epoch);
     /// Publish the batch whose description the caller has just written: reset `done`, then `head`, then the epoch.
