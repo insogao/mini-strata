@@ -1,6 +1,8 @@
 # mini-strata: Strata Qwen35 / IQ3_S adaptation
 
-最新：[Decode阶段报告](docs/phase2_decode/DECODE_STAGE_REPORT_20261012.md) · [外部代码审核入口](docs/phase2_decode/EXTERNAL_REVIEW_GUIDE.md)。新Decode候选仅在审核分支，尚无确认业务加速；main保留冻结Prefill源码。
+本分支是 **2026-10-13 MTP运行原型审核快照（截至268）**：[代码审核入口](docs/phase2_mtp/REVIEW_GUIDE_20261013.md) · [当前方案清单](docs/phase2_mtp/CURRENT_SCHEMES_FOR_DISCUSSION_20261013.md) · [实测证据](evidence/mtp-runtime-20261013.json)。真实K=1 MTP、紧凑专家缓存和默认关闭的串行Verifier候选已做Windows/CUDA正常样本测试；尚无稳定Decode提速或完整质量验收结论。271未编译候选不包含在本快照中。
+
+生产main继续保留冻结Prefill源码。以下2026-10-12说明属于历史生产Prefill成果，不能当作本分支新MTP模型的性能或质量保证。
 
 
 基于 [Niko1221/Strata](https://github.com/Niko1221/Strata) **v0.1.41** 的实验性 Qwen3.6-35B-A3B 适配。原始 Strata 提交和完整祖先历史保留；成熟 Qwen attention/GDN/shared expert/KV 来自固定 llama.cpp，routed experts 接入 Strata 原共享专家服务。

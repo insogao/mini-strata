@@ -612,11 +612,15 @@ template<> struct Fmt<8> { static constexpr int qk = 32, ipb = QI8_0 / VDR_Q8_0,
 // entry is a kernel template for each CUDA architecture of the build, hence two lists rather than one.
 #ifdef STRATA_Q6K_EXPERTS   // opt-in build (-DSTRATA_Q6K_EXPERTS=ON): one more instance per kernel, loaded at start
 #define STRATA_GU_FMTS(X) X(16) X(17) X(18) X(21) X(22) X(23) X(29) X(42) X(12) X(13) X(14) X(6) X(2) X(3) X(8)
+// Task 239: the Q6_K down role joins under the same opt-in (the experimental MTP model's layers 34/38/39
+// carry Q6_K ffn_down_exps); Fmt<14>, its dequant and row bytes already exist for both guarded branches.
+#define STRATA_D_FMTS(X) X(20) X(21) X(23) X(42) X(7) X(6) X(2) X(3) X(8) X(14)
+#define STRATA_MMVQ_FMTS(X) X(16) X(17) X(18) X(20) X(21) X(22) X(23) X(29) X(42) X(12) X(13) X(14) X(7) X(6) X(2) X(3) X(8)
 #else
 #define STRATA_GU_FMTS(X) X(16) X(17) X(18) X(21) X(22) X(23) X(29) X(42) X(12) X(13) X(6) X(2) X(3) X(8)
-#endif
 #define STRATA_D_FMTS(X) X(20) X(21) X(23) X(42) X(7) X(6) X(2) X(3) X(8)
 #define STRATA_MMVQ_FMTS(X) X(16) X(17) X(18) X(20) X(21) X(22) X(23) X(29) X(42) X(12) X(13) X(7) X(6) X(2) X(3) X(8)
+#endif
 
 __device__ __forceinline__ float warp_sum(float v) {
 #pragma unroll

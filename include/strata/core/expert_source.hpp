@@ -478,38 +478,6 @@ struct ExpertDispatch {
         double prefill_ms = 0;             ///< wall time in the GPU prompt expert path
     };
     NativeTierStats native_stats;
-    /// 165: default-OFF per-component split of one decode layer's CPU-miss window (STRATA_QWEN35_TIER_SPLIT=1,
-    /// exact value, resolved once per dispatch).  Host chrono windows only: no new CUDA event, no submission
-    /// reorder, no math/cache-policy/thread-pool change.  The numbers are per-layer HOST windows over runtime
-    /// T1 decode calls (the last prompt token may be included; not attributable per request) - neither pure
-    /// CPU/GPU time nor the business decode total.  Components: ms_act_wait = act D2H submit -> ev_act sync
-    /// return; ms_cpu = expert_native_misses around (activation quantization + job build + the pool's native
-    /// slice jobs); ms_upload_enq = miss-row upload submissions + ev_miss record + work waitEvent.  An all_miss
-    /// call (tier cache off) transferred the act inside the ids window, so its wait stays in ms_ids and is NOT
-    /// charged here, only counted.  ms_pool_gu/q/down are per-call differentials of the pool's ms_multi_* over
-    /// the misses call; ms_pool_drain is the phase_ms drain differential (the whole run_native_slice_jobs wall,
-    /// which includes its own phases and waits), a redundant cross-check only, never added to the components.
-    struct NativeTierSplit {
-        bool resolved = false;        ///< the feature gate was read (once per dispatch)
-        bool enabled = false;         ///< STRATA_QWEN35_TIER_SPLIT=1
-        bool reported = false;        ///< the one-time close report was printed
-        int64_t calls = 0;            ///< expert_native_decode_layer calls
-        int64_t all_hit_calls = 0;
-        int64_t miss_calls = 0;       ///< calls with at least one CPU miss (nm > 0)
-        int64_t miss_entries = 0;     ///< CPU miss entries summed over the calls
-        int64_t all_miss_calls = 0;   ///< calls with the tier cache off (act D2H rode the ids window)
-        int64_t pool_diff_calls = 0;  ///< miss calls whose pool counters were read before and after
-        double ms_misses_sum = 0;     ///< sum of the layer window t2..t3 (equals NativeTierStats::ms_misses)
-        double ms_act_wait = 0;
-        double ms_cpu = 0;
-        double ms_upload_enq = 0;
-        double ms_bookkeeping = 0;    ///< layer window outside the three components (all calls)
-        double ms_bookkeeping_min = 0, ms_bookkeeping_max = 0;
-        int64_t bookkeeping_observed = 0;
-        double ms_pool_gu = 0, ms_pool_q = 0, ms_pool_down = 0;
-        double ms_pool_drain = 0;
-    };
-    NativeTierSplit tier_split;
     /// The prompt path's loan state: the borrowed tail slots (see expert_native_loan_plan / _return).
     bool native_loan_active = false;
     int64_t native_loan_first = 0, native_loan_slots = 0;
@@ -581,7 +549,8 @@ void expert_pool_dispatch_multi(ExpertDispatch& d, const float* x_f, const int32
 /// and the caller counts them.  `x_f` is (n_tok, n_embd) host floats, `ids` (n_tok, k) host int32.
 /// Lives here, not in the graph bridge, because the source, the pool and the counters are this adapter's.
 void expert_native_qwen_dispatch(ExpertDispatch& d, const float* x_f, const int32_t* ids, int64_t n_tok, int64_t k,
-                                 const uint8_t* hit_rows, float* out);
+                                 const uint8_t* hit_rows, float* out,
+                                 strata::kernels::cpu::SlicePhaseTiming* slice_timing = nullptr);
 
 // ================== THE QWEN35 NATIVE TIER (shared-service API for the graph boundary) ==================
 //
@@ -614,8 +583,11 @@ bool expert_native_loan_return(ExpertDispatch& d, std::string& err);
 bool expert_native_launch(ExpertDispatch& d, int64_t layer, void* stream, const float* x_dev,
                           const int32_t* ids, int64_t k, uint8_t* is_hit);
 /// **CPU MISSES**: wraps `expert_native_qwen_dispatch` for the miss rows of one token; counts them.
+/// `slice_timing` (task 202, default null) is the optional explicit pool-phase timing sink: it is passed
+/// through to the pool's `run_native_slice_jobs` and never stored or retained; all other callers keep the
+/// exact previous behaviour.
 bool expert_native_misses(ExpertDispatch& d, int64_t layer, const float* x_host, const int32_t* miss_ids,
-                          int64_t nm, float* out);
+                          int64_t nm, float* out, strata::kernels::cpu::SlicePhaseTiming* slice_timing = nullptr);
 /// **COMBINE**: the weighted sum of `k` rows of `d.native_parts_dev` with the DEVICE router weights into
 /// `out_dev`, on `stream` (the same stream the hits and the miss uploads were ordered on).
 bool expert_native_combine(ExpertDispatch& d, void* stream, const float* weights_dev, float* out_dev, int64_t k);

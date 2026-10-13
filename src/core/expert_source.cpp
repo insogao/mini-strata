@@ -1,5 +1,6 @@
 // src/core/expert_source.cpp - the adapter.  See the header for the three clauses of the contract.
 #include "strata/core/expert_source.hpp"
+#include "strata/core/qwen35_bridge.hpp"   // task 194: the bounded default-OFF host-timeline marks
 #include "strata/core/foresight_swap.hpp"
 #include "strata/core/on_device.hpp"
 #include "strata/core/remote_experts.hpp"
@@ -3307,7 +3308,8 @@ void expert_pool_dispatch(void* user, const float* x_f, const int32_t* ids, cons
 }
 
 void expert_native_qwen_dispatch(ExpertDispatch& d, const float* x_f, const int32_t* ids, int64_t n_tok, int64_t k,
-                                 const uint8_t* hit_rows, float* out) {
+                                 const uint8_t* hit_rows, float* out,
+                                 strata::kernels::cpu::SlicePhaseTiming* slice_timing) {
     using namespace strata::kernels::cpu;
     if (d.failed) return;
     if (d.pool == nullptr || d.src == nullptr) {
@@ -3384,7 +3386,7 @@ void expert_native_qwen_dispatch(ExpertDispatch& d, const float* x_f, const int3
         j.hq[t] = d.qwen_hq.data() + (size_t) i * kNativeHBytes;
         j.out[t] = out + (size_t) i * (size_t) d.n_embd;
     }
-    if (njobs > 0) d.pool->run_native_slice_jobs(f, d.qwen_jobs.data(), (int) njobs);
+    if (njobs > 0) d.pool->run_native_slice_jobs(f, d.qwen_jobs.data(), (int) njobs, slice_timing);
     for (int64_t i = 0; i < n; ++i)
         if (ids[i] >= 0 && ids[i] < d.n_expert) d.job_of[(size_t) ids[i]] = (int16_t) -1;
     d.multi_entries += njobs;
@@ -3398,18 +3400,6 @@ namespace {
 double tier_now_ms() {
     static const auto epoch = std::chrono::steady_clock::now();
     return std::chrono::duration<double, std::milli>(std::chrono::steady_clock::now() - epoch).count();
-}
-
-/// 165: STRATA_QWEN35_TIER_SPLIT, exact value "1", read once per process (cached; same shape as the other
-/// Qwen35 opt-ins).  Unset or any other value keeps the original behaviour byte for byte: no timer read, no
-/// counter, no output.  When on, only expert_native_decode_layer/close add host chrono reads around the
-/// EXISTING calls (see ExpertDispatch::NativeTierSplit).
-bool tier_split_enabled() {
-    static const bool on = [] {
-        const char* v = std::getenv("STRATA_QWEN35_TIER_SPLIT");
-        return v != nullptr && std::strcmp(v, "1") == 0;
-    }();
-    return on;
 }
 }  // namespace
 
@@ -3435,8 +3425,52 @@ bool expert_native_cache_open(ExpertDispatch& d, int64_t slots, const std::strin
         err = "native tier: no slots";
         return false;
     }
+    // team250 P-C1 (default OFF, STRATA_QWEN35_COMPACT_SLOTS=1): compact static slot sizes.  The profile
+    // ranks (layer, expert) pairs and `admit` is sequential with no eviction, so slot i holds exactly
+    // ranked[i] and never changes layer: a slot may be sized for its pair's layer blob instead of the pack's
+    // max blob (245: uniform max = 4535.2 MiB vs 3199.2 MiB payload).  Tail slots (profile shorter than the
+    // slot count) keep max_blob, so later routing-driven admits cannot overflow.  No profile -> refuse the
+    // compact mode explicitly (failclosed to the uniform layout).  Everything downstream already indexes
+    // slots by slot_offset()/device_slot() (fill/verify take the blob's own bytes; the loan picks its
+    // contiguous tail by real byte offsets), so no other consumer changes.
+    const bool compact_req = [] {
+        const char* v = std::getenv("STRATA_QWEN35_COMPACT_SLOTS");
+        return v != nullptr && v[0] != '\0' && v[0] != '0';
+    }();
+    std::vector<int64_t> slot_sizes((size_t) slots, max_blob);
+    std::vector<std::pair<int32_t, int32_t>> compact_sel;   // team255: the exact pairs slot i will hold
+    bool compact_on = false;
+    if (compact_req) {
+        if (ranked.empty()) {
+            std::fprintf(stderr, "strata: compact slots requested but no profile was given; staying uniform\n");
+        } else {
+            // team255: bound-check every profile pair and collapse RANK DUPLICATES before sizing: slot i is
+            // sized for the i-th DISTINCT pair the fill will actually admit, so the sizing and the fill can
+            // never disagree (a duplicate would otherwise desynchronise slot index and pair).  Pairs beyond
+            // the distinct list keep max_blob, so routing-driven admits into them stay safe.
+            const int64_t want = (std::min)(slots, (int64_t) ranked.size());
+            std::vector<char> seen((size_t) lay.n_layers * (size_t) lay.n_expert, 0);
+            for (size_t i = 0; i < ranked.size() && (int64_t) compact_sel.size() < want; ++i) {
+                const int32_t rl = ranked[i].first, re = ranked[i].second;
+                if (rl < 0 || rl >= lay.n_layers || re < 0 || re >= lay.n_expert) {
+                    err = "native tier: profile pair " + std::to_string(i) + " is out of range (" +
+                          std::to_string(rl) + "," + std::to_string(re) + ")";
+                    return false;
+                }
+                const size_t at = (size_t) rl * (size_t) lay.n_expert + (size_t) re;
+                if (seen[at]) continue;   // first rank wins; one slot per (layer, expert)
+                seen[at] = 1;
+                compact_sel.push_back({rl, re});
+            }
+            for (size_t i = 0; i < compact_sel.size(); ++i) {
+                const uint64_t nb = lay.blob_bytes((int64_t) compact_sel[i].first);
+                slot_sizes[i] = (int64_t) (((nb + 255) / 256) * 256);
+            }
+            compact_on = !compact_sel.empty();
+        }
+    }
     if (!d.native_cache) d.native_cache = std::make_unique<ExpertCache>();
-    if (!d.native_cache->open_sized(std::vector<int64_t>((size_t) slots, max_blob), lay.n_layers, lay.n_expert, err)) {
+    if (!d.native_cache->open_sized(slot_sizes, lay.n_layers, lay.n_expert, err)) {
         d.native_cache.reset();
         d.cache = nullptr;
         return false;
@@ -3445,20 +3479,49 @@ bool expert_native_cache_open(ExpertDispatch& d, int64_t slots, const std::strin
     d.native_slot_ptr.assign((size_t) slots, 0);
     for (int64_t s = 0; s < slots; ++s)
         d.native_slot_ptr[(size_t) s] = (unsigned long long) d.native_cache->device_slot((int32_t) s);
-    std::fprintf(stderr, "strata: native expert tier: %lld slots x %lld B = %.2f GiB (%.2f GiB API bytes)\n",
-                 (long long) slots, (long long) max_blob, (double) (slots * max_blob) / 1073741824.0,
-                 (double) d.native_cache->bytes() / 1073741824.0);
+    if (compact_on) {
+        std::fprintf(stderr, "strata: native expert tier (compact): %lld slots, %.2f GiB (uniform would be "
+                             "%.2f GiB, saved %.0f MiB)\n",
+                     (long long) slots, (double) d.native_cache->bytes() / 1073741824.0,
+                     (double) (slots * max_blob) / 1073741824.0,
+                     (double) (slots * max_blob) / 1048576.0 - (double) d.native_cache->bytes() / 1048576.0);
+    } else {
+        std::fprintf(stderr, "strata: native expert tier: %lld slots x %lld B = %.2f GiB (%.2f GiB API bytes)\n",
+                     (long long) slots, (long long) max_blob, (double) (slots * max_blob) / 1073741824.0,
+                     (double) d.native_cache->bytes() / 1073741824.0);
+    }
     if (!profile.empty()) {
-        const int64_t want = (std::min)(slots, (int64_t) ranked.size());
+        // team255: compact mode fills exactly the distinct list its slot sizes were computed from; the
+        // uniform path keeps iterating `ranked` byte-for-byte as before (default OFF unchanged).
+        const std::vector<std::pair<int32_t, int32_t>>& fill_list = compact_on ? compact_sel : ranked;
+        const int64_t want = (std::min)(slots, (int64_t) fill_list.size());
         const auto t0 = std::chrono::steady_clock::now();
         uint64_t fill_bytes = 0;
         int64_t filled = 0;
         for (int64_t i = 0; i < want; ++i) {
-            const int32_t layer = ranked[(size_t) i].first;
-            const int32_t expert = ranked[(size_t) i].second;
+            const int32_t layer = fill_list[(size_t) i].first;
+            const int32_t expert = fill_list[(size_t) i].second;
+            if (layer < 0 || layer >= lay.n_layers || expert < 0 || expert >= lay.n_expert) {
+                err = "native tier: profile pair " + std::to_string(i) + " is out of range";
+                return false;
+            }
+            if (d.native_cache->slot_of(layer, expert) >= 0) continue;   // defensive: one slot per pair
             const int32_t slot = d.native_cache->admit(layer, expert);
             if (slot < 0) break;
             const int64_t nb = (int64_t) lay.blob_bytes(layer);
+            if (compact_on) {
+                // failclosed: a compact slot is sized for ITS pair's layer, but the invariant is re-checked
+                // here so a future reordering/eviction bug can never turn a mismatch into a silent overflow
+                // (`fill_slot_blocking` would copy `blob_` bytes if `nb` exceeded it).
+                const uint64_t span = d.native_cache->slot_offset((int64_t) slot + 1) -
+                                      d.native_cache->slot_offset((int64_t) slot);
+                if ((uint64_t) nb > span) {
+                    err = "native tier: compact slot " + std::to_string(slot) + " (" + std::to_string(span) +
+                          " B) is smaller than layer " + std::to_string(layer) + "'s blob (" +
+                          std::to_string(nb) + " B)";
+                    return false;
+                }
+            }
             const uint8_t* b = d.src != nullptr ? d.src->blob_stable(layer, expert) : nullptr;
             if (b == nullptr || !d.native_cache->fill_slot_blocking(slot, b, err, nb)) {
                 err = "native tier: the profile fill failed at pair " + std::to_string(i) + ": " + err;
@@ -3744,10 +3807,10 @@ bool expert_native_launch(ExpertDispatch& d, int64_t layer, void* stream, const 
 }
 
 bool expert_native_misses(ExpertDispatch& d, int64_t layer, const float* x_host, const int32_t* miss_ids,
-                          int64_t nm, float* out) {
+                          int64_t nm, float* out, strata::kernels::cpu::SlicePhaseTiming* slice_timing) {
     if (nm <= 0) return true;
     d.layers = layer;
-    expert_native_qwen_dispatch(d, x_host, miss_ids, 1, nm, nullptr, out);
+    expert_native_qwen_dispatch(d, x_host, miss_ids, 1, nm, nullptr, out, slice_timing);
     if (d.failed) return false;
     d.native_misses += nm;
     return true;
@@ -3788,7 +3851,19 @@ bool expert_native_admit(ExpertDispatch& d, int64_t layer, const int32_t* ids, i
             d.fail_layer = layer;
             return false;
         }
+        // team255 failclosed: a compact slot is sized for one layer's blob; a routing-driven admission must
+        // never fill past the slot's own span (uniform arenas have span == blob_, so this is a no-op there).
         const int64_t nb = (int64_t) lay.blob_bytes(layer);
+        {
+            const int64_t span = d.cache->slot_span(slot);
+            if (span <= 0 || nb > span) {
+                d.failed = true;
+                d.set_fail("native tier: layer " + std::to_string(layer) + "'s blob (" + std::to_string(nb) +
+                           " B) exceeds slot " + std::to_string(slot) + "'s span (" + std::to_string(span) + " B)");
+                d.fail_layer = layer;
+                return false;
+            }
+        }
         const uint8_t* b = d.src->blob(layer, e);
         if (b == nullptr || !d.cache->fill_slot_blocking(slot, b, err, nb)) {
             err = "native tier: cache admission failed at layer " + std::to_string(layer) + ": " + err;
@@ -3800,47 +3875,6 @@ bool expert_native_admit(ExpertDispatch& d, int64_t layer, const int32_t* ids, i
 }
 
 void expert_native_close(ExpertDispatch& d) {
-    // 165: the one-time split report (STRATA_QWEN35_TIER_SPLIT=1).  Printed before any teardown and only from
-    // this dispatch's own accumulators, so it never reads the pool or a freed object.
-    if (!d.tier_split.resolved) {
-        d.tier_split.resolved = true;
-        d.tier_split.enabled = tier_split_enabled();
-    }
-    if (d.tier_split.enabled && !d.tier_split.reported) {
-        d.tier_split.reported = true;
-        const ExpertDispatch::NativeTierSplit& ts = d.tier_split;
-        const double cpu_pool = ts.ms_pool_gu + ts.ms_pool_q + ts.ms_pool_down;
-        const double comp = ts.ms_act_wait + ts.ms_cpu + ts.ms_upload_enq;
-        const double residual = ts.ms_misses_sum - comp - ts.ms_bookkeeping;
-        std::fprintf(stderr,
-                     "strata: tier-split-165 ON (STRATA_QWEN35_TIER_SPLIT=1), domain: runtime T1 decode-layer "
-                     "calls, per-layer host windows (may include the last prompt token; not request-split; not "
-                     "pure CPU/GPU time and not the business decode total)\n");
-        std::fprintf(stderr,
-                     "strata: tier-split-165 counts: calls %lld | all-hit %lld | miss-calls %lld | "
-                     "all-miss(act D2H in ids window, not charged here) %lld | miss entries %lld | "
-                     "tier hits %lld misses %lld\n",
-                     (long long) ts.calls, (long long) ts.all_hit_calls, (long long) ts.miss_calls,
-                     (long long) ts.all_miss_calls, (long long) ts.miss_entries, (long long) d.native_hits,
-                     (long long) d.native_misses);
-        std::fprintf(stderr,
-                     "strata: tier-split-165 ms: misses-window %.3f = act-wait %.3f + cpu-dispatch %.3f + "
-                     "upload-enq %.3f + bookkeeping %.3f (identity residual %.6f; book min %.3f max %.3f; "
-                     "native_stats.ms_misses %.3f delta %.6f)\n",
-                     ts.ms_misses_sum, ts.ms_act_wait, ts.ms_cpu, ts.ms_upload_enq, ts.ms_bookkeeping, residual,
-                     ts.ms_bookkeeping_min, ts.ms_bookkeeping_max, d.native_stats.ms_misses,
-                     ts.ms_misses_sum - d.native_stats.ms_misses);
-        std::fprintf(stderr,
-                     "strata: tier-split-165 ms: cpu-dispatch pool split over %lld miss calls = gu-rows %.3f + "
-                     "host-quant %.3f + down-rows %.3f (pool %.3f); cpu-dispatch outside pool %.3f; pool drain "
-                     "differential (whole run_native_slice_jobs, redundant cross-check, NOT added) %.3f\n",
-                     (long long) ts.pool_diff_calls, ts.ms_pool_gu, ts.ms_pool_q, ts.ms_pool_down, cpu_pool,
-                     ts.ms_cpu - cpu_pool, ts.ms_pool_drain);
-        std::fprintf(stderr,
-                     "strata: tier-split-165 notes: pool wait-park/repark N/A (run_phase/run_native_slice_jobs "
-                     "do not update them; only run() does); ids window not split (its wait includes the upstream "
-                     "graph prefix)\n");
-    }
     for (void** p : {&d.native_meta_dev, &d.native_d_act, &d.native_x_q8_1, &d.native_scratch}) {
         if (*p != nullptr) { cudaFree(*p); *p = nullptr; }
     }
@@ -3881,6 +3915,7 @@ bool expert_native_decode_layer(ExpertDispatch& d, int64_t layer, int64_t k, con
     // Router ids (32 B).  With the tier OFF every entry is a miss, so the activation image is needed anyway:
     // both transfers are enqueued together behind ONE sync (the pre event already ordered the stream).
     const bool all_miss = d.cache == nullptr;
+    qwen35_t1h_stamp(QWEN35_T1H_IDS_SUBMIT);   // task 194 (inert unless the gate is on)
     if (cudaMemcpyAsync(st.host_ids, ids_dev, (size_t) K * sizeof(int32_t), cudaMemcpyDeviceToHost, copy) !=
         cudaSuccess) {
         err = "native tier: the router-id transfer failed";
@@ -3892,11 +3927,13 @@ bool expert_native_decode_layer(ExpertDispatch& d, int64_t layer, int64_t k, con
         err = "native tier: the activation transfer failed";
         return false;
     }
+    qwen35_t1h_stamp(QWEN35_T1H_IDS_WAIT_B);
     if (cudaEventRecord((cudaEvent_t) d.native_ev_ids, copy) != cudaSuccess ||
         cudaEventSynchronize((cudaEvent_t) d.native_ev_ids) != cudaSuccess) {
         err = "native tier: the router-id wait failed";
         return false;
     }
+    qwen35_t1h_stamp(QWEN35_T1H_IDS_WAIT_E);
     const double t1 = tier_now_ms();
     d.native_stats.ms_ids += t1 - t0;
     // LAUNCH: residency decision + the GPU hits.
@@ -3912,63 +3949,47 @@ bool expert_native_decode_layer(ExpertDispatch& d, int64_t layer, int64_t k, con
     }
     const double t2 = tier_now_ms();
     d.native_stats.ms_launch += t2 - t1;
+    qwen35_t1h_stamp(QWEN35_T1H_HOT_END);
+    qwen35_t1h_note(QWEN35_T1H_NOTE_HITS, (long long) (d.native_hits - hits_before));
     // CPU MISSES.
     int miss_rank[16];
     int nm = 0;
     for (int64_t i = 0; i < K; ++i)
         if (st.is_hit[i] == 0 && nm < 16) miss_rank[nm++] = (int) i;
-    // 165 (STRATA_QWEN35_TIER_SPLIT=1, default OFF): split this window (t2..t3) into the EXISTING steps.
-    // Host timers only; no sync, submission or data-path change.
-    ExpertDispatch::NativeTierSplit& ts = d.tier_split;
-    if (!ts.resolved) {
-        ts.resolved = true;
-        ts.enabled = tier_split_enabled();
-    }
-    const bool ts_on = ts.enabled;
-    double ts_act = 0.0, ts_cpu = 0.0, ts_up = 0.0;
+    qwen35_t1h_note(QWEN35_T1H_NOTE_MISSES, nm);
     if (nm == 0) {
         ++d.native_stats.all_hit;
     } else {
-        double pool_gu0 = 0.0, pool_q0 = 0.0, pool_down0 = 0.0, pool_drain0 = 0.0;
         if (!all_miss) {
-            const double w0 = ts_on ? tier_now_ms() : 0.0;
+            qwen35_t1h_stamp(QWEN35_T1H_ACT_SUBMIT);
             if (cudaMemcpyAsync(st.host_act, x_dev, (size_t) d.n_embd * sizeof(float), cudaMemcpyDeviceToHost,
                                 copy) != cudaSuccess) {
                 err = "native tier: the activation transfer failed";
                 return false;
             }
+            qwen35_t1h_stamp(QWEN35_T1H_ACT_WAIT_B);
             if (cudaEventRecord((cudaEvent_t) d.native_ev_act, copy) != cudaSuccess ||
                 cudaEventSynchronize((cudaEvent_t) d.native_ev_act) != cudaSuccess) {
                 err = "native tier: the activation wait failed";
                 return false;
             }
-            if (ts_on) ts_act = tier_now_ms() - w0;
+            qwen35_t1h_stamp(QWEN35_T1H_ACT_WAIT_E);
+            qwen35_t1h_note(QWEN35_T1H_NOTE_ACT_STATE, 2);
         }
         d.qwen_local_ids.resize((size_t) nm);
         for (int i = 0; i < nm; ++i) d.qwen_local_ids[(size_t) i] = st.host_ids[miss_rank[i]];
-        if (ts_on && d.pool != nullptr) {
-            pool_gu0 = d.pool->ms_multi_gu;
-            pool_q0 = d.pool->ms_multi_q;
-            pool_down0 = d.pool->ms_multi_down;
-            double pwp = 0.0, prp = 0.0;
-            d.pool->phase_ms(pwp, pool_drain0, prp);
-        }
-        const double c0 = ts_on ? tier_now_ms() : 0.0;
-        if (!expert_native_misses(d, layer, st.host_act, d.qwen_local_ids.data(), nm, st.host_miss)) return false;
-        if (ts_on) {
-            ts_cpu = tier_now_ms() - c0;
-            if (d.pool != nullptr) {
-                ts.ms_pool_gu += d.pool->ms_multi_gu - pool_gu0;
-                ts.ms_pool_q += d.pool->ms_multi_q - pool_q0;
-                ts.ms_pool_down += d.pool->ms_multi_down - pool_down0;
-                double pwp = 0.0, pdr = 0.0, prp = 0.0;
-                d.pool->phase_ms(pwp, pdr, prp);
-                ts.ms_pool_drain += pdr - pool_drain0;
-                ++ts.pool_diff_calls;
-            }
-        }
+        qwen35_t1h_stamp(QWEN35_T1H_COLD_B);
+        // Task 202: the optional pool-phase sink lives on this stack frame for the duration of the BLOCKING
+        // pool call only; the bridge copies the values immediately after the call returns (no pointer
+        // retention, no TLS/global flag, no effect on any other caller).
+        strata::kernels::cpu::SlicePhaseTiming t1h_pool_phase;
+        const bool t1h_pool_wanted = qwen35_t1h_pool_phase_wanted();
+        t1h_pool_phase.requested = t1h_pool_wanted;
+        if (!expert_native_misses(d, layer, st.host_act, d.qwen_local_ids.data(), nm, st.host_miss,
+                                  t1h_pool_wanted ? &t1h_pool_phase : nullptr)) return false;
+        qwen35_t1h_stamp(QWEN35_T1H_COLD_E);
+        if (t1h_pool_wanted) qwen35_t1h_pool_phase(&t1h_pool_phase);
         float* parts = expert_native_parts(d);
-        const double u0 = ts_on ? tier_now_ms() : 0.0;
         for (int i = 0; i < nm; ++i)
             if (cudaMemcpyAsync(parts + (size_t) miss_rank[i] * d.n_embd, st.host_miss + (size_t) i * d.n_embd,
                                 (size_t) d.n_embd * sizeof(float), cudaMemcpyHostToDevice, copy) != cudaSuccess) {
@@ -3980,7 +4001,7 @@ bool expert_native_decode_layer(ExpertDispatch& d, int64_t layer, int64_t k, con
             err = "native tier: the miss-upload ordering failed";
             return false;
         }
-        if (ts_on) ts_up = tier_now_ms() - u0;
+        qwen35_t1h_stamp(QWEN35_T1H_H2D_END);
         // Real overlap evidence: the CPU work just ended; SUCCESS here means the GPU hits finished during it.
         if (have_hits) {
             const cudaError_t ready = cudaEventQuery((cudaEvent_t) d.native_ev_hit_done);
@@ -3991,30 +4012,8 @@ bool expert_native_decode_layer(ExpertDispatch& d, int64_t layer, int64_t k, con
     }
     const double t3 = tier_now_ms();
     d.native_stats.ms_misses += t3 - t2;
-    if (ts_on) {
-        ++ts.calls;
-        ts.ms_misses_sum += t3 - t2;
-        if (nm == 0) {
-            ++ts.all_hit_calls;
-        } else {
-            ++ts.miss_calls;
-            ts.miss_entries += nm;
-            if (all_miss) ++ts.all_miss_calls;
-            ts.ms_act_wait += ts_act;
-            ts.ms_cpu += ts_cpu;
-            ts.ms_upload_enq += ts_up;
-        }
-        const double book = (t3 - t2) - ts_act - ts_cpu - ts_up;
-        ts.ms_bookkeeping += book;
-        if (ts.bookkeeping_observed++ == 0) {
-            ts.ms_bookkeeping_min = book;
-            ts.ms_bookkeeping_max = book;
-        } else {
-            if (book < ts.ms_bookkeeping_min) ts.ms_bookkeeping_min = book;
-            if (book > ts.ms_bookkeeping_max) ts.ms_bookkeeping_max = book;
-        }
-    }
     // COMBINE: the shared parts with the DEVICE router weights into the graph's output.
+    qwen35_t1h_stamp(QWEN35_T1H_COMBINE_SUBMIT);
     if (!expert_native_combine(d, work, (const float*) weights_dev, (float*) out_dev, K)) return false;
     const double t4 = tier_now_ms();
     d.native_stats.ms_combine += t4 - t3;

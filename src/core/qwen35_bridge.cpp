@@ -26,8 +26,11 @@
 #include <algorithm>
 #include <atomic>
 #include <cmath>
+#include <cstdarg>
 #include <cstdio>
 #include <cstdlib>
+#include <functional>
+#include <thread>
 #include <cstring>
 #include <filesystem>
 #include <fstream>
@@ -677,6 +680,267 @@ void a_split_flush() {
     }
 }
 
+// ---- Task 194 (exact STRATA_QWEN35_T1_HOST_TIMELINE=1, default off): bounded HOST timeline for request 2's
+// ACTUAL decode evaluations 6..8 (120 layer records + 6 evaluation boundary marks).  Every stamp is a host
+// steady_clock instant taken at a point that already exists on the seam path; no new CUDA call, event,
+// synchronize, query or allocation is added, the gate-off path is inert (a single cached env check), and
+// nothing is printed until the request ends.  The seam callbacks and the native tier run on the same compute
+// thread, so the recorder is plain single-thread state (no TLS assumptions); the thread id is recorded as a
+// correlation value when readily available.
+// ==== T1H-196 INTERNALS BEGIN (private recorder state/helpers; stays in the anonymous namespace) ====
+constexpr int kT1HMaxRecords = 144;   // 120 expected + bounded margin; overflow is a reported hard flag
+struct T1HRecord {
+    int64_t ns_pre0 = 0, ns_pre1 = 0, ns_ids_submit = 0, ns_ids_wait_b = 0, ns_ids_wait_e = 0;
+    int64_t ns_hot_end = 0, ns_act_submit = 0, ns_act_wait_b = 0, ns_act_wait_e = 0;
+    int64_t ns_cold_b = 0, ns_cold_e = 0, ns_h2d_end = 0, ns_combine_submit = 0;
+    int64_t ns_service_return = 0, ns_post_enq = 0, ns_join = 0;
+    int32_t eval = 0, layer = -1, hits = 0, misses = 0, act_state = 0;   // act_state: 0 absent(NA), 2 measured
+    uint8_t valid = 0;
+    long long tid = 0;
+    // Task 202 pool-phase sink (requested only when the pool gate + an open record exist)
+    uint8_t pool_requested = 0, pool_available = 0;
+    int32_t pool_reason = -1, pool_njobs = 0;
+    double pool_gu_incl = -1, pool_quant = -1, pool_down_incl = -1;
+    double pool_gu_bp = -1, pool_gu_pub = -1, pool_gu_drain = -1, pool_gu_wd = -1, pool_gu_ap = -1;
+    double pool_down_bp = -1, pool_down_pub = -1, pool_down_drain = -1, pool_down_wd = -1, pool_down_ap = -1;
+};
+struct T1HState {
+    bool active = false;
+    int request = 0, eval = 0, pending = -1, count = 0;
+    bool overflow = false, dup = false;
+    T1HRecord rec[kT1HMaxRecords];
+    int64_t eval_begin_ns[9] = {}, eval_ready_ns[9] = {};
+    int eval_layers[9] = {};
+    long long tid = 0;
+};
+T1HState g_t1h;
+
+int64_t t1h_now_ns() {
+    return (int64_t) std::chrono::duration_cast<std::chrono::nanoseconds>(
+               std::chrono::steady_clock::now().time_since_epoch()).count();
+}
+long long t1h_thread_id() {
+    return (long long) std::hash<std::thread::id>{}(std::this_thread::get_id());
+}
+bool t1_host_timeline_on() {
+    static const bool on = [] {
+        const char* v = std::getenv("STRATA_QWEN35_T1_HOST_TIMELINE");
+        return v != nullptr && std::strcmp(v, "1") == 0;
+    }();
+    return on;
+}
+/// Task 202: the pool gate is read once per process; it alone changes nothing (the HOST timeline recorder
+/// must also be active and hold an open record for any timestamp to be taken).
+bool t1_pool_phase_on() {
+    static const bool on = [] {
+        const char* v = std::getenv("STRATA_QWEN35_T1_POOL_PHASE");
+        return v != nullptr && std::strcmp(v, "1") == 0;
+    }();
+    return on;
+}
+/// Emit-time bounded writer (one per request end when the gate is on; not a per-seam builder, no heap).
+struct T1HEmit {
+    char* buf = nullptr;
+    size_t cap = 0, off = 0;
+    bool ok = true;
+    void put(const char* fmt, ...) {
+        if (!ok) return;
+        va_list ap;
+        va_start(ap, fmt);
+        const int n = std::vsnprintf(buf + off, cap - off, fmt, ap);
+        va_end(ap);
+        if (n < 0 || (size_t) n >= cap - off) { ok = false; return; }
+        off += (size_t) n;
+    }
+};
+
+// ==== T1H-196 INTERNALS END ====
+
+}  // namespace (T1H private state ends; the public API below has external linkage - task 196 repair)
+
+// ==== T1H-196 PUBLIC BEGIN (strata::core linkage, shared by bridge/expert/model translation units) ====
+
+bool qwen35_t1h_enabled() { return t1_host_timeline_on(); }
+
+void qwen35_t1h_eval_begin(int request, int eval) {
+    if (!t1_host_timeline_on()) return;
+    if (request != 2 || eval < 6 || eval > 8) return;   // contract: request 2, ACTUAL evaluations 6..8 only
+    T1HState& T = g_t1h;
+    if (T.pending >= 0) { T.rec[T.pending].valid = 0; T.dup = true; T.pending = -1; }
+    T.active = true;
+    T.request = request;
+    T.eval = eval;
+    T.eval_begin_ns[eval] = t1h_now_ns();
+}
+
+void qwen35_t1h_eval_ready(int request, int eval) {
+    if (!t1_host_timeline_on()) return;
+    if (request != 2 || eval < 6 || eval > 8) return;
+    T1HState& T = g_t1h;
+    if (!T.active) return;
+    T.eval_ready_ns[eval] = t1h_now_ns();
+    if (eval == 8) T.active = false;   // cleared only after the existing get-logits readiness of eval 8
+}
+
+void qwen35_t1h_scope_reset(int request) {
+    if (!t1_host_timeline_on()) return;
+    T1HState& T = g_t1h;
+    // Error/EOS/reset safety: an open record or active scope never carries into another request.
+    if (T.pending >= 0) { T.rec[T.pending].valid = 0; T.dup = true; T.pending = -1; }
+    T.active = false;
+    (void) request;
+}
+
+void qwen35_t1h_stamp(int field) {
+    T1HState& T = g_t1h;
+    if (!T.active || T.pending < 0) return;
+    const int64_t ns = t1h_now_ns();
+    T1HRecord& r = T.rec[T.pending];
+    switch (field) {
+        case QWEN35_T1H_PRE1: r.ns_pre1 = ns; break;
+        case QWEN35_T1H_IDS_SUBMIT: r.ns_ids_submit = ns; break;
+        case QWEN35_T1H_IDS_WAIT_B: r.ns_ids_wait_b = ns; break;
+        case QWEN35_T1H_IDS_WAIT_E: r.ns_ids_wait_e = ns; break;
+        case QWEN35_T1H_HOT_END: r.ns_hot_end = ns; break;
+        case QWEN35_T1H_ACT_SUBMIT: r.ns_act_submit = ns; break;
+        case QWEN35_T1H_ACT_WAIT_B: r.ns_act_wait_b = ns; break;
+        case QWEN35_T1H_ACT_WAIT_E: r.ns_act_wait_e = ns; break;
+        case QWEN35_T1H_COLD_B: r.ns_cold_b = ns; break;
+        case QWEN35_T1H_COLD_E: r.ns_cold_e = ns; break;
+        case QWEN35_T1H_H2D_END: r.ns_h2d_end = ns; break;
+        case QWEN35_T1H_COMBINE_SUBMIT: r.ns_combine_submit = ns; break;
+        case QWEN35_T1H_SERVICE_RETURN: r.ns_service_return = ns; break;
+        case QWEN35_T1H_POST_ENQ: r.ns_post_enq = ns; break;
+        case QWEN35_T1H_JOIN: r.ns_join = ns; break;
+        default: break;
+    }
+}
+
+void qwen35_t1h_note(int note, long long value) {
+    T1HState& T = g_t1h;
+    if (!T.active || T.pending < 0) return;
+    T1HRecord& r = T.rec[T.pending];
+    if (note == QWEN35_T1H_NOTE_HITS) r.hits = (int32_t) value;
+    else if (note == QWEN35_T1H_NOTE_MISSES) r.misses = (int32_t) value;
+    else if (note == QWEN35_T1H_NOTE_ACT_STATE) r.act_state = (int32_t) value;
+}
+
+void qwen35_t1h_begin_layer(int layer, bool t1) {
+    T1HState& T = g_t1h;
+    if (!T.active || !t1) return;
+    if (T.pending >= 0) { T.rec[T.pending].valid = 0; T.dup = true; }
+    if (T.count >= kT1HMaxRecords) { T.overflow = true; T.pending = -1; return; }
+    T.pending = T.count;
+    T1HRecord& r = T.rec[T.count];
+    r = T1HRecord();
+    r.eval = T.eval;
+    r.layer = (int32_t) layer;
+    r.ns_pre0 = t1h_now_ns();
+    if (T.tid == 0) T.tid = t1h_thread_id();
+    r.tid = T.tid;
+    if (T.eval >= 0 && T.eval < 9) ++T.eval_layers[T.eval];
+}
+
+void qwen35_t1h_end_layer() {
+    T1HState& T = g_t1h;
+    if (!T.active || T.pending < 0) return;
+    T1HRecord& r = T.rec[T.pending];
+    r.valid = 1;
+    ++T.count;
+    T.pending = -1;
+}
+
+bool qwen35_t1h_pool_phase_wanted() {
+    return t1_pool_phase_on() && t1_host_timeline_on() && g_t1h.active && g_t1h.pending >= 0;
+}
+
+void qwen35_t1h_pool_phase(const strata::kernels::cpu::SlicePhaseTiming* timing) {
+    if (timing == nullptr || !t1_pool_phase_on()) return;
+    T1HState& T = g_t1h;
+    if (!T.active || T.pending < 0) return;
+    T1HRecord& r = T.rec[T.pending];
+    r.pool_requested = 1;
+    r.pool_available = timing->available ? 1 : 0;
+    r.pool_reason = timing->available ? 0 : timing->reason;
+    r.pool_njobs = (int32_t) timing->n_jobs;
+    r.pool_gu_incl = timing->gu_inclusive_ms;
+    r.pool_quant = timing->quant_ms;
+    r.pool_down_incl = timing->down_inclusive_ms;
+    r.pool_gu_bp = timing->gu_before_park_ms;
+    r.pool_gu_pub = timing->gu_publish_ms;
+    r.pool_gu_drain = timing->gu_host_drain_ms;
+    r.pool_gu_wd = timing->gu_wait_done_ms;
+    r.pool_gu_ap = timing->gu_after_park_ms;
+    r.pool_down_bp = timing->down_before_park_ms;
+    r.pool_down_pub = timing->down_publish_ms;
+    r.pool_down_drain = timing->down_host_drain_ms;
+    r.pool_down_wd = timing->down_wait_done_ms;
+    r.pool_down_ap = timing->down_after_park_ms;
+}
+
+void qwen35_t1h_emit_request_end(int request) {
+    if (!t1_host_timeline_on() || request != 2) return;
+    T1HState& T = g_t1h;
+    bool complete = (T.count == 120) && !T.overflow && !T.dup;
+    for (int e = 6; e <= 8; ++e)
+        complete = complete && T.eval_layers[e] == 40 && T.eval_begin_ns[e] != 0 && T.eval_ready_ns[e] != 0;
+    static char t1h_buf[1 << 17];
+    T1HEmit E{t1h_buf, sizeof(t1h_buf), 0, true};
+    E.put("{\"event\":\"t1_host_timeline\",\"request\":2,\"clock\":\"steady_clock_ns\",\"complete\":%s,"
+          "\"count\":%d,\"overflow\":%s,\"dup\":%s,\"layer_capacity\":%d,"
+          "\"eval6_begin\":%lld,\"eval6_ready\":%lld,\"eval7_begin\":%lld,\"eval7_ready\":%lld,"
+          "\"eval8_begin\":%lld,\"eval8_ready\":%lld,\"eval_layers\":[%d,%d,%d],\"records\":[",
+          complete ? "true" : "false", T.count, T.overflow ? "true" : "false", T.dup ? "true" : "false",
+          kT1HMaxRecords, (long long) T.eval_begin_ns[6], (long long) T.eval_ready_ns[6],
+          (long long) T.eval_begin_ns[7], (long long) T.eval_ready_ns[7],
+          (long long) T.eval_begin_ns[8], (long long) T.eval_ready_ns[8],
+          T.eval_layers[6], T.eval_layers[7], T.eval_layers[8]);
+    for (int i = 0; i < T.count && E.ok; ++i) {
+        const T1HRecord& r = T.rec[i];
+        E.put("%s{\"eval\":%d,\"layer\":%d,\"pre0\":%lld,\"pre1\":%lld,\"ids_submit\":%lld,\"ids_wait_b\":%lld,"
+              "\"ids_wait_e\":%lld,\"hot_end\":%lld,\"act_submit\":%lld,\"act_wait_b\":%lld,\"act_wait_e\":%lld,"
+              "\"cold_b\":%lld,\"cold_e\":%lld,\"h2d_end\":%lld,\"combine_submit\":%lld,\"service_return\":%lld,"
+              "\"post_enq\":%lld,\"join\":%lld,\"hits\":%d,\"misses\":%d,\"act_state\":%d,\"tid\":%lld,"
+              "\"valid\":%d,",
+              i ? "," : "", r.eval, r.layer, (long long) r.ns_pre0, (long long) r.ns_pre1,
+              (long long) r.ns_ids_submit, (long long) r.ns_ids_wait_b, (long long) r.ns_ids_wait_e,
+              (long long) r.ns_hot_end, (long long) r.ns_act_submit, (long long) r.ns_act_wait_b,
+              (long long) r.ns_act_wait_e, (long long) r.ns_cold_b, (long long) r.ns_cold_e,
+              (long long) r.ns_h2d_end, (long long) r.ns_combine_submit, (long long) r.ns_service_return,
+              (long long) r.ns_post_enq, (long long) r.ns_join, r.hits, r.misses, r.act_state, r.tid,
+              (int) r.valid);
+        if (r.pool_requested) {
+            E.put("\"pool_phase_ms\":{\"available\":%s,\"reason\":%d,\"n_jobs\":%d,"
+                  "\"gu_inclusive\":%.6g,\"quant\":%.6g,\"down_inclusive\":%.6g,"
+                  "\"gu_before_park\":%.6g,\"gu_publish\":%.6g,\"gu_host_drain\":%.6g,\"gu_wait_done\":%.6g,"
+                  "\"gu_after_park\":%.6g,\"down_before_park\":%.6g,\"down_publish\":%.6g,"
+                  "\"down_host_drain\":%.6g,\"down_wait_done\":%.6g,\"down_after_park\":%.6g}}",
+                  r.pool_available ? "true" : "false", r.pool_reason, (int) r.pool_njobs,
+                  r.pool_gu_incl, r.pool_quant, r.pool_down_incl, r.pool_gu_bp, r.pool_gu_pub, r.pool_gu_drain,
+                  r.pool_gu_wd, r.pool_gu_ap, r.pool_down_bp, r.pool_down_pub, r.pool_down_drain, r.pool_down_wd,
+                  r.pool_down_ap);
+        } else {
+            E.put("\"pool_phase_ms\":null}");
+        }
+    }
+    E.put("]}\n");
+    if (!E.ok) {
+        // A truncated record must never look like a success: one compact, complete hard-diagnostic line.
+        std::fprintf(stdout,
+                     "{\"event\":\"t1_host_timeline\",\"request\":2,\"status\":\"serialization_overflow\","
+                     "\"count\":%d,\"overflow\":%s,\"dup\":%s}\n",
+                     T.count, T.overflow ? "true" : "false", T.dup ? "true" : "false");
+        std::fflush(stdout);
+        return;
+    }
+    std::fwrite(t1h_buf, 1, E.off, stdout);
+    std::fflush(stdout);
+}
+
+// ==== T1H-196 PUBLIC END ====
+
+namespace {   // the file's original anonymous helpers resume
+
 bool seam_exec(ggml_backend_t backend, ggml_tensor* node) {
     State& S = *g_state;
     ExpertDispatch& d = S.dispatch;
@@ -691,6 +955,8 @@ bool seam_exec(ggml_backend_t backend, ggml_tensor* node) {
     }
     const int64_t K = S.K;
     const double t0 = now_seconds();
+    // Task 194 (default off): open the host-timeline record at this seam entry (T1 layers only).
+    qwen35_t1h_begin_layer(layer, node->ne[1] == 1);
     // Task 133 (off by default): close the host-gap/device-span window opened at the previous seam exit.
     if (seam_gap_enabled()) seam_gap_enter(backend, layer, node->ne[1] == 1, t0);
     // Task 134 (off by default): the first seam callback of the current round closes the A window.
@@ -714,6 +980,7 @@ bool seam_exec(ggml_backend_t backend, ggml_tensor* node) {
     }
     cudaStreamWaitEvent(L.copy, (cudaEvent_t) L.pre->context, 0);
     cudaStreamWaitEvent(L.work, (cudaEvent_t) L.pre->context, 0);
+    qwen35_t1h_stamp(QWEN35_T1H_PRE1);   // task 194: pre event recorded + copy/work waits enqueued
     // Step probe (default off): the graph pre/work dependencies are established; capture A/W BEFORE the
     // original service runs so no output/alias can affect the input snapshot.
     bool step_active = false;
@@ -735,6 +1002,7 @@ bool seam_exec(ggml_backend_t backend, ggml_tensor* node) {
                          d.fail != nullptr ? d.fail : "no dispatch message");
             return false;
         }
+        qwen35_t1h_stamp(QWEN35_T1H_SERVICE_RETURN);   // task 196: explicitly named extra instant (NOT post/join)
         // Step probe (default off): capture B on the same work stream after the service, with one checked sync;
         // `count` in its record line is S.decode_layers BEFORE this layer's increment (241 before index 7).
         if (!step_probe_end(S, L, node, step_active)) return false;
@@ -800,7 +1068,10 @@ bool seam_exec(ggml_backend_t backend, ggml_tensor* node) {
         S.jobs.fetch_add((uint64_t) (T * K), std::memory_order_relaxed);
     }
     if (cudaEventRecord((cudaEvent_t) L.post->context, L.work) != cudaSuccess) return false;
+    qwen35_t1h_stamp(QWEN35_T1H_POST_ENQ);   // task 196: host instant of the ORIGINAL post-event record
     ggml_backend_event_wait(backend, L.post);
+    qwen35_t1h_stamp(QWEN35_T1H_JOIN);       // task 196: host instant of the ORIGINAL backend wait enqueue
+    qwen35_t1h_end_layer();                  // closes the record only after the final required boundary
     {
         const cudaError_t cerr = cudaGetLastError();
         if (cerr != cudaSuccess) {
@@ -1022,7 +1293,11 @@ double qwen35_native_seconds() {
 bool qwen35_native_enabled() { return g_state != nullptr && g_state->initialized; }
 
 bool qwen35_native_layer_enabled(int layer, int64_t n_tokens) {
-    (void) layer; (void) n_tokens;
+    (void) n_tokens;
+    // Task 235: the native seam owns the pack's main layers only; the MTP draft block (layer >= 40) must run
+    // on llama.cpp's own MoE path because its quants are not in the native pack.  Uninitialized state stays
+    // false through qwen35_native_enabled() below.
+    if (layer < 0 || layer >= 40) return false;
     // Diagnostic A/B: let llama.cpp's own graph compute the experts (the anchor against this bridge).
     if (std::getenv("STRATA_QWEN35_GGML_MOE") != nullptr) return false;
     return qwen35_native_enabled();

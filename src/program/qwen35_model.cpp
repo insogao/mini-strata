@@ -8,10 +8,13 @@
 #include "strata/core/qwen35_bridge.hpp"
 #include "strata/core/qwen35_prefill.hpp"
 #include "strata/core/expert_source.hpp"
+#include "strata/core/qwen35_mtp.hpp"
+#include "strata/core/qwen35_mtp_txn.hpp"
 #include "strata/kernels/cpu/expert_layout.hpp"
 #include "strata/kernels/cpu/pool.hpp"
 
 #include "llama.h"
+#include "llama-ext.h"
 #include "ggml-backend.h"
 
 #include <cuda_runtime.h>
@@ -63,14 +66,19 @@ struct VramPeak {
     size_t total = 0;
     int64_t samples = 0;
     double sample_seconds = 0;   // wall time of every sample() call, successful or not (additive diagnostic)
-    double sample() {
+    // One cudaMemGetInfo query feeds this tracker and an optional second window tracker, so a per-request
+    // peak never adds a second query per token.
+    void record_used(size_t used, size_t total_b) {
+        total = total_b;
+        if (used > peak_used) peak_used = used;
+        ++samples;
+    }
+    double sample(VramPeak* also = nullptr) {
         const auto begin = Clock::now();
         size_t free_b = 0, total_b = 0;
         if (cudaMemGetInfo(&free_b, &total_b) == cudaSuccess) {
-            total = total_b;
-            const size_t used = total_b - free_b;
-            if (used > peak_used) peak_used = used;
-            ++samples;
+            record_used(total_b - free_b, total_b);
+            if (also != nullptr) also->record_used(total_b - free_b, total_b);
         }
         const double seconds = elapsed(begin);
         sample_seconds += seconds;
@@ -262,9 +270,657 @@ struct GdnEventsFlushGuard {
     ~GdnEventsFlushGuard() { if (on) strata_gdn_events_flush(); }
 };
 
+// Task 178 (exact STRATA_QWEN35_TWO_REQUEST=1; default off): the same-process two-full-request measurement
+// contract prepared in task 176.  One process loads the model/bridge/context/sampler once and then runs TWO
+// complete greedy autoregressive requests over the same fixed prompt (positions restart at 0, the memory is
+// reset through the same proven `llama_memory_clear` call the warm/multi diagnostics trust, the prompt loan
+// is returned before each request's decode and re-planned inside the next prefill).  Each request emits its
+// own records (`prefill_start`, `first_token`, `token`, `token_timing`, `eog_stop`, `request_summary`) with
+// its own anchor and counters; the bridge's process-cumulative counters are reported as deltas against the
+// post-`finish_prompt` base snapshot of the same request.  This is a diagnostic measurement facility only
+// (no service, no platform, no quality claim); diagnostics that are one-shot or flush-once per process are
+// refused by contract in two_request_conflict() below - never mixed silently.
+bool two_request_enabled() {
+    static const bool on = [] {
+        const char* v = std::getenv("STRATA_QWEN35_TWO_REQUEST");
+        return v != nullptr && std::strcmp(v, "1") == 0;
+    }();
+    return on;
+}
+
+/// The pre-registered incompatibilities of the two-request contract (checked before the model loads): a
+/// one-shot/flush-once diagnostic or a non-autoregressive mode must be rejected, not silently mixed.
+/// TIER_SPLIT is a forward guard: this base carries no tier-split implementation, so the name is refused
+/// if it is ever set (the gate would otherwise be a cross-request close-only report in a later revision).
+const char* two_request_conflict(const Qwen35RunOptions& o) {
+    const auto exact1 = [](const char* name) {
+        const char* v = std::getenv(name);
+        return v != nullptr && std::strcmp(v, "1") == 0;
+    };
+    if (exact1("STRATA_QWEN35_WARM_ROUND")) return "STRATA_QWEN35_WARM_ROUND";
+    const char* mr = std::getenv("STRATA_QWEN35_MULTI_ROUND");
+    if (mr != nullptr && mr[0] != '\0') return "STRATA_QWEN35_MULTI_ROUND";
+    if (exact1("STRATA_QWEN35_GDN_EVENTS")) return "STRATA_QWEN35_GDN_EVENTS";
+    if (exact1("STRATA_QWEN35_SEAM_GAP")) return "STRATA_QWEN35_SEAM_GAP";
+    if (exact1("STRATA_QWEN35_A_SPLIT")) return "STRATA_QWEN35_A_SPLIT";
+    if (exact1("STRATA_QWEN35_STEP_PROBE")) return "STRATA_QWEN35_STEP_PROBE";
+    if (exact1("STRATA_QWEN35_TIER_SPLIT")) return "STRATA_QWEN35_TIER_SPLIT";
+    if (!o.routing_log.empty()) return "the routing log (--routing-log)";
+    if (o.topk > 0) return "the top-k dump (--topk)";
+    if (!o.teacher_file.empty()) return "the teacher prefix (--teacher-file: a teacher replay is not autoregressive)";
+    return nullptr;
+}
+
+// Task 194 (exact STRATA_QWEN35_T1_HOST_TIMELINE=1; default off): the bounded host-timeline diagnostic for
+// request 2's ACTUAL decode evaluations 6..8 (120 layer records + 6 evaluation boundary marks).  Strictly
+// confined to the two-request path and REFUSED when STRATA_QWEN35_T1_PROFILE_RANGE=1 is set (Nsight overhead
+// must not mix with host-phase attribution).  Gate off: every call inert, nothing printed, default untouched.
+bool t1_host_timeline_enabled() {
+    static const bool on = [] {
+        const char* v = std::getenv("STRATA_QWEN35_T1_HOST_TIMELINE");
+        return v != nullptr && std::strcmp(v, "1") == 0;
+    }();
+    return on;
+}
+
+// Task 202 (exact STRATA_QWEN35_T1_POOL_PHASE=1; default off): the optional pool-phase sink for the HOST
+// timeline's request-2 evaluations 6..8.  REFUSED before load unless the full combination is present
+// (T1_HOST_TIMELINE=1 + TWO_REQUEST=1 + STOP_EOG=1 + DECODE_TIMESTAMPS=1, Nsight range unset); gate off:
+// both gates are cached checks, no clock, no allocation, no output change.
+bool t1_pool_phase_enabled() {
+    static const bool on = [] {
+        const char* v = std::getenv("STRATA_QWEN35_T1_POOL_PHASE");
+        return v != nullptr && std::strcmp(v, "1") == 0;
+    }();
+    return on;
+}
+
+// Task 206 declaration-order fix: t1_pool_phase_conflict below uses t1_profile_range_enabled() whose
+// definition (unchanged) sits further down; a same-scope forward declaration restores definition-before-use
+// semantics without moving any code and without any gate/behavior change.
+bool t1_profile_range_enabled();
+
+const char* t1_pool_phase_conflict(const Qwen35RunOptions& o) {
+    if (!t1_pool_phase_enabled()) return nullptr;
+    const auto exact1 = [](const char* name) {
+        const char* v = std::getenv(name);
+        return v != nullptr && std::strcmp(v, "1") == 0;
+    };
+    if (!two_request_enabled()) return "the single-request path (STRATA_QWEN35_TWO_REQUEST is not 1)";
+    if (!exact1("STRATA_QWEN35_T1_HOST_TIMELINE")) return "a run without STRATA_QWEN35_T1_HOST_TIMELINE=1";
+    if (!exact1("STRATA_QWEN35_STOP_EOG")) return "a run without STRATA_QWEN35_STOP_EOG=1";
+    if (!exact1("STRATA_QWEN35_DECODE_TIMESTAMPS")) return "a run without STRATA_QWEN35_DECODE_TIMESTAMPS=1";
+    if (o.max_new != 32) return "an output budget other than 32";
+    if (t1_profile_range_enabled()) return "STRATA_QWEN35_T1_PROFILE_RANGE=1 (exclusive gates)";
+    return nullptr;
+}
+
+const char* t1_host_conflict(const Qwen35RunOptions& o) {
+    if (!t1_host_timeline_enabled()) return nullptr;
+    const auto exact1 = [](const char* name) {
+        const char* v = std::getenv(name);
+        return v != nullptr && std::strcmp(v, "1") == 0;
+    };
+    if (!two_request_enabled()) return "the single-request path (STRATA_QWEN35_TWO_REQUEST is not 1)";
+    if (!exact1("STRATA_QWEN35_STOP_EOG")) return "a run without STRATA_QWEN35_STOP_EOG=1";
+    if (!exact1("STRATA_QWEN35_DECODE_TIMESTAMPS")) return "a run without STRATA_QWEN35_DECODE_TIMESTAMPS=1";
+    if (o.max_new != 32) return "an output budget other than 32";
+    if (exact1("STRATA_QWEN35_T1_PROFILE_RANGE")) return "STRATA_QWEN35_T1_PROFILE_RANGE=1 (exclusive gates)";
+    return nullptr;
+}
+
+// Task 183 (P1 bounded-trace preparation; EXACT STRATA_QWEN35_T1_PROFILE_RANGE=1, default off): one
+// cudaProfilerStart immediately before the process call that opens request 2's decode evaluation 6 (1-based
+// ACTUAL evaluations) and one cudaProfilerStop right after the existing llama_get_logits_ith readiness wait
+// that closes evaluation 8 - exactly three T1 steps = 120 layer-steps of the actual 40-layer model, no
+// prefill/load/request 1, no whole-model capture, no new device synchronization.  The combination contract
+// is STRATA_QWEN35_TWO_REQUEST=1 + STRATA_QWEN35_STOP_EOG=1 + STRATA_QWEN35_DECODE_TIMESTAMPS=1 (and a
+// max_new budget that can reach evaluation 8); anything else is refused BEFORE the model loads.  Gate off:
+// no profiler call, no event, no timing, no output change; the single-request default flow is untouched.
+//
+// Header evidence (read-only fixed toolchain, 2026-10-12): the build's CUDA 12.8.1 Windows include tree
+// (D:/work/.strata-qwen35-source/runtime/cuda-12.8.1/include) does NOT declare cudaProfilerStart/Stop in
+// cuda_runtime_api.h (0 matches, full 670 KB file) and has no cuda_profiler_api.h - only doc-comment
+// mentions in driver_types.h.  Both are ordinary cudart entry points (this exe already links the shared
+// CUDA runtime for cudaMalloc/cudaMemGetInfo), so they are declared here with the documented runtime-API
+// signatures (x64: a single calling convention, C linkage).  This is NOT independently compile-proved: the
+// first registered build verifies the ABI/link, and read-only import/export evidence of the fixed toolchain
+// is recorded in the 185 task log; no exact official-redundancy claim is made here.
+extern "C" cudaError_t cudaProfilerStart(void);
+extern "C" cudaError_t cudaProfilerStop(void);
+
+bool t1_profile_range_enabled() {
+    static const bool on = [] {
+        const char* v = std::getenv("STRATA_QWEN35_T1_PROFILE_RANGE");
+        return v != nullptr && std::strcmp(v, "1") == 0;
+    }();
+    return on;
+}
+
+/// The profile range exists only inside the two-request measurement contract; every other combination is
+/// refused before load (strict gate; no silent mixing; no profiler call anywhere on the default path).
+const char* t1_profile_conflict(const Qwen35RunOptions& o) {
+    if (!t1_profile_range_enabled()) return nullptr;
+    const auto exact1 = [](const char* name) {
+        const char* v = std::getenv(name);
+        return v != nullptr && std::strcmp(v, "1") == 0;
+    };
+    if (!two_request_enabled()) return "the single-request path (STRATA_QWEN35_TWO_REQUEST is not 1)";
+    if (!exact1("STRATA_QWEN35_STOP_EOG")) return "a run without STRATA_QWEN35_STOP_EOG=1";
+    if (!exact1("STRATA_QWEN35_DECODE_TIMESTAMPS")) return "a run without STRATA_QWEN35_DECODE_TIMESTAMPS=1";
+    if (t1_host_timeline_enabled()) return "STRATA_QWEN35_T1_HOST_TIMELINE=1 (the two gates are exclusive)";
+    if (t1_pool_phase_enabled()) return "STRATA_QWEN35_T1_POOL_PHASE=1 (exclusive with the Nsight range)";
+    if (o.max_new < 9) return "a max_new budget that cannot reach decode evaluation 8";
+    return nullptr;
+}
+
+/// Exactly-once profiler range owner (task 183): the destructor stops a live range on EVERY exit path
+/// (NaN, decode error, EOG before evaluation 8, normal completion) with its own recorded cudaError_t.
+/// `designated_stop_reached` is set only when the stop landed at the registered point (after eval 8's
+/// EXISTING readiness wait), so a run can never silently claim full-range collection.
+struct T1ProfileRange {
+    bool requested = false;                 ///< gate on AND this is request 2 (decided per request)
+    bool started = false;
+    bool stopped = false;
+    bool designated_stop_reached = false;   ///< the stop call ran at the eval-8 readiness point
+    bool start_called = false;
+    bool stop_called = false;
+    int start_error = 0;                    ///< cudaError_t result of the start call (0 == cudaSuccess)
+    int stop_error = 0;                     ///< cudaError_t result of the stop call (0 == cudaSuccess)
+    void start() {
+        if (!requested || start_called) return;
+        start_called = true;
+        const cudaError_t e = cudaProfilerStart();
+        start_error = (int) e;
+        started = (e == cudaSuccess);
+        if (!started) stopped = true;       // a failed start must not leave a live-range expectation
+    }
+    void stop_at_designated_point() {
+        if (!started || stopped) return;
+        stop_called = true;
+        const cudaError_t e = cudaProfilerStop();
+        stop_error = (int) e;
+        stopped = true;
+        designated_stop_reached = (e == cudaSuccess);
+    }
+    /// Explicit idempotent close called ONCE at the end of the decode loop (before the summary metadata is
+    /// built): a range still live after an early EOG/NaN/decode error is stopped here so the summary reports
+    /// the true stopped/error state; designated_stop_reached stays false because the registered point was
+    /// not reached.  Guarded by started && !stopped, so a second ProfilerStop can never be issued.
+    void cleanup_after_decode() {
+        if (started && !stopped) {
+            stop_called = true;
+            stop_error = (int) cudaProfilerStop();
+            stopped = true;
+        }
+    }
+    ~T1ProfileRange() {
+        if (started && !stopped) {   // safety fallback ONLY: all normal paths already closed explicitly
+            stop_called = true;
+            stop_error = (int) cudaProfilerStop();
+            stopped = true;
+        }
+    }
+    bool coverage_ok() const { return requested && started && stopped && designated_stop_reached; }
+};
+
+/// Formats the t1_profile_range object into `buf`; returns false and leaves an EMPTY string (never a
+/// partial/truncated object) when the buffer cannot hold the complete object plus its NUL.  Callers treat
+/// false as a hard diagnostic failure: the summary then carries "t1_profile_range":null and the run fails
+/// non-zero, so a truncated JSON record can never be produced (task 183 review; fixed in 185).
+bool format_prof_json(const T1ProfileRange& prof, char* buf, size_t cap) {
+    if (buf == nullptr || cap == 0) return false;
+    const int n = std::snprintf(
+        buf, cap,
+        "{\"requested\":%s,\"started\":%s,\"stopped\":%s,\"designated_stop_reached\":%s,"
+        "\"start_called\":%s,\"stop_called\":%s,\"start_error\":%d,\"stop_error\":%d,\"coverage_ok\":%s,"
+        "\"start_eval\":6,\"stop_eval\":8,\"evals_in_window\":3,\"header_declared_locally\":true}",
+        prof.requested ? "true" : "false", prof.started ? "true" : "false",
+        prof.stopped ? "true" : "false", prof.designated_stop_reached ? "true" : "false",
+        prof.start_called ? "true" : "false", prof.stop_called ? "true" : "false",
+        prof.start_error, prof.stop_error, prof.coverage_ok() ? "true" : "false");
+    if (n < 0 || (size_t) n >= cap) {
+        buf[0] = '\0';
+        return false;
+    }
+    return true;
+}
+
+/// The two-request flow itself (called only with the gate on and no conflict).  The load region (model,
+/// bridge, context, batch, sampler, seam arm) already ran once in qwen35_run; this function only owns the
+/// per-request engine calls and the measurement records.  Request 1 is the first measurement and request 2
+/// a subsequent, UNCONFIRMED repeat (never labelled steady/p95; one pair cannot prove stability).
+///
+/// Declared contract (diagnostic only; no production API):
+///  - `request_start` anchors the whole request INCLUDING the memory reset (JSON/EOS/E2E use it);
+///    `prefill_start` is taken after the reset; reset/process/finish/full-prefill walls are reported apart,
+///    and TTFT is reported both request-anchored (ttft_request) and prefill-anchored (ttft_prefill).
+///  - the reset is the proven llama_memory_clear(mem, true) (KV cells + GDN conv/SSM/rollback planes).
+///  - autoregressive by contract: the first vocab EOG ends each request even without STRATA_QWEN35_STOP_EOG
+///    (the teacher prefix is refused above, so a non-autoregressive replay cannot run here).
+///  - guards fail the run non-zero and never start the next request: failed prefill / loan return, NaN,
+///    decode process error, missing EOG (max_new reached), unclosed JSON, decode_layers != actual
+///    n_layers * decode_evaluations, broken base2 prompt-tail check, prefill_owned_bytes > 0, or a negative
+///    counter delta.  No business risk answer/tag is ever produced or checked here (external fixture guard).
+///  - task 183: an OPTIONAL bounded profiler range (gate STRATA_QWEN35_T1_PROFILE_RANGE=1, request 2,
+///    actual evaluations 6..8) starts/stops exactly once, is stopped on every early-exit path, and reports
+///    its coverage/errors in `t1_profile_range`; gate off keeps every call and record inert.
+int run_two_request_flow(llama_context* ctx, llama_batch_ext* batch, llama_sampler* sampler,
+                         const llama_vocab* vocab, const std::vector<llama_token>& prompt,
+                         const Qwen35RunOptions& o, const Clock::time_point& process_start, VramPeak& vram,
+                         int64_t n_layers) {
+    const int64_t n_vocab = llama_vocab_n_tokens(vocab);
+    std::fprintf(stdout, "{\"event\":\"prompt_tokens\",\"ids\":[");
+    for (size_t i = 0; i < prompt.size(); ++i) std::fprintf(stdout, "%s%d", i ? "," : "", prompt[i]);
+    std::fprintf(stdout, "]}\n");
+    std::fprintf(stdout, "{\"event\":\"load_done\",\"since_process_start_seconds\":%.9g,\"requests_planned\":2}\n",
+                 elapsed(process_start));
+    std::fflush(stdout);
+    const auto stats_json = [](const core::Qwen35BridgeStats& s) {
+        char buf[512];
+        std::snprintf(buf, sizeof(buf),
+                      "{\"layers\":%lld,\"hits\":%lld,\"misses\":%lld,\"jobs\":%lld,"
+                      "\"expert_seconds\":%.6g,\"tier_ms\":{\"ids\":%.1f,\"launch\":%.1f,"
+                      "\"misses\":%.1f,\"combine\":%.1f,\"admit\":%.1f}}",
+                      (long long) s.decode_layers, (long long) s.decode_hits,
+                      (long long) s.decode_misses, (long long) s.jobs, s.expert_seconds,
+                      s.ms_ids, s.ms_launch, s.ms_misses, s.ms_combine, s.ms_queue);
+        return std::string(buf);
+    };
+    const auto arrays_json = [](const std::vector<double>& v) {
+        std::string s = "[";
+        for (size_t k = 0; k < v.size(); ++k) {
+            char buf[64];
+            std::snprintf(buf, sizeof(buf), "%s%.9g", k ? "," : "", v[k]);
+            s += buf;
+        }
+        return s + "]";
+    };
+    const auto pct_json = [](const std::vector<double>& v, double p) {
+        if (v.empty()) return std::string("null");
+        char buf[64];
+        std::snprintf(buf, sizeof(buf), "%.6g", percentile_nearest_rank(v, p));
+        return std::string(buf);
+    };
+    int rc = 0;
+    int requests_done = 0;
+    core::Qwen35BridgeStats prev_base{};
+    long long prev_measured_layers = 0;
+    bool have_prev = false;
+    for (int request = 1; request <= 2 && rc == 0; ++request) {
+        core::qwen35_t1h_scope_reset(request);   // task 194: no scope/records carried across requests
+        const auto anchor = Clock::now();   // request_start: includes the memory reset for E2E
+        const double anchor_since_process_start = elapsed(process_start);
+        VramPeak req_vram;   // this request's window peak (fed by the same one-query samples as the process peak)
+        vram.sample(&req_vram);
+        std::printf("{\"event\":\"request_start\",\"request\":%d,\"since_process_start_seconds\":%.9g}\n",
+                    request, anchor_since_process_start);
+        std::fflush(stdout);
+        // Before-prompt bridge snapshot: every per-request value below is a delta or an actual final value
+        // against it, never a process-cumulative number relabelled as this request's.
+        core::Qwen35BridgeStats before{};
+        core::qwen35_bridge_stats(before);
+        // Fresh request state through the proven API: cell metadata + the KV cells and the recurrent r/s/p
+        // buffers (GDN conv + SSM + rollback planes) are zeroed, exactly like the warm/multi diagnostics.
+        if (llama_memory_t mem = llama_get_memory(ctx)) {
+            llama_memory_clear(mem, true);
+        }
+        const double reset_seconds = elapsed(anchor);
+        const auto prefill_anchor = Clock::now();
+        std::printf("{\"event\":\"prefill_start\",\"request\":%d,\"since_request_start_seconds\":%.9g,"
+                    "\"since_process_start_seconds\":%.9g}\n", request, elapsed(anchor), elapsed(process_start));
+        std::fflush(stdout);
+        fill_batch(batch, prompt.data(), (int) prompt.size(), 0);
+        int64_t prefill_process_calls = 0;
+        const auto process_begin = Clock::now();
+        const int process_rc = llama_process(ctx, LLAMA_PROCESS_TYPE_DECODE, batch);
+        const double prefill_process_seconds = elapsed(process_begin);
+        ++prefill_process_calls;
+        const auto finish_begin = Clock::now();
+        const bool loan_returned = core::qwen35_bridge_finish_prompt();
+        const double prefill_finish_seconds = elapsed(finish_begin);
+        const double prefill_seconds = elapsed(prefill_anchor);   // the fixed complete-prefill wall
+        const double full_prefill_wall_seconds = elapsed(anchor); // reset + prefill (the request's real prompt cost)
+        const char* stop_reason = "max_new";
+        if (process_rc != 0) {
+            std::fprintf(stderr, "strata generate: request %d prefill failed\n", request);
+            stop_reason = "prefill_failed";
+            rc = 1;
+        } else if (!loan_returned) {
+            std::fprintf(stderr, "strata generate: request %d: the prompt loan was not returned; stopping before "
+                                 "decode\n", request);
+            stop_reason = "loan_failed";
+            rc = 1;
+        }
+        // The request's own base snapshot, taken after finish_prompt: the prompt-tail T=1 seam is already in
+        // it, so every decode value below is a pure decode-only delta (the warm/multi pattern).
+        core::Qwen35BridgeStats base{};
+        core::qwen35_bridge_stats(base);
+        std::vector<llama_token> generated;
+        std::vector<double> emit_s_arr, ready_s_arr;
+        JsonClosureDetector json_detector;
+        double ttft_request_seconds = -1;
+        double ttft_prefill_seconds = -1;
+        double eos_sample_s = -1;
+        double json_close_emit_s = -1;
+        long long eog_id = -1;
+        bool json_closed = false;
+        int decode_evaluations = 0;
+        double decode_seconds = 0;
+        // Task 183: the bounded profiler range.  Inert unless the gate passed the pre-load combination
+        // checks AND this is request 2; the only profiler calls live inside T1ProfileRange (start before
+        // eval 6's process, designated stop after eval 8's existing readiness wait) - nothing on the default
+        // path, no added timing, no event, no synchronize.
+        T1ProfileRange prof;
+        prof.requested = t1_profile_range_enabled() && request == 2 && o.max_new >= 9;
+        if (rc == 0) {
+            const auto decode_begin = Clock::now();
+            for (int64_t i = 0; i < o.max_new; ++i) {
+                vram.sample(&req_vram);   // one query feeds the request window and the process peak (no double queries)
+                const float* logits = llama_get_logits_ith(ctx, -1);
+                if (request == 2 && i >= 6 && i <= 8) core::qwen35_t1h_eval_ready(2, (int) i);   // task 194
+                if (prof.requested && i == 8) {
+                    // The existing readiness wait above just closed decode evaluation 8 (a process call opens
+                    // eval e at iteration i = e - 1 and completes at iteration i = e); stop exactly here,
+                    // before any further work.  No new synchronization is added.
+                    prof.stop_at_designated_point();
+                }
+                if (logits != nullptr && logits_have_nan(logits, n_vocab)) {
+                    stop_reason = "nan";
+                    std::fprintf(stderr, "strata generate: NaN in the logits at request %d output %lld; stopping\n",
+                                 request, (long long) i);
+                    rc = 1;
+                    break;
+                }
+                // The two-request measurement is autoregressive by contract (the teacher prefix is refused
+                // above): the first vocab EOG always ends the request and is never a visible token.
+                const llama_token token = llama_sampler_sample(sampler, ctx, -1);
+                if (llama_vocab_is_eog(vocab, token)) {
+                    stop_reason = "eog";
+                    eog_id = (long long) token;
+                    eos_sample_s = elapsed(anchor);
+                    std::printf("{\"event\":\"eog_stop\",\"request\":%d,\"index\":%lld,\"id\":%d,"
+                                "\"eos_sample_s\":%.9g}\n", request, (long long) i, token, eos_sample_s);
+                    std::fflush(stdout);
+                    break;
+                }
+                const double ready_s = elapsed(anchor);
+                if (i == 0) {
+                    ttft_request_seconds = ready_s;
+                    ttft_prefill_seconds = elapsed(prefill_anchor);
+                    std::printf("{\"event\":\"first_token\",\"request\":%d,\"id\":%d,"
+                                "\"since_request_start_seconds\":%.9g,\"since_prefill_start_seconds\":%.9g,"
+                                "\"since_process_start_seconds\":%.9g}\n",
+                                request, token, ready_s, ttft_prefill_seconds, elapsed(process_start));
+                }
+                generated.push_back(token);
+                char piece[256];
+                const int piece_size = llama_token_to_piece(vocab, token, piece, sizeof(piece), 0, true);
+                std::string hex;
+                for (int j = 0; j < (piece_size > 0 ? piece_size : 0); ++j) {
+                    char byte[3];
+                    std::snprintf(byte, sizeof(byte), "%02x", (unsigned char) piece[j]);
+                    hex += byte;
+                }
+                std::printf("{\"event\":\"token\",\"request\":%d,\"index\":%lld,\"id\":%d,\"teacher\":false,"
+                            "\"piece_hex\":%s}\n", request, (long long) i, token, json_quote(hex).c_str());
+                std::fflush(stdout);
+                const double emit_s = elapsed(anchor);
+                if (!json_closed && json_detector.feed(piece, piece_size > 0 ? piece_size : 0)) {
+                    json_closed = true;
+                    json_close_emit_s = emit_s;
+                }
+                emit_s_arr.push_back(emit_s);
+                ready_s_arr.push_back(ready_s);
+                std::printf("{\"event\":\"token_timing\",\"request\":%d,\"index\":%lld,\"ready_s\":%.9g,"
+                            "\"emit_s\":%.9g}\n", request, (long long) i, ready_s, emit_s);
+                std::fflush(stdout);
+                if (i + 1 < o.max_new) {
+                    if (prof.requested && i + 1 == 6) {
+                        // Immediately before the process call that opens decode evaluation 6 (1-based actual
+                        // evaluations): after tokens 0..5 were emitted and eval 5's readiness wait passed.
+                        prof.start();
+                    }
+                    if (request == 2 && i + 1 >= 6 && i + 1 <= 8) core::qwen35_t1h_eval_begin(2, (int) (i + 1));
+                    fill_batch(batch, &token, 1, (int) (prompt.size() + i));
+                    const int decode_rc = llama_process(ctx, LLAMA_PROCESS_TYPE_DECODE, batch);
+                    if (decode_rc != 0) {
+                        stop_reason = "decode_process_error";
+                        std::fprintf(stderr, "strata generate: decode failed at request %d output %lld\n",
+                                     request, (long long) i);
+                        rc = 1;
+                        break;
+                    }
+                    ++decode_evaluations;
+                }
+            }
+            decode_seconds = elapsed(decode_begin);
+        }
+        core::qwen35_t1h_scope_reset(request);   // task 194: close the scope on every decode exit path
+        // Task 183 review fix (185): explicit idempotent close BEFORE the summary metadata is built (the
+        // destructor is only a safety fallback); a REQUESTED range that missed or failed its registered
+        // 6..8 window (start/stop API error, or the designated eval-8 stop point never reached) is a hard
+        // non-zero diagnostic guard - never carried as a clean measurement and never a silent untraced claim.
+        prof.cleanup_after_decode();
+        const bool prof_requested_ok = !prof.requested || prof.coverage_ok();
+        if (prof.requested && !prof_requested_ok) {
+            std::fprintf(stderr, "strata generate: request %d: the requested T1 profile range did not cover "
+                                 "evaluations 6..8 (started %d stopped %d designated %d start_error %d "
+                                 "stop_error %d); failing\n", request, prof.started ? 1 : 0,
+                         prof.stopped ? 1 : 0, prof.designated_stop_reached ? 1 : 0, prof.start_error,
+                         prof.stop_error);
+            if (rc == 0) rc = 1;
+        }
+        core::Qwen35BridgeStats after{};
+        core::qwen35_bridge_stats(after);
+        core::Qwen35BridgeStats measured{};
+        measured.decode_layers = after.decode_layers - base.decode_layers;
+        measured.decode_hits = after.decode_hits - base.decode_hits;
+        measured.decode_misses = after.decode_misses - base.decode_misses;
+        measured.jobs = after.jobs - base.jobs;
+        measured.expert_seconds = after.expert_seconds - base.expert_seconds;
+        measured.ms_ids = after.ms_ids - base.ms_ids;
+        measured.ms_launch = after.ms_launch - base.ms_launch;
+        measured.ms_misses = after.ms_misses - base.ms_misses;
+        measured.ms_combine = after.ms_combine - base.ms_combine;
+        measured.ms_queue = after.ms_queue - base.ms_queue;
+        // Per-request prefill deltas (before-prompt -> after-finish) for the cumulative counters, plus the
+        // after-finish ACTUAL instantaneous values; nothing here is a process total relabelled as this
+        // request's.  Negative deltas are a structural failure.
+        const long long pf_gpu_layers_delta = (long long) (base.prefill_layers_gpu - before.prefill_layers_gpu);
+        const long long pf_entries_delta = (long long) (base.prefill_entries - before.prefill_entries);
+        const bool deltas_ok = measured.decode_layers >= 0 && measured.decode_hits >= 0 &&
+                               measured.decode_misses >= 0 && measured.jobs >= 0 && pf_gpu_layers_delta >= 0 &&
+                               pf_entries_delta >= 0 && measured.expert_seconds >= 0;
+        // Runtime layer-count check: with the actual model's layer count, this request's measured decode
+        // layers must equal actual n_layers * its decode evaluations (prompt tail excluded by the base).
+        const long long layers_expected = (long long) n_layers * (long long) decode_evaluations;
+        const bool layers_ok = measured.decode_layers == layers_expected;
+        // Contract guards for a clean request: EOS before the budget, a closed JSON and no owned fallback.
+        const bool eos_ok = rc == 0 && std::strcmp(stop_reason, "eog") == 0;
+        const bool json_ok = rc == 0 && json_closed;
+        const bool owned_ok = base.prefill_owned_bytes == 0;
+        const size_t n_visible = generated.size();
+        std::vector<double> itl_emit_ms, itl_ready_ms;
+        for (size_t k = 1; k < n_visible; ++k) {
+            itl_emit_ms.push_back((emit_s_arr[k] - emit_s_arr[k - 1]) * 1000.0);
+            itl_ready_ms.push_back((ready_s_arr[k] - ready_s_arr[k - 1]) * 1000.0);
+        }
+        const std::vector<double> itl_first4_emit_ms(
+            itl_emit_ms.begin(), itl_emit_ms.begin() + std::min<size_t>(4, itl_emit_ms.size()));
+        std::string tps_emit = "null", tps_ready = "null";
+        if (n_visible >= 2) {
+            char buf[64];
+            const double span_emit = emit_s_arr.back() - emit_s_arr.front();
+            if (span_emit > 0) {
+                std::snprintf(buf, sizeof(buf), "%.6g", (double) (n_visible - 1) / span_emit);
+                tps_emit = buf;
+            }
+            const double span_ready = ready_s_arr.back() - ready_s_arr.front();
+            if (span_ready > 0) {
+                std::snprintf(buf, sizeof(buf), "%.6g", (double) (n_visible - 1) / span_ready);
+                tps_ready = buf;
+            }
+        }
+        std::string e2e_last = "null", eog_json = "null", eos_json = "null", close_json = "null";
+        {
+            char buf[64];
+            if (n_visible >= 1) {
+                std::snprintf(buf, sizeof(buf), "%.9g", emit_s_arr.back());
+                e2e_last = buf;
+            }
+            if (eog_id >= 0) { std::snprintf(buf, sizeof(buf), "%lld", eog_id); eog_json = buf; }
+            if (eos_sample_s >= 0) { std::snprintf(buf, sizeof(buf), "%.9g", eos_sample_s); eos_json = buf; }
+            if (json_closed && json_close_emit_s >= 0) {
+                std::snprintf(buf, sizeof(buf), "%.9g", json_close_emit_s);
+                close_json = buf;
+            }
+        }
+        // Runtime prompt-tail check (not hard-coded): the base's growth since the previous request must equal
+        // the previous request's measured decode layers plus this request's prompt-tail prefill calls.  The
+        // check is ENFORCED: a mismatch fails the request (and the run), it is not a decorative print.
+        const long long base2_delta = have_prev ? (long long) (base.decode_layers - prev_base.decode_layers) : -1;
+        const long long base2_expected = have_prev ? prev_measured_layers + prefill_process_calls : -1;
+        const bool base2_ok = !have_prev || base2_delta == base2_expected;
+        const bool request_ok = rc == 0 && layers_ok && base2_ok && eos_ok && json_ok && owned_ok && deltas_ok &&
+                                prof_requested_ok;
+        std::string base2_json = "null";
+        if (have_prev) {
+            char buf[256];
+            std::snprintf(buf, sizeof(buf),
+                          "{\"ok\":%s,\"base2_minus_base1_layers\":%lld,\"prev_decode_layers\":%lld,"
+                          "\"this_prefill_calls\":%lld}",
+                          base2_ok ? "true" : "false", base2_delta, prev_measured_layers,
+                          (long long) prefill_process_calls);
+            base2_json = buf;
+        }
+        // Task 182 review fix (metadata only, no compute change): the prefill resident/streamed/
+        // product_calls/stream_mib values below are PROCESS-CUMULATIVE running values; the *_cumulative
+        // copies label that explicitly and the new *_delta fields carry the real before->base per-request
+        // difference.  The legacy keys keep their exact previous values, so existing parsers remain valid.
+        // MiB fields round the real byte counters (a MiB difference is not an exact transfer-byte figure).
+        const long long pf_resident_delta = (long long) (base.prefill_resident - before.prefill_resident);
+        const long long pf_streamed_delta = (long long) (base.prefill_streamed - before.prefill_streamed);
+        const long long pf_product_delta = (long long) (base.prefill_product_calls - before.prefill_product_calls);
+        const double pf_stream_mib_delta =
+            ((double) base.prefill_stream_bytes - (double) before.prefill_stream_bytes) / 1048576.0;
+        // Task 183 review fix (185): the profiler metadata is formatted through format_prof_json with an
+        // explicit length check - a buffer that cannot hold the complete object fails the run instead of
+        // emitting a truncated JSON record (the summary then carries "t1_profile_range":null).  The units
+        // note lives in this comment/doc, not in the JSON (kept small on purpose): evaluations are 1-based
+        // actual evaluations; the window is request 2 evals 6..8; the stop-flush wall is diagnostic E2E only.
+        char prof_buf[320];
+        std::string prof_json = "null";
+        if (!format_prof_json(prof, prof_buf, sizeof(prof_buf))) {
+            std::fprintf(stderr, "strata generate: request %d: the t1_profile_range metadata buffer is too "
+                                 "small for the complete object; failing instead of emitting truncated JSON\n",
+                         request);
+            rc = 1;
+        } else {
+            prof_json = prof_buf;
+        }
+        const std::string base_json = stats_json(base);
+        const std::string measured_json = stats_json(measured);
+        const double e2e_observation_s = elapsed(anchor);
+        std::printf("{\"event\":\"request_summary\",\"request\":%d,\"requests_planned\":2,"
+                    "\"request_start_since_process_start_seconds\":%.9g,"
+                    "\"timing\":{\"reset_seconds\":%.9g,\"prefill_process_seconds\":%.9g,"
+                    "\"prefill_process_calls\":%lld,\"prefill_finish_seconds\":%.9g,"
+                    "\"prefill_seconds\":%.9g,\"full_prefill_wall_seconds\":%.9g,"
+                    "\"ttft_request_seconds\":%.9g,\"ttft_prefill_seconds\":%.9g,"
+                    "\"decode_seconds\":%.9g,\"e2e_observation_seconds\":%.9g},"
+                    "\"prefill\":{\"gpu_layers_delta\":%lld,\"entries_delta\":%lld,\"resident\":%lld,"
+                    "\"streamed\":%lld,\"product_calls\":%lld,\"stream_mib\":%.4g,"
+                    "\"resident_cumulative\":%lld,\"streamed_cumulative\":%lld,"
+                    "\"product_calls_cumulative\":%lld,\"stream_mib_cumulative\":%.4g,"
+                    "\"resident_delta\":%lld,\"streamed_delta\":%lld,\"product_calls_delta\":%lld,"
+                    "\"stream_mib_delta\":%.4g},"
+                    "\"cache\":{\"slots\":%llu,\"resident\":%llu,\"bytes\":%llu,\"mib\":%.1f,"
+                    "\"payload_mib\":%.1f},"
+                    "\"loan\":{\"slots\":%lld,\"mib\":%.4g,\"restored\":%lld,\"owned_mib\":%.4g,\"why\":%s},"
+                    "\"decode\":{\"visible_output_tokens\":%zu,\"evaluations\":%d,\"layers\":%lld,"
+                    "\"layers_expected\":%lld,\"hits\":%lld,\"misses\":%lld,\"jobs\":%lld,"
+                    "\"expert_seconds\":%.6g,\"tier_ms_ids\":%.1f,\"tier_ms_launch\":%.1f,"
+                    "\"tier_ms_misses\":%.1f,\"tier_ms_combine\":%.1f,\"tier_ms_admit\":%.1f},"
+                    "\"stop\":{\"reason\":\"%s\",\"eog_id\":%s,\"eos_sample_s\":%s,\"json_closed\":%s,"
+                    "\"json_close_emit_s\":%s,\"e2e_last_visible_token_seconds\":%s},"
+                    "\"decode_tps_emit\":%s,\"decode_tps_ready\":%s,"
+                    "\"itl_emit_ms_p50\":%s,\"itl_emit_ms_p95\":%s,\"itl_emit_ms_p99\":%s,"
+                    "\"itl_ready_ms_p50\":%s,\"itl_ready_ms_p95\":%s,\"itl_ready_ms_p99\":%s,"
+                    "\"itl_first4_emit_ms\":%s,"
+                    "\"decode_base\":%s,\"decode_measured\":%s,"
+                    "\"guards\":{\"ok\":%s,\"layers\":%s,\"base2\":%s,\"eos\":%s,\"json\":%s,\"owned\":%s,"
+                    "\"deltas\":%s},"
+                    "\"vram\":{\"request_peak_mib\":%.1f,\"device_total_mib\":%.1f,\"samples\":%lld},"
+                    "\"t1_profile_range\":%s,"
+                    "\"base2_check\":%s}\n",
+                    request, anchor_since_process_start,
+                    reset_seconds, prefill_process_seconds, (long long) prefill_process_calls,
+                    prefill_finish_seconds, prefill_seconds, full_prefill_wall_seconds,
+                    ttft_request_seconds, ttft_prefill_seconds, decode_seconds, e2e_observation_s,
+                    pf_gpu_layers_delta, pf_entries_delta, (long long) base.prefill_resident,
+                    (long long) base.prefill_streamed, (long long) base.prefill_product_calls,
+                    (double) base.prefill_stream_bytes / 1048576.0,
+                    (long long) base.prefill_resident, (long long) base.prefill_streamed,
+                    (long long) base.prefill_product_calls,
+                    (double) base.prefill_stream_bytes / 1048576.0,
+                    pf_resident_delta, pf_streamed_delta, pf_product_delta, pf_stream_mib_delta,
+                    (unsigned long long) base.cache_slots, (unsigned long long) base.cache_resident,
+                    (unsigned long long) base.cache_bytes, (double) base.cache_bytes / 1048576.0,
+                    (double) base.cache_payload_bytes / 1048576.0,
+                    (long long) base.prefill_loan_slots, (double) base.prefill_loan_bytes / 1048576.0,
+                    (long long) base.prefill_loan_restored, (double) base.prefill_owned_bytes / 1048576.0,
+                    json_quote(base.prefill_loan_why).c_str(),
+                    n_visible, decode_evaluations, (long long) measured.decode_layers, layers_expected,
+                    (long long) measured.decode_hits, (long long) measured.decode_misses,
+                    (long long) measured.jobs, measured.expert_seconds,
+                    measured.ms_ids, measured.ms_launch, measured.ms_misses, measured.ms_combine,
+                    measured.ms_queue,
+                    stop_reason, eog_json.c_str(), eos_json.c_str(), json_closed ? "true" : "false",
+                    close_json.c_str(), e2e_last.c_str(),
+                    tps_emit.c_str(), tps_ready.c_str(),
+                    pct_json(itl_emit_ms, 0.50).c_str(), pct_json(itl_emit_ms, 0.95).c_str(),
+                    pct_json(itl_emit_ms, 0.99).c_str(),
+                    pct_json(itl_ready_ms, 0.50).c_str(), pct_json(itl_ready_ms, 0.95).c_str(),
+                    pct_json(itl_ready_ms, 0.99).c_str(),
+                    arrays_json(itl_first4_emit_ms).c_str(),
+                    base_json.c_str(), measured_json.c_str(),
+                    request_ok ? "true" : "false", layers_ok ? "true" : "false", base2_ok ? "true" : "false",
+                    eos_ok ? "true" : "false", json_ok ? "true" : "false", owned_ok ? "true" : "false",
+                    deltas_ok ? "true" : "false",
+                    req_vram.mib(), (double) req_vram.total / 1048576.0, (long long) req_vram.samples,
+                    prof_json.c_str(),
+                    base2_json.c_str());
+        std::fflush(stdout);
+        if (request == 2) core::qwen35_t1h_emit_request_end(2);   // task 194: one bounded JSON line
+        graph_stats_record("request_end", (long long) request, ctx);
+        ++requests_done;
+        if (!request_ok && rc == 0) {
+            // First-summary-emit failure stops the run: the summary above is kept, the run fails non-zero
+            // and the next request never starts.
+            std::fprintf(stderr, "strata generate: request %d failed a measurement guard (layers %d base2 %d "
+                                 "eos %d json %d owned %d deltas %d); stopping\n",
+                         request, layers_ok ? 1 : 0, base2_ok ? 1 : 0, eos_ok ? 1 : 0, json_ok ? 1 : 0,
+                         owned_ok ? 1 : 0, deltas_ok ? 1 : 0);
+            rc = 1;
+        }
+        prev_base = base;
+        prev_measured_layers = (long long) measured.decode_layers;
+        have_prev = true;
+    }
+    std::printf("{\"event\":\"two_request_done\",\"exit\":%d,\"requests_completed\":%d,\"prompt_tokens\":%zu,"
+                "\"since_process_start_seconds\":%.9g,\"process_peak_device_vram_mib\":%.1f,"
+                "\"process_device_total_mib\":%.1f,\"process_vram_samples\":%lld}\n",
+                rc, requests_done, prompt.size(), elapsed(process_start), vram.mib(),
+                (double) vram.total / 1048576.0, (long long) vram.samples);
+    std::fflush(stdout);
+    return rc;
+}
+
 }  // namespace
 
 int qwen35_run(const Qwen35RunOptions& o) {
+    if (core::qwen35_mtp_selftest_requested()) return core::qwen35_mtp_selftest();
     if (o.model.empty() || o.pack_dir.empty() || (o.tokens.empty() && o.prompt_text.empty())) {
         std::fprintf(stderr, "strata generate: the Qwen35 path needs --qwen35-model, --qwen35-pack and a token or text prompt\n");
         return 2;
@@ -274,6 +930,33 @@ int qwen35_run(const Qwen35RunOptions& o) {
     if (const char* replay = std::getenv("STRATA_QWEN35_LAYER_REPLAY"); replay != nullptr && replay[0] != '\0') {
         const char* mix = std::getenv("STRATA_QWEN35_LAYER_REPLAY_MIXED");
         return qwen35_layer_replay(o, replay, mix != nullptr && std::strcmp(mix, "1") == 0);
+    }
+    if (two_request_enabled()) {
+        // Task 178 contract: refuse one-shot/flush-once diagnostics before the model load (the exact list is
+        // in two_request_conflict() below); a bad combination never pays the load.
+        if (const char* conflict = two_request_conflict(o)) {
+            std::fprintf(stderr, "strata generate: STRATA_QWEN35_TWO_REQUEST=1 cannot be combined with %s\n",
+                         conflict);
+            return 2;
+        }
+    }
+    if (const char* t1_conflict = t1_profile_conflict(o)) {
+        // Task 183 strict gate: the profile range is refused before load outside its registered combination.
+        std::fprintf(stderr, "strata generate: STRATA_QWEN35_T1_PROFILE_RANGE=1 cannot be combined with %s\n",
+                     t1_conflict);
+        return 2;
+    }
+    if (const char* t1h_conflict = t1_host_conflict(o)) {
+        // Task 194 strict gate: the host timeline is refused before load outside its registered combination.
+        std::fprintf(stderr, "strata generate: STRATA_QWEN35_T1_HOST_TIMELINE=1 cannot be combined with %s\n",
+                     t1h_conflict);
+        return 2;
+    }
+    if (const char* t1p_conflict = t1_pool_phase_conflict(o)) {
+        // Task 202 strict gate: the pool-phase sink is refused before load outside its registered combination.
+        std::fprintf(stderr, "strata generate: STRATA_QWEN35_T1_POOL_PHASE=1 cannot be combined with %s\n",
+                     t1p_conflict);
+        return 2;
     }
     const auto process_start = Clock::now();
     llama_backend_init();
@@ -303,17 +986,28 @@ int qwen35_run(const Qwen35RunOptions& o) {
     {
         auto mp = llama_model_default_params();
         mp.n_gpu_layers = (int32_t) o.ngl;
+        // Task 261: the TXN engine also needs the real MTP block (blk.40) loaded and placed; loading it is
+        // keyed on either the bootstrap-only DRAFT gate or the real TXN gate, never on DRAFT alone.
+        const bool mtp_on_mp = core::qwen35_mtp_draft_enabled() || core::qwen35_mtp_txn_enabled();
+        mp.load_mtp = mtp_on_mp;
         // `--cpu-moe` keeps the routed expert tensors on the CPU: the equivalent override is the CPU DEVICE's
         // buffer type (the plain ggml_backend_cpu_buffer_type() is a different, non-device buffer and changes
         // how llama places/see the host weights).
         ggml_backend_dev_t cpu_dev = ggml_backend_dev_by_name("CPU");
         ggml_backend_buffer_type_t cpu_buft = cpu_dev != nullptr ? ggml_backend_dev_buffer_type(cpu_dev)
                                                                  : ggml_backend_cpu_buffer_type();
+        ggml_backend_dev_t gpu_dev_mp = ggml_backend_dev_by_type(GGML_BACKEND_DEVICE_TYPE_GPU);
+        ggml_backend_buffer_type_t gpu_buft_mp = gpu_dev_mp != nullptr ? ggml_backend_dev_buffer_type(gpu_dev_mp) : nullptr;
+        const llama_model_tensor_buft_override overrides_draft[] = {
+            {"blk\\.40\\..*", gpu_buft_mp},
+            {".*ffn_.*_exps.*", cpu_buft},
+            {nullptr, nullptr},
+        };
         const llama_model_tensor_buft_override overrides[] = {
             {".*ffn_.*_exps.*", cpu_buft},
             {nullptr, nullptr},
         };
-        mp.tensor_buft_overrides = overrides;
+        mp.tensor_buft_overrides = mtp_on_mp ? overrides_draft : overrides;
         model.reset(llama_model_load_from_file(o.model.c_str(), mp));
     }
     if (model == nullptr) {
@@ -330,6 +1024,21 @@ int qwen35_run(const Qwen35RunOptions& o) {
     }
     const llama_vocab* vocab = llama_model_get_vocab(model.get());
     const int64_t n_layers = llama_model_n_layer(model.get());
+
+    // Task 232 (default OFF, exact STRATA_QWEN35_MTP=1): probe the file's MTP draft block (blk.<n_layers>).
+    // The draft/verify runtime is not implemented in this prototype: a valid schema stops here with rc 3
+    // instead of pretending MTP can run; a missing/invalid draft block fails with rc 1.
+    if (core::qwen35_mtp_enabled()) {
+        const core::Qwen35DraftReport rep = core::qwen35_mtp_probe(o.model, n_layers);
+        std::printf("{\"event\":\"qwen35_mtp_probe\",\"ok\":%s,\"checked\":%d,\"missing\":%d,"
+                    "\"mismatched\":%d}\n", rep.ok ? "true" : "false", rep.checked, rep.missing,
+                    rep.mismatched);
+        std::fflush(stdout);
+        std::fprintf(stderr, "strata generate: STRATA_QWEN35_MTP=1 draft probe: %s%s\n",
+                     rep.ok ? "schema OK" : "FAILED", rep.ok ? " (runtime draft/verify not implemented)" :
+                     (" - " + rep.error).c_str());
+        return rep.ok ? 3 : 1;
+    }
     const int64_t n_embd = llama_model_n_embd(model.get());
     const int64_t n_ff = meta_int(model.get(), "qwen35moe.expert_feed_forward_length", 0);
     const int64_t n_expert = meta_int(model.get(), "qwen35moe.expert_count", 0);
@@ -432,6 +1141,10 @@ int qwen35_run(const Qwen35RunOptions& o) {
     // capping the context's worst-case output reserve at 1 keeps the reserve graph's vocab-projection
     // columns at the real contract instead of n_batch.  The decode path itself is unchanged.
     cp.n_outputs_max = 1;
+    if (core::qwen35_mtp_txn_enabled()) {
+        cp.n_outputs_max = 2;   // seed + draft verify rows (all-row outputs)
+        cp.n_rs_seq = 1;        // one rollback snapshot level for the target hybrid memory
+    }
     cp.no_perf = false;
     std::unique_ptr<llama_context, decltype(&llama_free)> ctx(llama_init_from_model(model.get(), cp), llama_free);
     if (ctx == nullptr) {
@@ -439,6 +1152,7 @@ int qwen35_run(const Qwen35RunOptions& o) {
         core::qwen35_bridge_shutdown();
         return 1;
     }
+    if (core::qwen35_mtp_draft_enabled() || core::qwen35_mtp_txn_enabled()) llama_set_embeddings_nextn(ctx.get(), true, false);
     // Requested vs actual micro-batch: the request is the CLI value, the actual is the context's own answer
     // through the public llama_n_ubatch (never a re-print of the request).
     std::fprintf(stdout, "{\"event\":\"context_config\",\"requested_ubatch\":%lld,\"n_ubatch\":%u}\n",
@@ -455,6 +1169,18 @@ int qwen35_run(const Qwen35RunOptions& o) {
     }
     // Past graph reservation: decode-graph nodes are the external producer from here on.
     if (std::getenv("STRATA_QWEN35_NO_SEAM") == nullptr) core::qwen35_arm_decode_seam(true);
+    if (two_request_enabled()) {
+        // Task 178: the two-full-request measurement path replaces the single-request flow below.  The load
+        // region just above (model, bridge, context, batch, sampler, seam arm) ran once and is shared by both
+        // requests; the teardown (bridge shutdown, backend free) also runs once, after both.
+        const int rc_two = run_two_request_flow(ctx.get(), batch.get(), sampler.get(), vocab, prompt, o,
+                                                process_start, vram, n_layers);
+        vram.sample();
+        core::qwen35_report_decode_seam();
+        core::qwen35_bridge_shutdown();
+        llama_backend_free();
+        return rc_two;
+    }
     std::fprintf(stdout, "{\"event\":\"prompt_tokens\",\"ids\":[");
     for (size_t i = 0; i < prompt.size(); ++i) std::fprintf(stdout, "%s%d", i ? "," : "", prompt[i]);
     std::fprintf(stdout, "]}\n");
@@ -700,9 +1426,15 @@ int qwen35_run(const Qwen35RunOptions& o) {
     // Task 153 M0 observation state (default off; reads the same loop, changes no loop decision when off).
     const bool decode_timestamps_on = decode_timestamps_enabled();
     const bool stop_eog_on = stop_eog_enabled();
+    const bool draft_on = core::qwen35_mtp_draft_enabled();
+    const bool txn_on = core::qwen35_mtp_txn_enabled();
+    bool draft_round_done = false;
+    int64_t draft_pred_id = -1;
+    int64_t draft_seed_id = -1;
     std::vector<double> decode_token_ready_s;   // visible tokens only, seconds from the request anchor
     std::vector<double> decode_token_emit_s;
     const char* decode_stop_reason = "max_new";   // eog | nan | decode_process_error keep their own value
+    std::string decode_stop_reason_txn;   // task 264: the txn engine's real stop ("txn_<engine stop>")
     long long decode_eog_id = -1;
     const bool decode_entered = (rc == 0);
     // Task 153 M0 statistics split (TIMESTAMPS gate only, host read-only): the last prompt crop already ran
@@ -820,9 +1552,263 @@ int qwen35_run(const Qwen35RunOptions& o) {
             const llama_token token = llama_sampler_sample(sampler.get(), ctx.get(), -1);
             decode_sampler_seconds += elapsed(sampler_begin);
             ++decode_sampler_rounds;
+
+            if (txn_on && i == 0 && !llama_vocab_is_eog(vocab, token)) {
+                // Task 259 ownership: with TXN ON the transaction engine owns the visible emission of the
+                // whole request, including this prompt-sampled seed (emitted exactly once by the engine).
+                // The caller only records the returned vector and stops its own loop - it never emits the
+                // seed/draft/bonus itself, so nothing can be dropped or duplicated.
+                // Task 261: with STRATA_QWEN35_MTP_TXN_REQUESTS=2 this same process runs a second request
+                // after the proven reset sequence (memory clear + full re-prefill + loan return) and a fresh
+                // seed sample; EVERY request here runs the real transaction engine - there is no plain-decode
+                // request in this path.
+                int64_t txn_requests = 1;
+                if (const char* nr = std::getenv("STRATA_QWEN35_MTP_TXN_REQUESTS")) {
+                    const long long v = std::strtoll(nr, nullptr, 10);
+                    if (v >= 2) txn_requests = 2;
+                }
+                llama_token txn_seed = token;
+                bool txn_ok = true;
+                std::string txn_err;
+                for (int64_t rq = 1; rq <= txn_requests; ++rq) {
+                    // Task 264: per-request real anchors.  Request 1's prompt phase already ran on the main
+                    // path clock (prefill_begin + its measured process/finish spans); request 2 takes its own
+                    // anchor BEFORE the memory reset, so its reset/prefill/loan/seed are THIS request's real
+                    // values and are never request 1's.  The request-relative values below compose the
+                    // caller's real anchor/engine-entry instants with the engine's engine-relative timing
+                    // result; the engine values alone are never presented as the request E2E.
+                    Clock::time_point rq_anchor = prefill_begin;
+                    double rq_reset_s = -1.0, rq_prefill_process_s = prefill_process_seconds;
+                    double rq_prefill_finish_s = prefill_finish_seconds, rq_prefill_s = prefill_seconds;
+                    double rq_seed_sample_s = -1.0;
+                    if (rq == 1) {
+                        rq_seed_sample_s = elapsed(prefill_begin);   // the seed sampler just returned (few statements up)
+                    } else {
+                        rq_anchor = Clock::now();   // request start: BEFORE the memory clear (E2E includes it)
+                        if (llama_memory_t mem = llama_get_memory(ctx.get())) llama_memory_clear(mem, true);
+                        rq_reset_s = elapsed(rq_anchor);
+                        fill_batch(batch.get(), prompt.data(), (int) prompt.size(), 0);
+                        const auto pf_proc_begin = Clock::now();
+                        const int pf_rc = llama_process(ctx.get(), LLAMA_PROCESS_TYPE_DECODE, batch.get());
+                        rq_prefill_process_s = elapsed(pf_proc_begin);
+                        const auto pf_fin_begin = Clock::now();
+                        const bool loan_ok = core::qwen35_bridge_finish_prompt();
+                        rq_prefill_finish_s = elapsed(pf_fin_begin);
+                        rq_prefill_s = elapsed(rq_anchor);   // reset + full prefill + loan (rq1's composition + reset)
+                        const float* seed_logits = pf_rc == 0 ? llama_get_logits_ith(ctx.get(), -1) : nullptr;
+                        if (pf_rc != 0 || !loan_ok || seed_logits == nullptr) {
+                            std::fprintf(stderr, "strata generate: mtp-txn request 2 re-prefill failed (rc=%d "
+                                                 "loan=%d logits=%d)\n", pf_rc, loan_ok ? 1 : 0,
+                                         seed_logits != nullptr ? 1 : 0);
+                            txn_ok = false;
+                            break;
+                        }
+                        txn_seed = llama_sampler_sample(sampler.get(), ctx.get(), -1);
+                        rq_seed_sample_s = elapsed(rq_anchor);
+                    }
+                    std::printf("{\"event\":\"qwen35_mtp_txn_request\",\"request\":%lld,\"seed\":%d,"
+                                "\"first_pos\":%lld,\"max_new\":%lld}\n",
+                                (long long) rq, (int) txn_seed, (long long) prompt.size(), (long long) o.max_new);
+                    std::fflush(stdout);
+                    std::vector<llama_token> txn_emitted;
+                    core::Qwen35MtpTxnTiming txn_timing;
+                    const double engine_entry_s = elapsed(rq_anchor);
+                    const int txn_rc = core::qwen35_mtp_txn_run(model.get(), ctx.get(), vocab,
+                                                                (int64_t) prompt.size(), txn_seed,
+                                                                (int64_t) o.max_new, &txn_emitted,
+                                                                &txn_timing, &txn_err);
+                    if (txn_rc != 0) {
+                        std::fprintf(stderr, "strata generate: mtp-txn request %lld rc=%d err=%s\n",
+                                     (long long) rq, txn_rc, txn_err.c_str());
+                        txn_ok = false;
+                        break;
+                    }
+                    const double request_end_s = elapsed(rq_anchor);   // caller-observed: the engine returned
+                    // JSON closure over the exact returned pieces: the deterministic detector picks WHICH
+                    // piece closes the JSON and the engine's recorded per-emit flush vector supplies the real
+                    // flush instant of that piece (no re-measurement, no re-decode).
+                    bool rq_json_closed = false;
+                    double rq_json_close_s = -1.0;
+                    {
+                        JsonClosureDetector det;
+                        for (size_t k = 0; k < txn_emitted.size(); ++k) {
+                            char piece[256];
+                            const int psz = llama_token_to_piece(vocab, txn_emitted[k], piece, sizeof(piece), 0, true);
+                            if (det.feed(piece, psz > 0 ? psz : 0)) {
+                                if (k < txn_timing.emit_flush_s.size()) {
+                                    rq_json_closed = true;
+                                    rq_json_close_s = engine_entry_s + txn_timing.emit_flush_s[k];
+                                }
+                                break;
+                            }
+                        }
+                    }
+                    const double rq_first_flush_s = engine_entry_s + txn_timing.first_flush_s;
+                    const double rq_stop_s = engine_entry_s + txn_timing.engine_wall_s;
+                    if (decode_timestamps_on) {
+                        char json_close_buf[40] = "null";
+                        if (rq_json_closed) std::snprintf(json_close_buf, sizeof(json_close_buf), "%.9g", rq_json_close_s);
+                        std::printf("{\"event\":\"qwen35_mtp_txn_request_timing\",\"request\":%lld,"
+                                    "\"anchor\":\"%s\",\"reset_seconds\":%.9g,"
+                                    "\"prefill_process_seconds\":%.9g,\"prefill_finish_seconds\":%.9g,"
+                                    "\"prefill_seconds\":%.9g,\"seed_sample_seconds\":%.9g,"
+                                    "\"engine_entry_seconds\":%.9g,\"ttft_flush_request_seconds\":%.9g,"
+                                    "\"eos_complete_request_seconds\":%.9g,\"request_end_seconds\":%.9g,"
+                                    "\"json_closed\":%s,\"json_close_flush_request_seconds\":%s,"
+                                    "\"engine_wall_seconds\":%.9g,\"rounds\":%lld,\"emitted\":%lld,"
+                                    "\"eos\":%lld,\"stop\":\"%s\",\"eog_id\":%lld}\n",
+                                    (long long) rq, rq == 1 ? "prefill_begin" : "request_reset",
+                                    rq_reset_s, rq_prefill_process_s, rq_prefill_finish_s, rq_prefill_s,
+                                    rq_seed_sample_s, engine_entry_s, rq_first_flush_s, rq_stop_s, request_end_s,
+                                    rq_json_closed ? "true" : "false", json_close_buf,
+                                    txn_timing.engine_wall_s, (long long) txn_timing.rounds,
+                                    (long long) txn_timing.emitted, (long long) txn_timing.eos_count,
+                                    txn_timing.stop.c_str(), txn_timing.eog_id);
+                        std::fflush(stdout);
+                        // Task 267: export the REAL post-fflush emit vectors (typed timing - captured
+                        // after each fflush, unlike the old raw emit "flush_s" printf-argument lie).
+                        // ready = decided before the write; flush = written AND flushed; both are
+                        // engine-relative and convert to the request anchor by adding engine_entry_s.
+                        const bool split_on = txn_timing.cost_split_on;
+                        const bool sync_on = txn_timing.cost_sync_on;
+                        std::printf("{\"event\":\"qwen35_mtp_txn_request_flush_arrays\",\"request\":%lld,"
+                                    "\"engine_entry_seconds\":%.9g,\"emit_ready_engine_seconds\":[",
+                                    (long long) rq, engine_entry_s);
+                        for (size_t k = 0; k < txn_timing.emit_ready_s.size(); ++k)
+                            std::printf("%s%.9g", k ? "," : "", txn_timing.emit_ready_s[k]);
+                        std::printf("],\"emit_flush_engine_seconds\":[");
+                        for (size_t k = 0; k < txn_timing.emit_flush_s.size(); ++k)
+                            std::printf("%s%.9g", k ? "," : "", txn_timing.emit_flush_s[k]);
+                        std::printf("],\"emit_ready_request_seconds\":[");
+                        for (size_t k = 0; k < txn_timing.emit_ready_s.size(); ++k)
+                            std::printf("%s%.9g", k ? "," : "", engine_entry_s + txn_timing.emit_ready_s[k]);
+                        std::printf("],\"emit_flush_request_seconds\":[");
+                        for (size_t k = 0; k < txn_timing.emit_flush_s.size(); ++k)
+                            std::printf("%s%.9g", k ? "," : "", engine_entry_s + txn_timing.emit_flush_s[k]);
+                        std::printf("],\"cost_split\":%s,\"cost_sync\":%s,"
+                                    "\"cost_phases_ms\":{\"initdraftctx\":%.6g,\"draft\":%.6g,\"verify\":%.6g,"
+                                    "\"hcopy\":%.6g,\"replay\":%.6g,\"rollback\":%.6g,\"emit\":%.6g,"
+                                    "\"unattributed\":%.6g},\"cost_sync_calls\":%lld,\"cost_sync_wait_ms\":%.6g}\n",
+                                    split_on ? "true" : "false", sync_on ? "true" : "false",
+                                    txn_timing.ph_initdraftctx_ms, txn_timing.ph_draft_ms,
+                                    txn_timing.ph_verify_ms, txn_timing.ph_hcopy_ms, txn_timing.ph_replay_ms,
+                                    txn_timing.ph_rollback_ms, txn_timing.ph_emit_ms,
+                                    txn_timing.ph_unattributed_ms, (long long) txn_timing.cost_sync_calls,
+                                    txn_timing.cost_sync_wait_s * 1000.0);
+                        std::fflush(stdout);
+                    }
+                    if (rq == 1) ttft_seconds = rq_first_flush_s;   // summary TTFT = the first request's real value
+                    decode_stop_reason_txn = std::string("txn_") + txn_timing.stop;
+                    if (txn_timing.eog_id >= 0) decode_eog_id = txn_timing.eog_id;
+                    for (llama_token t : txn_emitted) generated.push_back(t);
+                }
+                if (!txn_ok) rc = 1;
+                break;
+            }
+            if (draft_on && i == 0 && !draft_round_done && !llama_vocab_is_eog(vocab, token)) {
+                draft_round_done = true;
+                std::fprintf(stderr, "qwen35 mtp-draft stage: start seed=%d pos=%lld\n", (int) token, (long long) prompt.size());
+                std::fflush(stderr);
+                const auto draft_begin = Clock::now();
+                std::unique_ptr<llama_context, decltype(&llama_free)> mtp_ctx(nullptr, llama_free);
+                {
+                    auto dp = llama_context_default_params();
+                    dp.n_ctx = (uint32_t) o.max_context;
+                    dp.n_batch = 1;
+                    dp.n_ubatch = 1;
+                    dp.n_threads = (int32_t) o.threads;
+                    dp.n_threads_batch = (int32_t) o.threads;
+                    dp.op_offload = true;
+                    dp.n_seq_max = 1;
+                    dp.n_outputs_max = 1;
+                    dp.no_perf = true;
+                    dp.ctx_type = LLAMA_CONTEXT_TYPE_MTP;
+                    dp.ctx_other = ctx.get();
+                    mtp_ctx.reset(llama_init_from_model(model.get(), dp));
+                }
+                const int64_t n_embd_out = (int64_t) llama_model_n_embd_out(model.get());
+                const int32_t h_index = (int32_t) (prompt.size() - 1);
+                const float* h_row = mtp_ctx ? llama_get_embeddings_nextn_ith(ctx.get(), h_index) : nullptr;
+                std::vector<float> h_copy;
+                if (h_row != nullptr && n_embd_out > 0) h_copy.assign(h_row, h_row + n_embd_out);
+                const float* h_prev = h_copy.empty() ? nullptr : h_copy.data();
+                bool h_finite = h_prev != nullptr;
+                for (int64_t e = 0; h_finite && e < (int64_t) h_copy.size(); ++e) h_finite = std::isfinite(h_prev[e]);
+                int draft_rc = -2;
+                int64_t draft_id = -1;
+                double draft_logit = 0.0;
+                bool draft_logits_ok = false;
+                bool draft_batch_ok = false;
+                if (mtp_ctx) {
+                    llama_set_embeddings_nextn(mtp_ctx.get(), true, true);
+                    std::fprintf(stderr,
+                                 "qwen35 mtp-draft stage: h_present=%s row=%d n_embd_out=%lld copy_float=%lld mtp_ctx=ok\n",
+                                 h_prev != nullptr ? "true" : "false", (int) h_index, (long long) n_embd_out,
+                                 (long long) h_copy.size());
+                    std::fflush(stderr);
+                    std::unique_ptr<llama_batch_ext, decltype(&llama_batch_ext_free)> db(
+                        llama_batch_ext_init(mtp_ctx.get()), llama_batch_ext_free);
+                    const int32_t dbi = db != nullptr ? llama_batch_ext_add_token(db.get(), 0, token) : -1;
+                    const llama_pos dpos = (llama_pos) prompt.size();
+                    const llama_embd dhe = {h_prev, 1, (size_t) n_embd_out};
+                    draft_batch_ok = db != nullptr && dbi >= 0 && h_prev != nullptr &&
+                                     llama_batch_ext_set_pos(db.get(), dbi, &dpos) &&
+                                     llama_batch_ext_set_embd_token(db.get(), dbi, dhe) &&
+                                     llama_batch_ext_set_output_logits(db.get(), dbi, true);
+                    std::fprintf(stderr, "qwen35 mtp-draft stage: batch_ok=%s idx=%d pos=%lld width=%lld\n",
+                                 draft_batch_ok ? "true" : "false", (int) dbi, (long long) dpos, (long long) n_embd);
+                    std::fflush(stderr);
+                    if (draft_batch_ok) {
+                        draft_rc = llama_process(mtp_ctx.get(), LLAMA_PROCESS_TYPE_DECODE, db.get());
+                        std::fprintf(stderr, "qwen35 mtp-draft stage: decode_rc=%d\n", draft_rc);
+                        std::fflush(stderr);
+                    }
+                    const float* dlog = (draft_rc == 0) ? llama_get_logits_ith(mtp_ctx.get(), -1) : nullptr;
+                    if (draft_rc == 0 && dlog != nullptr) {
+                        draft_logits_ok = true;
+                        for (int64_t v = 0; v < n_vocab; ++v) {
+                            if (!std::isfinite(dlog[v])) { draft_logits_ok = false; break; }
+                            if (draft_id < 0 || dlog[v] > draft_logit) { draft_id = v; draft_logit = dlog[v]; }
+                        }
+                    }
+                }
+                draft_pred_id = draft_id;
+                draft_seed_id = (int64_t) token;
+                size_t vram_free = 0, vram_total = 0;
+                cudaMemGetInfo(&vram_free, &vram_total);
+                std::fprintf(stdout,
+                    "{\"event\":\"qwen35_mtp_draft\",\"seed\":%d,\"seed_pos\":%lld,"
+                    "\"h_index\":%d,\"n_embd_out\":%lld,\"h_copy_bytes\":%lld,"
+                    "\"h_present\":%s,\"h_finite\":%s,\"mtp_ctx\":%s,\"batch_ok\":%s,\"decode_rc\":%d,"
+                    "\"logits_ok\":%s,\"draft_token\":%lld,\"draft_logit\":%.9g,\"n_vocab\":%lld,"
+                    "\"draft_kv_n_ctx\":%u,\"vram_free_mib\":%lld,\"vram_total_mib\":%lld,\"seconds\":%.6f}\n",
+                    (int) token, (long long) prompt.size(),
+                    (int) h_index, (long long) n_embd_out, (long long) (h_copy.size() * sizeof(float)),
+                    h_prev != nullptr ? "true" : "false", h_finite ? "true" : "false",
+                    mtp_ctx ? "true" : "false", draft_batch_ok ? "true" : "false", draft_rc,
+                    draft_logits_ok ? "true" : "false",
+                    (long long) draft_id, draft_logit, (long long) n_vocab,
+                    mtp_ctx ? llama_n_ctx(mtp_ctx.get()) : 0u,
+                    (long long) (vram_free / (1024 * 1024)), (long long) (vram_total / (1024 * 1024)),
+                    elapsed(draft_begin));
+                std::fflush(stdout);
+            }
             // Task 153 M0 (STRATA_QWEN35_STOP_EOG=1 only): a true autoregressive run stops before the EOG
             // becomes an output - it is not pushed, not printed and not fed back.  A teacher replay is not
             // autoregressive and is exempt (max-new budget kept, labelled in the observation record).
+            if (draft_on && i == 1 && draft_pred_id >= 0) {
+                char pb[256], tb[256];
+                const int sb = llama_token_to_piece(vocab, (llama_token) draft_pred_id, pb, sizeof(pb), 0, true);
+                const int st = llama_token_to_piece(vocab, token, tb, sizeof(tb), 0, true);
+                std::string hd, ht;
+                for (int j = 0; j < (sb > 0 ? sb : 0); ++j) { char bx[3]; std::snprintf(bx, sizeof(bx), "%02x", (unsigned char) pb[j]); hd += bx; }
+                for (int j = 0; j < (st > 0 ? st : 0); ++j) { char bx[3]; std::snprintf(bx, sizeof(bx), "%02x", (unsigned char) tb[j]); ht += bx; }
+                std::printf("{\"event\":\"qwen35_mtp_draft_compare\",\"seed\":%lld,\"draft\":%lld,\"target_next\":%d,"
+                            "\"match\":%s,\"draft_piece_hex\":\"%s\",\"target_piece_hex\":\"%s\"}\n",
+                            (long long) draft_seed_id, (long long) draft_pred_id, (int) token,
+                            draft_pred_id == (int64_t) token ? "true" : "false", hd.c_str(), ht.c_str());
+                std::fflush(stdout);
+            }
             if (stop_eog_on && teacher.empty() && llama_vocab_is_eog(vocab, token)) {
                 decode_stop_reason = "eog";
                 decode_eog_id = (long long) token;
@@ -1099,7 +2085,8 @@ int qwen35_run(const Qwen35RunOptions& o) {
                 "\"decode_piece_seconds\":%.9g,\"decode_piece_rounds\":%lld,"
                 "\"decode_piece_hex_seconds\":%.9g,\"decode_piece_hex_rounds\":%lld,"
                 "\"decode_token_write_seconds\":%.9g,\"decode_token_write_rounds\":%lld,"
-                "\"decode_flush_seconds\":%.9g,\"decode_flush_rounds\":%lld}\n",
+                "\"decode_flush_seconds\":%.9g,\"decode_flush_rounds\":%lld,"
+                "\"mtp_txn\":%s,\"legacy_aggregate_authoritative\":%s}\n",
             rc, prompt.size(), generated.size(), decode_evaluations, prefill_seconds, decode_seconds,
             ttft_seconds, prefill_tps, decode_eps, (unsigned long long) st.jobs, st.expert_seconds,
             (unsigned long long) st.decode_layers, (unsigned long long) st.decode_hits,
@@ -1134,7 +2121,8 @@ int qwen35_run(const Qwen35RunOptions& o) {
             decode_piece_seconds, (long long) decode_piece_rounds,
             decode_piece_hex_seconds, (long long) decode_piece_hex_rounds,
             decode_token_write_seconds, (long long) decode_token_write_rounds,
-            decode_flush_seconds, (long long) decode_flush_rounds);
+            decode_flush_seconds, (long long) decode_flush_rounds,
+            txn_on ? "true" : "false", txn_on ? "false" : "true");
     std::fflush(stdout);
     // Task 153 M0 observation (printed only when one of the two gates above is ON; with both OFF the stdout
     // ends at the summary exactly as before).  The stop record is emitted for either gate; the timing block
@@ -1142,7 +2130,8 @@ int qwen35_run(const Qwen35RunOptions& o) {
     // synchronization, no change to any earlier number, and the raw per-token instants are the
     // token_timing lines on stdout.
     if (decode_timestamps_on || stop_eog_on) {
-        const char* stop_reason = decode_stop_reason;
+        const char* stop_reason = decode_stop_reason_txn.empty() ? decode_stop_reason
+                                                                 : decode_stop_reason_txn.c_str();
         if (!decode_entered) stop_reason = loan_returned ? "prefill_failed" : "loan_failed";
         const size_t n_visible = generated.size();
         // Timing values exist only when TIMESTAMPS=1 filled exactly one record per visible token; every
